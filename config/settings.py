@@ -86,6 +86,29 @@ class Settings(BaseSettings):
     REDDIT_CLIENT_SECRET: str = ""
     REDDIT_USER_AGENT: str = "trading-bot/1.0"
 
+    # --- Regime Detection ---
+    USE_REGIME_DETECTION: bool = True
+    REGIME_ADX_TRENDING: float = 25.0
+    REGIME_VOLATILITY_HIGH_PCT: float = 80.0
+    REGIME_VOLATILE_SIZING_FACTOR: float = 0.5
+
+    # --- Backtesting ---
+    BACKTEST_INITIAL_CAPITAL: float = 100_000.0
+    BACKTEST_FEE_PCT: float = 0.1
+    BACKTEST_SLIPPAGE_PCT: float = 0.05
+    BACKTEST_WALK_FORWARD_SPLITS: int = 5
+    BACKTEST_WALK_FORWARD_TRAIN_RATIO: float = 0.8
+    OPTUNA_N_TRIALS: int = 100
+
+    # --- Ensemble ML ---
+    USE_ENSEMBLE: bool = False
+    ENSEMBLE_MODELS: list[str] = Field(default=["lightgbm"])
+    ML_LABEL_HORIZON: int = 1
+    ML_LABEL_THRESHOLD: float = 0.001
+    ML_TRAIN_RATIO: float = 0.7
+    ML_VAL_RATIO: float = 0.15
+    OPTUNA_ML_TRIALS: int = 50
+
     # --- Infrastructure ---
     PROMETHEUS_ENABLED: bool = False
 

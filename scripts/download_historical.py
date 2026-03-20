@@ -11,6 +11,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from config import get_settings
 from config.logging import setup_logging
@@ -23,7 +24,7 @@ from db.base import async_session_factory
 
 async def download_ohlcv(
     fetcher: CCXTFetcher,
-    repo: OHLCVRepository,
+    session_factory: async_sessionmaker,
     exchange: str,
     pair: str,
     timeframe: str,
@@ -31,7 +32,9 @@ async def download_ohlcv(
     semaphore: asyncio.Semaphore,
 ) -> int:
     """Download OHLCV for one pair/timeframe combination."""
-    async with semaphore:
+    async with semaphore, session_factory() as session:
+        repo = OHLCVRepository(session)
+
         # Incremental: resume from last known timestamp
         latest = await repo.get_latest_timestamp(exchange, pair, timeframe)
         start = latest + timedelta(milliseconds=1) if latest else since
@@ -116,12 +119,13 @@ async def main() -> None:
     semaphore = asyncio.Semaphore(5)
     total_candles = 0
 
-    async with fetcher, async_session_factory() as session:
-        repo = OHLCVRepository(session)
-
+    async with fetcher:
         # Build work items: pairs x timeframes
+        # Each task gets its own DB session (AsyncSession is not task-safe)
         tasks = [
-            download_ohlcv(fetcher, repo, exchange, pair, tf, since, semaphore)
+            download_ohlcv(
+                fetcher, async_session_factory, exchange, pair, tf, since, semaphore
+            )
             for pair in pairs
             for tf in timeframes
         ]
