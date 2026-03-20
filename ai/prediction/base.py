@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 import pandas as pd
 
@@ -22,7 +23,7 @@ class BasePredictor(ABC):
         self,
         train_data: pd.DataFrame,
         val_data: pd.DataFrame,
-        hyperparameters: dict[str, object] | None = None,
+        hyperparameters: dict[str, Any] | None = None,
     ) -> dict[str, float]: ...
 
     @abstractmethod
