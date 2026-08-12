@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ModelTrainer:
     """Wrapper for training, evaluating, and persisting prediction models."""
 
-    def __init__(self, model_dir: str = "models/prediction") -> None:
+    def __init__(self, model_dir: str = "var/models/prediction") -> None:
         self._model_dir = Path(model_dir)
         self._model_dir.mkdir(parents=True, exist_ok=True)
 

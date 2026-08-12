@@ -23,7 +23,7 @@ def setup_logging() -> None:
         ),
     )
     logger.add(
-        "logs/trading_bot_{time:YYYY-MM-DD}.log",
+        "var/logs/trading_bot_{time:YYYY-MM-DD}.log",
         rotation="1 day",
         retention="30 days",
         level="DEBUG",

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import OHLCVData
 
-CACHE_DIR = Path("data/cache")
+CACHE_DIR = Path("var/cache")
 
 
 class OHLCVRepository:

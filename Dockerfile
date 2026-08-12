@@ -19,4 +19,4 @@ COPY --from=builder /app /app
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-CMD ["python", "__main__.py"]
+CMD ["trading-bot"]

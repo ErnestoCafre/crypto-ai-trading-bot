@@ -15,16 +15,12 @@ build/
 .idea/
 *.swp
 
-models/**/*.pt
-models/**/*.pth
-models/**/*.pkl
-models/**/*.joblib
-models/**/*.onnx
+# Runtime artifacts: logs, model weights, parquet cache
+var/
 
 *.parquet
 *.h5
 *.hdf5
-data_cache/
 
 credentials.json
 *.pem
@@ -42,5 +38,3 @@ coverage.xml
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
-
-logs/
