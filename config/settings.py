@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     # --- Trading ---
     TRADING_PAIRS: list[str] = Field(default=["BTC/USDT", "ETH/USDT", "SOL/USDT"])
 
+    # --- Orchestrator ---
+    TRADING_TIMEFRAME: str = "1h"
+    TRADING_INTERVAL_MINUTES: int = 60
+    OHLCV_LOOKBACK_BARS: int = 250
+    INITIAL_BALANCE: float = 100_000.0
+    PAPER_SLIPPAGE_PCT: float = 0.05
+    PAPER_FEE_PCT: float = 0.1
+
     # --- Risk Management ---
     MAX_RISK_PER_TRADE_PCT: float = 1.0
     MAX_POSITION_PCT: float = 10.0
