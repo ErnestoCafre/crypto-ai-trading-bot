@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from data.storage import OHLCVRepository
+from trading_bot.data.storage import OHLCVRepository
 
 
 @pytest.fixture()
@@ -37,7 +37,7 @@ class TestParquetCache:
     def test_save_and_load_parquet(
         self, sample_ohlcv_df: pd.DataFrame, tmp_path: Path
     ) -> None:
-        import data.storage as storage_mod
+        import trading_bot.data.storage as storage_mod
 
         original_cache = storage_mod.CACHE_DIR
         storage_mod.CACHE_DIR = tmp_path
@@ -56,7 +56,7 @@ class TestParquetCache:
             storage_mod.CACHE_DIR = original_cache
 
     def test_load_parquet_returns_none_when_missing(self, tmp_path: Path) -> None:
-        import data.storage as storage_mod
+        import trading_bot.data.storage as storage_mod
 
         original_cache = storage_mod.CACHE_DIR
         storage_mod.CACHE_DIR = tmp_path
@@ -69,7 +69,7 @@ class TestParquetCache:
     def test_save_parquet_creates_directory_structure(
         self, sample_ohlcv_df: pd.DataFrame, tmp_path: Path
     ) -> None:
-        import data.storage as storage_mod
+        import trading_bot.data.storage as storage_mod
 
         original_cache = storage_mod.CACHE_DIR
         storage_mod.CACHE_DIR = tmp_path
@@ -86,7 +86,7 @@ class TestDFToRecords:
     """Tests for internal _df_to_records helper."""
 
     def test_converts_df_to_records(self, sample_ohlcv_df: pd.DataFrame) -> None:
-        from data.storage import _df_to_records
+        from trading_bot.data.storage import _df_to_records
 
         records = _df_to_records(sample_ohlcv_df, "binance", "BTC/USDT", "1h")
 

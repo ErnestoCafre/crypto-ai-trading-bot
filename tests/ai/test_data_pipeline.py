@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ai.prediction.data_pipeline import MLDataPipeline
+from trading_bot.ai.prediction.data_pipeline import MLDataPipeline
 
 
 @pytest.fixture()

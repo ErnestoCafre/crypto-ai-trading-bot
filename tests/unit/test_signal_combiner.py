@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from core.models import AISignals, Signal, SignalType
-from core.signal_combiner import SignalCombiner
+from trading_bot.core.models import AISignals, Signal, SignalType
+from trading_bot.core.signal_combiner import SignalCombiner
 
 
 class TestSignalCombiner:

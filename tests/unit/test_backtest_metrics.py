@@ -7,8 +7,8 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 import pytest
 
-from backtest.data_types import BacktestTrade
-from backtest.metrics import MetricsCalculator
+from trading_bot.backtest.data_types import BacktestTrade
+from trading_bot.backtest.metrics import MetricsCalculator
 
 
 def _make_trade(pnl: float, pnl_pct: float = 0.0, hours: float = 24.0) -> BacktestTrade:

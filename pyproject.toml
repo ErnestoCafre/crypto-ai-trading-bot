@@ -51,7 +51,7 @@ dependencies = [
 ]
 
 [project.scripts]
-trading-bot = "core.cli:run"
+trading-bot = "trading_bot.cli:run"
 
 [project.optional-dependencies]
 dev = [
@@ -84,10 +84,7 @@ select = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = [
-    "core", "ai", "data", "backtest", "execution",
-    "risk", "dashboard", "notifications", "db", "config",
-]
+known-first-party = ["trading_bot"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -119,10 +116,7 @@ markers = [
 addopts = "-v --tb=short"
 
 [tool.hatch.build.targets.wheel]
-packages = [
-    "core", "ai", "data", "backtest", "execution",
-    "risk", "dashboard", "notifications", "db", "config",
-]
+packages = ["src/trading_bot"]
 
 [build-system]
 requires = ["hatchling"]

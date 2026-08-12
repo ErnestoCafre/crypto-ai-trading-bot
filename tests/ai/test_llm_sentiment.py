@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ai.sentiment.llm_sentiment import LLMSentimentAnalyzer
-from core.models import SentimentResult
+from trading_bot.ai.sentiment.llm_sentiment import LLMSentimentAnalyzer
+from trading_bot.core.models import SentimentResult
 
 
 def _make_analyzer_with_mock(response_json: dict) -> LLMSentimentAnalyzer:

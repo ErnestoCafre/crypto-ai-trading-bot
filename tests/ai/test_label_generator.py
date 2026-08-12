@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from ai.prediction.label_generator import LabelGenerator
+from trading_bot.ai.prediction.label_generator import LabelGenerator
 
 
 @pytest.fixture()

@@ -22,7 +22,7 @@ services:
 
   dashboard:
     build: .
-    command: ["streamlit", "run", "dashboard/app.py", "--server.port=8501"]
+    command: ["streamlit", "run", "src/trading_bot/dashboard/app.py", "--server.port=8501"]
     depends_on:
       - db
     env_file:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from ai.sentiment.aggregator import SentimentAggregator
-from core.models import AggregatedSentiment, SentimentResult
+from trading_bot.ai.sentiment.aggregator import SentimentAggregator
+from trading_bot.core.models import AggregatedSentiment, SentimentResult
 
 
 def _result(score: float, model: str) -> SentimentResult:

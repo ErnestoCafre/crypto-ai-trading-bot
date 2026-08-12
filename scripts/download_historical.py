@@ -13,13 +13,13 @@ from datetime import UTC, datetime, timedelta
 from loguru import logger
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from config import get_settings
-from config.logging import setup_logging
-from data.market.ccxt_fetcher import CCXTFetcher
-from data.news.cryptocompare import CryptoCompareNews
-from data.onchain.fear_greed import FearGreedIndex
-from data.storage import OHLCVRepository
-from db.base import async_session_factory
+from trading_bot.config import get_settings
+from trading_bot.config.logging import setup_logging
+from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
+from trading_bot.data.news.cryptocompare import CryptoCompareNews
+from trading_bot.data.onchain.fear_greed import FearGreedIndex
+from trading_bot.data.storage import OHLCVRepository
+from trading_bot.db.base import async_session_factory
 
 
 async def download_ohlcv(

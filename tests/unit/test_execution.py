@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from execution.paper_executor import PaperExecutor
+from trading_bot.execution.paper_executor import PaperExecutor
 
 
 @pytest.fixture()

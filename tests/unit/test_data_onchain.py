@@ -13,7 +13,7 @@ class TestFearGreedIndex:
     """Tests for FearGreedIndex fetcher."""
 
     def _make_fetcher(self) -> object:
-        from data.onchain.fear_greed import FearGreedIndex
+        from trading_bot.data.onchain.fear_greed import FearGreedIndex
 
         fetcher = FearGreedIndex()
         return fetcher

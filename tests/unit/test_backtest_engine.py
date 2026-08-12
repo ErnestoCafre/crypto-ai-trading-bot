@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backtest.data_types import BacktestResult
-from backtest.engine import BacktestEngine
-from core.models import Signal, SignalType
-from core.strategies.base import BaseStrategy
+from trading_bot.backtest.data_types import BacktestResult
+from trading_bot.backtest.engine import BacktestEngine
+from trading_bot.core.models import Signal, SignalType
+from trading_bot.core.strategies.base import BaseStrategy
 
 
 def _make_ohlcv(n: int = 300, trend: float = 0.5) -> pd.DataFrame:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from config.settings import Settings
+from trading_bot.config.settings import Settings
 
 
 class TestSettings:

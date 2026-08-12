@@ -6,11 +6,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from core.models import AISignals, CombinedSignal, SignalType
-from risk.ai_confidence import AIConfidenceFilter
-from risk.drawdown import DrawdownMonitor
-from risk.position_sizer import PositionSizer
-from risk.stop_loss import StopLossManager
+from trading_bot.core.models import AISignals, CombinedSignal, SignalType
+from trading_bot.risk.ai_confidence import AIConfidenceFilter
+from trading_bot.risk.drawdown import DrawdownMonitor
+from trading_bot.risk.position_sizer import PositionSizer
+from trading_bot.risk.stop_loss import StopLossManager
 
 # ---------- StopLossManager ----------
 

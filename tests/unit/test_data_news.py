@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from core.models import NewsArticle
+from trading_bot.core.models import NewsArticle
 
 # ---------------------------------------------------------------------------
 # CryptoCompareNews
@@ -18,7 +18,7 @@ class TestCryptoCompareNews:
     """Tests for CryptoCompareNews fetcher."""
 
     def _make_fetcher(self) -> object:
-        from data.news.cryptocompare import CryptoCompareNews
+        from trading_bot.data.news.cryptocompare import CryptoCompareNews
 
         fetcher = CryptoCompareNews()
         return fetcher
@@ -40,7 +40,7 @@ class TestCryptoCompareNews:
 
     @pytest.mark.asyncio
     async def test_parse_article(self) -> None:
-        from data.news.cryptocompare import CryptoCompareNews
+        from trading_bot.data.news.cryptocompare import CryptoCompareNews
 
         item = {
             "title": "Bitcoin Rally",
@@ -83,7 +83,7 @@ class TestCryptoCompareNews:
 
     @pytest.mark.asyncio
     async def test_category_to_pair_mapping(self) -> None:
-        from data.news.cryptocompare import CryptoCompareNews
+        from trading_bot.data.news.cryptocompare import CryptoCompareNews
 
         item = {
             "title": "ETH Update",
@@ -99,7 +99,7 @@ class TestCryptoCompareNews:
 
     @pytest.mark.asyncio
     async def test_body_truncation(self) -> None:
-        from data.news.cryptocompare import CryptoCompareNews
+        from trading_bot.data.news.cryptocompare import CryptoCompareNews
 
         item = {
             "title": "Long Article",
@@ -143,7 +143,7 @@ class TestRSSFeedFetcher:
 
     @pytest.mark.asyncio
     async def test_parse_rss_xml(self) -> None:
-        from data.news.rss_feeds import RSSFeedFetcher
+        from trading_bot.data.news.rss_feeds import RSSFeedFetcher
 
         articles = RSSFeedFetcher._parse_feed(
             self.SAMPLE_RSS, "https://example.com/rss"
@@ -156,7 +156,7 @@ class TestRSSFeedFetcher:
 
     @pytest.mark.asyncio
     async def test_fetch_latest_aggregates_feeds(self) -> None:
-        from data.news.rss_feeds import RSSFeedFetcher
+        from trading_bot.data.news.rss_feeds import RSSFeedFetcher
 
         fetcher = RSSFeedFetcher(feeds=["https://feed1.com", "https://feed2.com"])
         fetcher._fetch_feed = AsyncMock(return_value=self.SAMPLE_RSS)
@@ -169,7 +169,7 @@ class TestRSSFeedFetcher:
 
     @pytest.mark.asyncio
     async def test_fetch_by_pair_filters(self) -> None:
-        from data.news.rss_feeds import RSSFeedFetcher
+        from trading_bot.data.news.rss_feeds import RSSFeedFetcher
 
         fetcher = RSSFeedFetcher(feeds=["https://feed1.com"])
         fetcher._fetch_feed = AsyncMock(return_value=self.SAMPLE_RSS)
@@ -187,7 +187,7 @@ class TestRSSFeedFetcher:
 
     @pytest.mark.asyncio
     async def test_invalid_xml_handled(self) -> None:
-        from data.news.rss_feeds import RSSFeedFetcher
+        from trading_bot.data.news.rss_feeds import RSSFeedFetcher
 
         articles = RSSFeedFetcher._parse_feed("not xml at all", "https://bad.com")
         assert articles == []

@@ -10,9 +10,9 @@ from unittest.mock import MagicMock
 import numpy as np
 import pandas as pd
 
-from ai.prediction.base import BasePredictor
-from ai.prediction.ensemble import EnsemblePredictor
-from core.models import Prediction
+from trading_bot.ai.prediction.base import BasePredictor
+from trading_bot.ai.prediction.ensemble import EnsemblePredictor
+from trading_bot.core.models import Prediction
 
 
 def _make_mock_predictor(confidence: float = 0.7) -> BasePredictor:

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ai.prediction.feature_engine import FeatureEngine
+from trading_bot.ai.prediction.feature_engine import FeatureEngine
 
 
 @pytest.fixture()

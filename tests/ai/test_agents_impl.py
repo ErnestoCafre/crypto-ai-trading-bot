@@ -11,12 +11,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ai.agents.orchestrator import Orchestrator
-from ai.agents.risk_evaluator import RiskEvaluatorAgent
-from ai.agents.sentiment_analyst import SentimentAnalystAgent
-from ai.agents.technical_analyst import TechnicalAnalystAgent
-from ai.sentiment.cost_tracker import SentimentCostTracker
-from core.models import AgentAnalysis, OrchestratorDecision
+from trading_bot.ai.agents.orchestrator import Orchestrator
+from trading_bot.ai.agents.risk_evaluator import RiskEvaluatorAgent
+from trading_bot.ai.agents.sentiment_analyst import SentimentAnalystAgent
+from trading_bot.ai.agents.technical_analyst import TechnicalAnalystAgent
+from trading_bot.ai.sentiment.cost_tracker import SentimentCostTracker
+from trading_bot.core.models import AgentAnalysis, OrchestratorDecision
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -483,7 +483,7 @@ class TestBotIntegration:
     @pytest.mark.asyncio
     async def test_llm_cycle_caches_decision(self):
         """_run_llm_cycle populates _latest_llm_decision."""
-        from core.bot import TradingOrchestrator
+        from trading_bot.core.bot import TradingOrchestrator
 
         s = _make_settings(USE_LLM_AGENT=True)
         orch = TradingOrchestrator(settings=s)
@@ -514,7 +514,7 @@ class TestBotIntegration:
 
     def test_llm_disabled_no_init(self):
         """USE_LLM_AGENT=False → no orchestrator."""
-        from core.bot import TradingOrchestrator
+        from trading_bot.core.bot import TradingOrchestrator
 
         s = _make_settings(USE_LLM_AGENT=False)
         orch = TradingOrchestrator(settings=s)
@@ -524,7 +524,7 @@ class TestBotIntegration:
 
     def test_build_ai_signals_includes_llm(self):
         """Cached LLM decision flows into AISignals."""
-        from core.bot import TradingOrchestrator
+        from trading_bot.core.bot import TradingOrchestrator
 
         s = _make_settings(USE_LLM_AGENT=True)
         orch = TradingOrchestrator(settings=s)

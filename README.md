@@ -36,9 +36,9 @@ uv run alembic upgrade head  # aplicar migraciones
 ## Uso
 
 ```bash
-uv run trading-bot                     # ejecutar el bot
-uv run streamlit run dashboard/app.py  # dashboard
-uv run python .                        # equivalente, sin instalar el paquete
+uv run trading-bot                                    # ejecutar el bot
+uv run python -m trading_bot                          # equivalente
+uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
 ```
 
 ## Desarrollo
@@ -58,21 +58,27 @@ Hexagonal / Clean Architecture con el módulo AI completamente opcional
 
 ```
 trading-bot/
-├── core/          # Estrategias, regime detection y lógica de negocio
-├── ai/            # Sentiment, prediction, LLM agents, RL
-├── data/          # Fetchers (CCXT, CoinGecko, noticias, social, on-chain)
-├── backtest/      # vectorbt + Backtesting.py
-├── execution/     # Paper trading + Live (CCXT)
-├── risk/          # Position sizing, stops, kill-switch
-├── dashboard/     # Streamlit
-├── notifications/ # Telegram Bot
-├── db/            # SQLAlchemy ORM
-├── config/        # Pydantic settings
-├── alembic/       # Migraciones de base de datos
-├── scripts/       # Utilidades (descarga de históricos)
-├── tests/         # unit/, integration/, ai/
-└── var/           # Artefactos de runtime (logs, modelos, cache) — gitignored
+├── src/trading_bot/
+│   ├── cli.py         # Entry point (console script `trading-bot`)
+│   ├── core/          # Estrategias, regime detection y lógica de negocio
+│   ├── ai/            # Sentiment, prediction, LLM agents, RL
+│   ├── data/          # Fetchers (CCXT, CoinGecko, noticias, social, on-chain)
+│   ├── backtest/      # vectorbt + Backtesting.py
+│   ├── execution/     # Paper trading + Live (CCXT)
+│   ├── risk/          # Position sizing, stops, kill-switch
+│   ├── dashboard/     # Streamlit
+│   ├── notifications/ # Telegram Bot
+│   ├── db/            # SQLAlchemy ORM
+│   └── config/        # Pydantic settings
+├── migrations/        # Alembic
+├── scripts/           # Utilidades (descarga de históricos)
+├── tests/             # unit/, integration/, ai/
+└── var/               # Artefactos de runtime (logs, modelos, cache) — gitignored
 ```
+
+El layout `src/` hace que los tests corran contra el paquete instalado y no
+contra el directorio de trabajo, así que un `__init__.py` faltante o un import
+roto falla en los tests en vez de pasar desapercibido.
 
 ## Docker
 

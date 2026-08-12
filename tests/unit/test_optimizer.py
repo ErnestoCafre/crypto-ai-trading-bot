@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backtest.optimizer import StrategyOptimizer
-from core.models import Signal
-from core.strategies.base import BaseStrategy
+from trading_bot.backtest.optimizer import StrategyOptimizer
+from trading_bot.core.models import Signal
+from trading_bot.core.strategies.base import BaseStrategy
 
 
 def _make_ohlcv(n: int = 300) -> pd.DataFrame:

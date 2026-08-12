@@ -8,12 +8,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ai.prediction.feature_engine import FeatureEngine
-from core.models import SignalType
-from core.regime import MarketRegime, RegimeClassification, RegimeDetector
-from core.strategies.mean_reversion import MeanReversion
-from core.strategies.trend_following import TrendFollowing
-from core.strategy_selector import StrategySelector
+from trading_bot.ai.prediction.feature_engine import FeatureEngine
+from trading_bot.core.models import SignalType
+from trading_bot.core.regime import MarketRegime, RegimeClassification, RegimeDetector
+from trading_bot.core.strategies.mean_reversion import MeanReversion
+from trading_bot.core.strategies.trend_following import TrendFollowing
+from trading_bot.core.strategy_selector import StrategySelector
 
 
 def _make_ohlcv(
@@ -175,7 +175,7 @@ class TestStrategySelector:
         # Need to also mock the strategy's generate_signal
         from datetime import UTC, datetime
 
-        from core.models import Signal
+        from trading_bot.core.models import Signal
 
         mock_signal = Signal(
             type=SignalType.LONG,

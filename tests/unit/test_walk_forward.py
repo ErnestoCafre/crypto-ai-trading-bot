@@ -5,10 +5,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from backtest.engine import BacktestEngine
-from backtest.walk_forward import WalkForwardValidator
-from core.models import Signal
-from core.strategies.base import BaseStrategy
+from trading_bot.backtest.engine import BacktestEngine
+from trading_bot.backtest.walk_forward import WalkForwardValidator
+from trading_bot.core.models import Signal
+from trading_bot.core.strategies.base import BaseStrategy
 
 
 def _make_ohlcv(n: int = 500) -> pd.DataFrame:

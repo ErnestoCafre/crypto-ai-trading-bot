@@ -18,9 +18,9 @@ class TestCCXTFetcher:
 
     def _make_fetcher(self) -> object:
         """Create a CCXTFetcher with a mocked exchange."""
-        from data.market.ccxt_fetcher import CCXTFetcher
+        from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 
-        with patch("data.market.ccxt_fetcher.ccxt_async") as mock_ccxt:
+        with patch("trading_bot.data.market.ccxt_fetcher.ccxt_async") as mock_ccxt:
             mock_exchange = AsyncMock()
             mock_exchange.rateLimit = 1200
             mock_exchange.markets = {"BTC/USDT": {"active": True}}
@@ -116,7 +116,9 @@ class TestCCXTFetcher:
             side_effect=[ccxt_async.RateLimitExceeded("rate limit"), raw]
         )
 
-        with patch("data.market.ccxt_fetcher.asyncio.sleep", new_callable=AsyncMock):
+        with patch(
+            "trading_bot.data.market.ccxt_fetcher.asyncio.sleep", new_callable=AsyncMock
+        ):
             df = await fetcher.fetch_ohlcv(
                 "BTC/USDT", "1h", since=datetime(2024, 1, 1, tzinfo=UTC)
             )
@@ -170,21 +172,21 @@ class TestCoinGeckoFetcher:
     """Tests for CoinGeckoFetcher."""
 
     def test_pair_to_coin_id_mapping(self) -> None:
-        from data.market.coingecko import CoinGeckoFetcher
+        from trading_bot.data.market.coingecko import CoinGeckoFetcher
 
         assert CoinGeckoFetcher.pair_to_coin_id("BTC/USDT") == "bitcoin"
         assert CoinGeckoFetcher.pair_to_coin_id("ETH/USDT") == "ethereum"
         assert CoinGeckoFetcher.pair_to_coin_id("SOL/USDT") == "solana"
 
     def test_pair_to_coin_id_unknown_raises(self) -> None:
-        from data.market.coingecko import CoinGeckoFetcher
+        from trading_bot.data.market.coingecko import CoinGeckoFetcher
 
         with pytest.raises(ValueError, match="Unknown pair"):
             CoinGeckoFetcher.pair_to_coin_id("UNKNOWN/USDT")
 
     @pytest.mark.asyncio
     async def test_fetch_ohlcv_parses_response(self) -> None:
-        from data.market.coingecko import CoinGeckoFetcher
+        from trading_bot.data.market.coingecko import CoinGeckoFetcher
 
         fetcher = CoinGeckoFetcher()
         mock_response = {
@@ -221,9 +223,9 @@ class TestBinanceFetcher:
 
     @pytest.mark.asyncio
     async def test_delegates_to_ccxt(self) -> None:
-        from data.market.binance import BinanceFetcher
+        from trading_bot.data.market.binance import BinanceFetcher
 
-        with patch("data.market.ccxt_fetcher.ccxt_async") as mock_ccxt:
+        with patch("trading_bot.data.market.ccxt_fetcher.ccxt_async") as mock_ccxt:
             mock_exchange = AsyncMock()
             mock_exchange.rateLimit = 1200
             mock_exchange.markets = {"BTC/USDT": {"active": True}}

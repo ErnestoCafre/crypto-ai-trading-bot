@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ai.sentiment.cryptobert import CryptoBERTAnalyzer
-from core.models import SentimentResult
+from trading_bot.ai.sentiment.cryptobert import CryptoBERTAnalyzer
+from trading_bot.core.models import SentimentResult
 
 
 @pytest.fixture()

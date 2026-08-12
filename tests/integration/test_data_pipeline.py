@@ -16,8 +16,8 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from data.storage import OHLCVRepository
-from db.base import Base
+from trading_bot.data.storage import OHLCVRepository
+from trading_bot.db.base import Base
 
 
 @pytest_asyncio.fixture
@@ -118,7 +118,7 @@ class TestCCXTIntegration:
     @pytest.mark.slow
     async def test_fetch_small_ohlcv(self) -> None:
         """Fetch 10 candles from Binance (real network call)."""
-        from data.market.ccxt_fetcher import CCXTFetcher
+        from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 
         since = datetime.now(UTC) - timedelta(hours=12)
 

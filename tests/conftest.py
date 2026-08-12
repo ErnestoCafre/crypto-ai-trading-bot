@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ai.prediction.feature_engine import FeatureEngine
-from core.models import (
+from trading_bot.ai.prediction.feature_engine import FeatureEngine
+from trading_bot.core.models import (
     AISignals,
     CombinedSignal,
     OrderResult,

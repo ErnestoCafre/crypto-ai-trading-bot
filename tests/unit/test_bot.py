@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.bot import TradingOrchestrator
-from core.models import (
+from trading_bot.core.bot import TradingOrchestrator
+from trading_bot.core.models import (
     AggregatedSentiment,
     AISignals,
     CombinedSignal,
@@ -157,7 +157,7 @@ def _setup_orchestrator(settings=None, **overrides) -> TradingOrchestrator:
 
 def _wire_mocks(orch: TradingOrchestrator, ohlcv=None):
     """Wire mock components into the orchestrator for testing."""
-    from core.regime import MarketRegime, RegimeClassification
+    from trading_bot.core.regime import MarketRegime, RegimeClassification
 
     ohlcv = ohlcv if ohlcv is not None else _make_ohlcv()
 
@@ -419,7 +419,7 @@ class TestSentimentCycle:
         orch = _setup_orchestrator(USE_SENTIMENT=True)
         _wire_mocks(orch)
 
-        from core.models import NewsArticle, SentimentResult
+        from trading_bot.core.models import NewsArticle, SentimentResult
 
         mock_analyzer = MagicMock()
         mock_analyzer.analyze = MagicMock(
@@ -551,17 +551,17 @@ class TestIntegration:
         orch = TradingOrchestrator(settings=settings)
 
         # Real components
-        from ai.prediction.feature_engine import FeatureEngine
-        from core.regime import RegimeDetector
-        from core.signal_combiner import SignalCombiner
-        from core.strategies.mean_reversion import MeanReversion
-        from core.strategies.trend_following import TrendFollowing
-        from core.strategy_selector import StrategySelector
-        from execution.paper_executor import PaperExecutor
-        from risk.ai_confidence import AIConfidenceFilter
-        from risk.drawdown import DrawdownMonitor
-        from risk.position_sizer import PositionSizer
-        from risk.stop_loss import StopLossManager
+        from trading_bot.ai.prediction.feature_engine import FeatureEngine
+        from trading_bot.core.regime import RegimeDetector
+        from trading_bot.core.signal_combiner import SignalCombiner
+        from trading_bot.core.strategies.mean_reversion import MeanReversion
+        from trading_bot.core.strategies.trend_following import TrendFollowing
+        from trading_bot.core.strategy_selector import StrategySelector
+        from trading_bot.execution.paper_executor import PaperExecutor
+        from trading_bot.risk.ai_confidence import AIConfidenceFilter
+        from trading_bot.risk.drawdown import DrawdownMonitor
+        from trading_bot.risk.position_sizer import PositionSizer
+        from trading_bot.risk.stop_loss import StopLossManager
 
         fe = FeatureEngine()
         rd = RegimeDetector(feature_engine=fe)

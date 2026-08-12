@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ai.prediction.lightgbm_model import LightGBMPredictor
-from core.models import Prediction
+from trading_bot.ai.prediction.lightgbm_model import LightGBMPredictor
+from trading_bot.core.models import Prediction
 
 
 def _make_train_val() -> tuple[pd.DataFrame, pd.DataFrame]:

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ai.prediction.feature_engine_advanced import AdvancedFeatureEngine
+from trading_bot.ai.prediction.feature_engine_advanced import AdvancedFeatureEngine
 
 
 @pytest.fixture()
@@ -100,7 +100,7 @@ class TestBasePreservation:
         self, engine: AdvancedFeatureEngine, ohlcv_100: pd.DataFrame
     ) -> None:
         """Base FeatureEngine columns should still be present."""
-        from ai.prediction.feature_engine import FeatureEngine
+        from trading_bot.ai.prediction.feature_engine import FeatureEngine
 
         df = engine.build_features(ohlcv_100)
         # At minimum RSI should be present from base engine

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from core.models import Signal, SignalType
+from trading_bot.core.models import Signal, SignalType
 
 
 def test_signal_type_values() -> None:

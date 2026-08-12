@@ -6,10 +6,10 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 
-from ai.prediction.feature_engine import FeatureEngine
-from core.models import SignalType
-from core.strategies.mean_reversion import MeanReversion
-from core.strategies.trend_following import TrendFollowing
+from trading_bot.ai.prediction.feature_engine import FeatureEngine
+from trading_bot.core.models import SignalType
+from trading_bot.core.strategies.mean_reversion import MeanReversion
+from trading_bot.core.strategies.trend_following import TrendFollowing
 
 
 class TestTrendFollowing:
