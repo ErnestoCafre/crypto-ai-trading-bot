@@ -18,6 +18,9 @@ build/
 # Runtime artifacts: logs, model weights, parquet cache
 var/
 
+# Notas personales de planificación (no forman parte del proyecto)
+personal-docs/
+
 *.parquet
 *.h5
 *.hdf5
