@@ -1,0 +1,53 @@
+# Virtualenv: must never overwrite the Linux venv built inside the image
+.venv/
+
+# VCS and CI
+.git/
+.gitignore
+.github/
+
+# Runtime artifacts (logs, model weights, parquet cache)
+var/
+*.parquet
+*.h5
+*.hdf5
+
+# Python caches and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+htmlcov/
+.coverage
+coverage.xml
+
+# Secrets (.env.example is kept as documentation)
+.env
+.env.local
+.env.production
+credentials.json
+*.pem
+*.key
+
+# Not needed at runtime
+tests/
+docs/
+personal-docs/
+.claude/
+.pre-commit-config.yaml
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
