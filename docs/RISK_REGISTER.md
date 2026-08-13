@@ -13,7 +13,7 @@ Riesgos técnicos y operacionales identificados para el bot de trading crypto co
 | ID | Riesgo | Prob. | Impacto | Prio. | Mitigación | Owner |
 |----|--------|-------|---------|-------|------------|-------|
 | R01 | **Exchange API caída** (Binance, Bybit down o rate limited) | 2 | 4 | 8 | Fallback a segundo exchange via CCXT. Queue de órdenes pendientes. Telegram alerta inmediata. No operar si no hay confirmación de ejecución. | execution/ |
-| R02 | **Pérdida de conexión a internet del VPS** | 2 | 4 | 8 | Stop-loss en exchange (server-side, no depende del bot). Telegram heartbeat cada 5 min — si no llega, investigar. Docker auto-restart. | docker/ |
+| R02 | **Pérdida de conexión a internet del VPS** | 2 | 4 | 8 | Stop-loss en exchange (server-side, no depende del bot). Telegram heartbeat cada 5 min — si no llega, investigar. Docker auto-restart. | docker-compose.yml |
 | R03 | **Base de datos PostgreSQL se llena o corrompe** | 1 | 3 | 3 | Monitoreo de disco. Retention policy: purgar OHLCV cache >1 año. Backups diarios automatizados. SQLite como fallback temporal. | db/ |
 | R04 | **CoinGecko / CryptoCompare API cambia o depreca endpoints** | 2 | 2 | 4 | Interfaz abstracta `BaseFetcher` / `BaseNewsFetcher`. Cambiar implementación sin tocar lógica. Tests de integración con health check semanal. | data/ |
 
