@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     MAX_POSITION_PCT: float = 10.0
     MAX_DRAWDOWN_PCT: float = 15.0
     MAX_DAILY_LOSS_PCT: float = 3.0
+    # Persisted drawdown latch + stops. "{mode}" is replaced by BOT_MODE so a
+    # paper session never overwrites the live halt state.
+    RISK_STATE_PATH: str = "var/state/risk_state_{mode}.json"
+    # Manual reset of a max-drawdown HALT on startup. Remove after use.
+    RISK_RESET: bool = False
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = ""
