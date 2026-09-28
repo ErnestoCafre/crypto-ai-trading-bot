@@ -18,6 +18,9 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://trading_bot:trading_bot@db:5432/trading_bot
+    volumes:
+      # Kill-switch latch and stops must survive container recreation.
+      - botstate:/app/var/state
     restart: unless-stopped
 
   dashboard:
@@ -34,3 +37,4 @@ services:
 
 volumes:
   pgdata:
+  botstate:

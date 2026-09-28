@@ -453,12 +453,12 @@ class OrderResult:
     filled_quantity: float
     fee: float
     slippage_pct: float
-    status: str                  # "filled", "partially_filled", "failed"
+    status: str                  # paper: "filled" | "rejected"; live: estado ccxt ("closed", "open", ...)
     timestamp: datetime
 
 
 class BaseExecutor(ABC):
-    """Interfaz para ejecutar órdenes en exchange."""
+    """Interfaz para ejecutar órdenes en exchange (solo spot)."""
 
     @abstractmethod
     async def place_order(
@@ -469,10 +469,13 @@ class BaseExecutor(ABC):
         quantity: float,
         price: Optional[float] = None,
     ) -> OrderResult:
+        """Paper limita la cantidad al efectivo (compra) o a lo que se tiene
+        (venta); si no queda nada ejecutable devuelve status="rejected"."""
         ...
 
     @abstractmethod
-    async def cancel_order(self, order_id: str) -> bool:
+    async def cancel_order(self, order_id: str, pair: Optional[str] = None) -> bool:
+        """`pair` es obligatorio en Binance/ccxt."""
         ...
 
     @abstractmethod
@@ -480,14 +483,38 @@ class BaseExecutor(ABC):
         ...
 
     @abstractmethod
-    async def get_balance(self) -> dict:
-        """Retorna {'USDT': 10000.0, 'BTC': 0.5, ...}"""
+    async def get_balance(self) -> dict[str, float]:
+        """{'total', 'cash', ...}: `total` = cash + activos de los pares
+        valorados a precio de mercado. Lanza excepción si no puede valorar
+        (nunca devuelve 0 inventado: dispararía el kill-switch)."""
+        ...
+
+    @abstractmethod
+    async def get_position(self, pair: str) -> float:
+        """Cantidad del activo base en `pair` (live: saldo total, incluido el
+        bloqueado por un stop; dust bajo el mínimo del mercado = 0)."""
         ...
 
     @abstractmethod
     async def close_all_positions(self) -> list[OrderResult]:
-        """Kill-switch: cierra todas las posiciones abiertas."""
+        """Kill-switch: cancela órdenes (incl. stops) y vende los activos de
+        los pares configurados, nunca otros activos de la cuenta."""
         ...
+
+    def update_prices(self, prices: dict[str, float]) -> None:
+        """Último precio por par (paper: mark-to-market). No-op por defecto."""
+
+    async def place_stop_loss(
+        self, pair: str, quantity: float, stop_price: float
+    ) -> Optional[str]:
+        """Stop nativo; devuelve el id o None (el bot vigila el stop por velas).
+        Live: ccxt `params={"stopLossPrice": ...}` -> Binance spot STOP_LOSS."""
+
+    async def get_order(self, order_id: str, pair: str) -> dict:
+        """Orden nativa (estructura ccxt); usado para seguir stops nativos."""
+
+    async def close(self) -> None:
+        """Libera conexiones del exchange. No-op por defecto."""
 ```
 
 **Implementaciones**: `PaperExecutor` (sandbox), `LiveExecutor` (CCXT real)
@@ -542,12 +569,18 @@ BaseFetcher.fetch_ohlcv()
     │        │
     │        └──► CombinedSignal (should_trade, confidence, sizing)
     │
-    ├──► PositionSizer.calculate(confidence)
+    ├──► BaseExecutor.get_position(pair)
+    │        ├── CLOSE/SHORT con posición ──► salida total (sin filtros de confianza;
+    │        │                                 cancela antes el stop nativo)
+    │        └── LONG sin posición ──► filtros + DrawdownMonitor.entries_allowed
+    │
+    ├──► PositionSizer.calculate(confidence)   (solo entradas)
     │        │
-    │        └──► PositionSize (quantity, stop_loss)
+    │        └──► PositionSize (quantity, stop_loss_price)
     │
     └──► BaseExecutor.place_order()
              │
              ├──► OrderResult
-             └──► BaseNotifier.send_trade_notification()
+             ├──► BaseNotifier.send_trade_notification()
+             └──► BUY llenado ──► place_stop_loss() + StopTracker (persistido)
 ```

@@ -41,6 +41,37 @@ uv run python -m trading_bot                          # equivalente
 uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
 ```
 
+## Gestión de riesgo
+
+- **Stop-loss**: cada compra registra un stop (ATR x2). En live se coloca una
+  orden `STOP_LOSS` nativa en el exchange (ccxt `stopLossPrice`); si el mercado
+  no la soporta o la orden es rechazada, el bot vigila el stop con las velas
+  cerradas. En paper siempre se vigila por velas: si el `low` toca el stop se
+  vende al precio del stop, o al `open` si la vela abrió por debajo (gap).
+- **Pérdida diaria** (`MAX_DAILY_LOSS_PCT`): liquida y notifica una vez; las
+  entradas nuevas quedan bloqueadas hasta el siguiente día UTC (se levanta sola).
+- **Drawdown máximo** (`MAX_DRAWDOWN_PCT`): liquida y notifica una vez y deja el
+  bot en estado `HALTED`: no abre posiciones nuevas, ni tras reiniciar, hasta un
+  reset manual. Stops y salidas siguen funcionando.
+- El estado se persiste en `RISK_STATE_PATH` (por defecto
+  `var/state/risk_state_{mode}.json`). Si falta o está corrupto, el bot arranca
+  desde el balance actual y deja un warning. En Docker vive en el volumen
+  `botstate` (`/app/var/state`), así sobrevive a recrear el contenedor.
+- En live, **un retiro de fondos cuenta como pérdida** para el drawdown: tras
+  retirar, reiniciar una vez con `RISK_RESET=true`.
+- En paper la cuenta simulada se reinicia en `INITIAL_BALANCE` en cada arranque:
+  se conserva el estado (pausa/HALT) pero pico e inicio de día se re-anclan al
+  balance nuevo.
+- `RISK_RESET=true` actúa en **cada** arranque mientras esté puesto: quitarlo
+  después de usarlo, o el HALT dejaría de sobrevivir a los reinicios.
+
+Reset manual de un `HALTED`:
+
+```bash
+RISK_RESET=true uv run trading-bot   # una sola vez; re-baselinea al balance actual
+# o bien: detener el bot y borrar var/state/risk_state_<modo>.json
+```
+
 ## Desarrollo
 
 ```bash

@@ -6,6 +6,7 @@ import asyncio
 import signal
 import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 from loguru import logger
@@ -20,10 +21,8 @@ from trading_bot.config.settings import Settings, get_settings
 from trading_bot.core.models import (
     AggregatedSentiment,
     AISignals,
-    CombinedSignal,
     OrchestratorDecision,
     OrderResult,
-    PositionSize,
     SentimentResult,
     SignalType,
 )
@@ -37,10 +36,13 @@ from trading_bot.data.news.cryptocompare import CryptoCompareNews
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
 from trading_bot.execution.base import BaseExecutor
 from trading_bot.execution.paper_executor import PaperExecutor
+from trading_bot.notifications.base import BaseNotifier
 from trading_bot.risk.ai_confidence import AIConfidenceFilter
-from trading_bot.risk.drawdown import DrawdownMonitor
+from trading_bot.risk.drawdown import DrawdownMonitor, TradingState
 from trading_bot.risk.position_sizer import PositionSizer
+from trading_bot.risk.risk_state import RiskStateStore
 from trading_bot.risk.stop_loss import StopLossManager
+from trading_bot.risk.stop_tracker import StopTracker
 
 
 class TradingOrchestrator:
@@ -50,6 +52,7 @@ class TradingOrchestrator:
         self._settings = settings or get_settings()
         self._scheduler: object | None = None
         self._running: bool = False
+        self._closed: bool = False
 
         # Core components — initialised in start()
         self._fetcher: BinanceFetcher | None = None
@@ -59,7 +62,10 @@ class TradingOrchestrator:
         self._signal_combiner: SignalCombiner | None = None
         self._position_sizer: PositionSizer | None = None
         self._drawdown_monitor: DrawdownMonitor | None = None
+        self._stop_tracker = StopTracker()
+        self._risk_store: RiskStateStore | None = None
         self._ai_confidence_filter: AIConfidenceFilter | None = None
+        self._notifier: BaseNotifier | None = None
 
         # AI components — optional, feature-flagged
         self._sentiment_analyzer: BaseSentimentAnalyzer | None = None
@@ -144,12 +150,16 @@ class TradingOrchestrator:
         while self._running:
             await asyncio.sleep(1)
 
+        await self.stop()
         logger.info("TradingOrchestrator stopped.")
 
     async def stop(self) -> None:
         """Graceful shutdown: stop scheduler, close fetcher, set running=False."""
-        logger.info("Stopping TradingOrchestrator…")
         self._running = False
+        if self._closed:
+            return
+        self._closed = True
+        logger.info("Stopping TradingOrchestrator…")
 
         if self._scheduler is not None:
             from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -166,29 +176,58 @@ class TradingOrchestrator:
         if self._fear_greed is not None:
             await self._fear_greed.close()
 
+        if self._executor is not None:
+            await self._executor.close()
+
     async def run_trading_cycle(self) -> None:
-        """One complete trading cycle: check drawdown, process each pair."""
+        """One complete trading cycle: price, check drawdown, process each pair."""
         assert self._executor is not None
         assert self._drawdown_monitor is not None
 
-        balance = await self._executor.get_balance()
-        portfolio_value = balance["total"]
-        logger.info(
-            "Trading cycle — portfolio: ${:,.2f}",
-            portfolio_value,
-        )
-
-        if self._drawdown_monitor.check(portfolio_value):
-            logger.warning(
-                "KILL SWITCH triggered — drawdown {:.1f}%",
-                self._drawdown_monitor.current_drawdown_pct,
-            )
-            await self._executor.close_all_positions()
-            return
-
+        # Fetch market data first so the portfolio is valued at current prices
+        market_data: dict[str, pd.DataFrame] = {}
         for pair in self._settings.TRADING_PAIRS:
             try:
-                await self._process_pair(pair, portfolio_value)
+                market_data[pair] = await self._fetch_ohlcv(pair)
+            except Exception:
+                logger.exception("Error fetching market data for {}", pair)
+        self._executor.update_prices(
+            {
+                pair: float(ohlcv["close"].iloc[-1])
+                for pair, ohlcv in market_data.items()
+                if len(ohlcv) > 0
+            }
+        )
+
+        # Stops run before valuation and signals, and regardless of halts.
+        await self._process_stops(market_data)
+
+        try:
+            balance = await self._executor.get_balance()
+        except Exception:
+            # Never feed a guessed value to the drawdown monitor.
+            logger.exception("Could not value portfolio — skipping cycle")
+            return
+        portfolio_value = balance["total"]
+        logger.info(
+            "Trading cycle — portfolio: ${:,.2f} ({})",
+            portfolio_value,
+            self._drawdown_monitor.state.value,
+        )
+
+        # Latching kill-switch: liquidate and notify only on the transition.
+        triggered = self._drawdown_monitor.update(portfolio_value)
+        # Persist the latch before liquidating: a crash mid-liquidation must
+        # still restart HALTED/paused.
+        self._save_risk_state()
+        if triggered is not None:
+            await self._handle_risk_trigger(triggered)
+            self._save_risk_state()
+            return
+
+        for pair, ohlcv in market_data.items():
+            try:
+                await self._process_pair(pair, ohlcv, portfolio_value)
             except Exception:
                 logger.exception("Error processing {}", pair)
                 continue
@@ -222,9 +261,18 @@ class TradingOrchestrator:
 
         # Risk components
         self._position_sizer = PositionSizer(stop_loss_mgr=StopLossManager())
-        self._drawdown_monitor = DrawdownMonitor(initial_value=s.INITIAL_BALANCE)
         self._ai_confidence_filter = AIConfidenceFilter()
         self._signal_combiner = SignalCombiner()
+
+        # Notifier
+        if s.TELEGRAM_BOT_TOKEN and s.TELEGRAM_CHAT_ID:
+            from trading_bot.notifications.telegram_notifier import TelegramNotifier
+
+            self._notifier = TelegramNotifier(
+                bot_token=s.TELEGRAM_BOT_TOKEN,
+                chat_id=s.TELEGRAM_CHAT_ID,
+            )
+            logger.info("Telegram notifier initialised")
 
         # Executor
         if s.BOT_MODE == "live":
@@ -243,13 +291,19 @@ class TradingOrchestrator:
 
             from trading_bot.execution.live_executor import LiveExecutor
 
-            self._executor = LiveExecutor(exchange=exchange)
+            self._executor = LiveExecutor(exchange=exchange, pairs=s.TRADING_PAIRS)
         else:
             self._executor = PaperExecutor(
                 initial_balance=s.INITIAL_BALANCE,
                 slippage_pct=s.PAPER_SLIPPAGE_PCT,
                 fee_pct=s.PAPER_FEE_PCT,
             )
+
+        # Drawdown baseline is the executor's real portfolio value (in live
+        # mode the exchange account, not INITIAL_BALANCE), unless a persisted
+        # risk state exists.
+        initial_balance = await self._executor.get_balance()
+        await self._load_risk_state(initial_balance["total"])
 
         # Data fetcher
         self._fetcher = BinanceFetcher(
@@ -313,7 +367,7 @@ class TradingOrchestrator:
                 logger.exception("Failed to init LLM agents — continuing without LLM")
                 self._llm_orchestrator = None
 
-        if s.USE_ENSEMBLE:
+        if s.USE_DL_PREDICTION or s.USE_ENSEMBLE:
             try:
                 from trading_bot.ai.prediction.lightgbm_model import LightGBMPredictor
 
@@ -330,14 +384,16 @@ class TradingOrchestrator:
     # Private — per-pair pipeline
     # ------------------------------------------------------------------
 
-    async def _process_pair(self, pair: str, portfolio_value: float) -> None:
-        """Full pipeline for one pair: fetch -> signal -> risk -> execute."""
+    async def _process_pair(
+        self, pair: str, ohlcv: pd.DataFrame, portfolio_value: float
+    ) -> None:
+        """Full pipeline for one pair: signal -> risk -> position -> execute."""
+        assert self._executor is not None
         assert self._signal_combiner is not None
         assert self._ai_confidence_filter is not None
         assert self._position_sizer is not None
 
-        # A. Fetch OHLCV
-        ohlcv = await self._fetch_ohlcv(pair)
+        # A. Validate OHLCV (fetched by run_trading_cycle)
         if len(ohlcv) < 50:
             logger.warning(
                 "{}: insufficient data ({} bars), skipping", pair, len(ohlcv)
@@ -354,7 +410,45 @@ class TradingOrchestrator:
         # D. Combine signals
         combined = self._signal_combiner.combine(signal, ai_signals)
 
-        # E. Risk filters
+        if combined.type == SignalType.NEUTRAL:
+            logger.debug("{}: NEUTRAL signal, skipping", pair)
+            return
+
+        # E. Map the signal onto the current spot position
+        entry_price = float(ohlcv["close"].iloc[-1])
+        position_qty = await self._executor.get_position(pair)
+
+        if combined.type in (SignalType.CLOSE, SignalType.SHORT):
+            if position_qty <= 0:
+                if combined.type == SignalType.SHORT:
+                    logger.info(
+                        "{}: SHORT ignored — spot-only bot with no position", pair
+                    )
+                else:
+                    logger.debug("{}: CLOSE with no position, skipping", pair)
+                return
+            # Exits skip the confidence filters: a weak exit signal must never
+            # keep a position open.
+            await self._exit_position(pair, position_qty, entry_price)
+            return
+
+        # F. Entry (LONG): only when flat, trading allowed and confident
+        if position_qty > 0:
+            logger.debug(
+                "{}: LONG but already holding {:.8f}, skipping", pair, position_qty
+            )
+            return
+
+        assert self._drawdown_monitor is not None
+        if not self._drawdown_monitor.entries_allowed:
+            logger.info(
+                "{}: LONG blocked — risk state {} ({})",
+                pair,
+                self._drawdown_monitor.state.value,
+                self._drawdown_monitor.halt_reason,
+            )
+            return
+
         if not combined.should_trade:
             logger.debug("{}: should_trade=False, skipping", pair)
             return
@@ -363,22 +457,12 @@ class TradingOrchestrator:
             logger.debug("{}: AI confidence filter blocked", pair)
             return
 
-        if combined.type == SignalType.NEUTRAL:
-            logger.debug("{}: NEUTRAL signal, skipping", pair)
-            return
-
-        # F. Position sizing
-        entry_price = float(ohlcv["close"].iloc[-1])
-        side = self._signal_side(combined.type)
-        if side is None:
-            return
-
         position_size = self._position_sizer.calculate(
             pair=pair,
             signal_confidence=combined.combined_confidence,
             portfolio_value=portfolio_value,
             entry_price=entry_price,
-            side=side,
+            side="buy",
             ai_confidence=(ai_signals.prediction_confidence if ai_signals else None),
             ohlcv=ohlcv,
         )
@@ -386,18 +470,13 @@ class TradingOrchestrator:
             logger.debug("{}: position size zero, skipping", pair)
             return
 
-        # G. Execute
-        result = await self._execute_signal(pair, combined, position_size, entry_price)
-        if result:
-            logger.info(
-                "{}: {} {} qty={:.6f} @ ${:,.2f} (fee=${:.2f})",
-                pair,
-                result.side,
-                result.status,
-                result.filled_quantity,
-                result.filled_price,
-                result.fee,
-            )
+        # G. Execute and protect with a stop
+        result = await self._execute_order(
+            pair, "buy", position_size.quantity, entry_price
+        )
+        if not await self._report_fill(result, "signal_combiner"):
+            return
+        await self._register_stop(pair, position_size.stop_loss_price, ohlcv)
 
     async def _fetch_ohlcv(self, pair: str) -> pd.DataFrame:
         """Fetch recent OHLCV from the exchange."""
@@ -423,7 +502,12 @@ class TradingOrchestrator:
 
         if self._predictor is not None and self._predictor.is_loaded():
             try:
-                pred = self._predictor.predict(ohlcv)
+                features = (
+                    self._feature_engine.build_features(ohlcv)
+                    if self._feature_engine is not None
+                    else None
+                )
+                pred = self._predictor.predict(ohlcv, features=features)
                 prediction_conf = pred.confidence
                 prediction_ret = pred.predicted_return
             except Exception:
@@ -529,12 +613,24 @@ class TradingOrchestrator:
 
         dd = self._drawdown_monitor
         context["drawdown_pct"] = dd.current_drawdown_pct if dd else 0.0
-        context["open_positions"] = 0
+        context["open_positions"] = await self._count_open_positions()
         context["max_risk_pct"] = s.MAX_RISK_PER_TRADE_PCT
         context["max_position_pct"] = s.MAX_POSITION_PCT
         context["max_drawdown_pct"] = s.MAX_DRAWDOWN_PCT
 
         return context
+
+    async def _count_open_positions(self) -> int:
+        if self._executor is None:
+            return 0
+        count = 0
+        for pair in self._settings.TRADING_PAIRS:
+            try:
+                if await self._executor.get_position(pair) > 0:
+                    count += 1
+            except Exception:
+                logger.warning("{}: could not read position", pair)
+        return count
 
     async def _run_sentiment_cycle(self) -> None:
         """Separate job: fetch news/fear-greed, analyse, cache results."""
@@ -590,26 +686,287 @@ class TradingOrchestrator:
             except Exception:
                 logger.exception("Sentiment cycle failed for {}", pair)
 
-    async def _execute_signal(
-        self,
-        pair: str,
-        combined: CombinedSignal,
-        position_size: PositionSize,
-        price: float,
-    ) -> OrderResult | None:
-        """Execute an order via the executor."""
+    async def _execute_order(
+        self, pair: str, side: str, quantity: float, price: float
+    ) -> OrderResult:
+        """Send a market order via the executor."""
         assert self._executor is not None
-        side = self._signal_side(combined.type)
-        if side is None:
-            return None
-
         return await self._executor.place_order(
             pair=pair,
             side=side,
             order_type="market",
-            quantity=position_size.quantity,
+            quantity=quantity,
             price=price,
         )
+
+    async def _report_fill(self, result: OrderResult, strategy: str) -> bool:
+        """Log and notify a fill; False if nothing was filled."""
+        if result.filled_quantity <= 0:
+            logger.warning(
+                "{}: {} order not filled (status={})",
+                result.pair,
+                result.side,
+                result.status,
+            )
+            return False
+        logger.info(
+            "{}: {} {} qty={:.6f} @ ${:,.2f} (fee=${:.2f}) [{}]",
+            result.pair,
+            result.side,
+            result.status,
+            result.filled_quantity,
+            result.filled_price,
+            result.fee,
+            strategy,
+        )
+        if self._notifier is not None:
+            await self._notifier.send_trade_notification(
+                {
+                    "side": result.side,
+                    "pair": result.pair,
+                    "filled_price": result.filled_price,
+                    "filled_quantity": result.filled_quantity,
+                    "status": result.status,
+                    "strategy": strategy,
+                }
+            )
+        return True
+
+    # ------------------------------------------------------------------
+    # Private — stops
+    # ------------------------------------------------------------------
+
+    async def _register_stop(
+        self, pair: str, stop_price: float, ohlcv: pd.DataFrame
+    ) -> None:
+        """Protect a freshly filled entry: native stop if possible, else watched."""
+        assert self._executor is not None
+        if stop_price <= 0:
+            logger.warning("{}: no valid stop price, position unprotected", pair)
+            return
+        quantity = await self._executor.get_position(pair)
+        if quantity <= 0:
+            return
+        order_id = await self._executor.place_stop_loss(pair, quantity, stop_price)
+        entry_candle = (
+            ohlcv.index[-1] if isinstance(ohlcv.index, pd.DatetimeIndex) else None
+        )
+        self._stop_tracker.register(pair, stop_price, quantity, order_id, entry_candle)
+        logger.info(
+            "{}: stop-loss @ ${:,.2f} for {:.8f} ({})",
+            pair,
+            stop_price,
+            quantity,
+            f"exchange order {order_id}" if order_id else "watched by bot",
+        )
+        self._save_risk_state()
+
+    async def _process_stops(self, market_data: dict[str, pd.DataFrame]) -> None:
+        """Detect stops filled on the exchange or hit by candles; exit if so."""
+        for pair in self._stop_tracker.pairs():
+            stop = self._stop_tracker.get(pair)
+            if stop is None:
+                continue
+            try:
+                if stop.order_id is not None:
+                    await self._check_exchange_stop(pair, stop.order_id)
+                    continue
+                ohlcv = market_data.get(pair)
+                if ohlcv is None:
+                    continue
+                fill_price = self._stop_tracker.check_hit(pair, ohlcv)
+                if fill_price is not None:
+                    await self._execute_stop(pair, fill_price)
+            except Exception:
+                logger.exception("{}: stop processing failed", pair)
+        self._save_risk_state()
+
+    async def _check_exchange_stop(self, pair: str, order_id: str) -> None:
+        assert self._executor is not None
+        order = await self._executor.get_order(order_id, pair)
+        status = str(order.get("status") or "")
+        if status == "open":
+            return
+        if status == "closed":
+            self._stop_tracker.remove(pair)
+            price = float(order.get("average") or order.get("price") or 0.0)
+            qty = float(order.get("filled") or 0.0)
+            await self._notify_stop(pair, qty, price)
+            return
+        # Canceled/expired/rejected outside the bot: keep protecting it.
+        stop = self._stop_tracker.get(pair)
+        if stop is not None and await self._executor.get_position(pair) > 0:
+            logger.warning(
+                "{}: exchange stop {} is {}; bot will watch the stop",
+                pair,
+                order_id,
+                status or "unknown",
+            )
+            stop.order_id = None
+        else:
+            self._stop_tracker.remove(pair)
+
+    async def _execute_stop(self, pair: str, fill_price: float) -> None:
+        """Bot-side stop: sell the whole position at ``fill_price``."""
+        assert self._executor is not None
+        quantity = await self._executor.get_position(pair)
+        if quantity <= 0:
+            self._stop_tracker.remove(pair)
+            return
+        logger.warning("{}: STOP-LOSS hit @ ${:,.2f}", pair, fill_price)
+        result = await self._execute_order(pair, "sell", quantity, fill_price)
+        if not await self._report_fill(result, "stop_loss"):
+            return
+        self._stop_tracker.remove(pair)
+        await self._notify_stop(pair, result.filled_quantity, result.filled_price)
+
+    async def _notify_stop(self, pair: str, quantity: float, price: float) -> None:
+        logger.warning(
+            "{}: stop-loss executed — {:.8f} @ ${:,.2f}", pair, quantity, price
+        )
+        if self._notifier is not None:
+            await self._notifier.send_alert(
+                f"STOP-LOSS executed on {pair}: sold {quantity:.8f} @ ${price:,.2f}.",
+                level="warning",
+            )
+
+    async def _exit_position(self, pair: str, quantity: float, price: float) -> None:
+        """Signal exit: cancel the native stop first, then sell everything."""
+        assert self._executor is not None
+        stop = self._stop_tracker.get(pair)
+        cancelled_native = False
+        if stop is not None and stop.order_id is not None:
+            # The stop locks the balance; the sell fails while it is open.
+            cancelled_native = await self._executor.cancel_order(stop.order_id, pair)
+            if not cancelled_native:
+                logger.warning(
+                    "{}: could not cancel stop {}; sell may fail", pair, stop.order_id
+                )
+
+        try:
+            result = await self._execute_order(pair, "sell", quantity, price)
+        except Exception:
+            if cancelled_native and stop is not None:
+                stop.order_id = None  # keep watching it bot-side
+                self._save_risk_state()
+            raise
+
+        if await self._report_fill(result, "signal_combiner"):
+            self._stop_tracker.remove(pair)
+        elif cancelled_native and stop is not None:
+            stop.order_id = None
+        self._save_risk_state()
+
+    async def _reconcile_stops(self, native_orders_cancelled: bool) -> None:
+        """Drop stops of flat pairs; demote cancelled native stops to watched."""
+        assert self._executor is not None
+        for pair in self._stop_tracker.pairs():
+            stop = self._stop_tracker.get(pair)
+            if stop is None:
+                continue
+            try:
+                held = await self._executor.get_position(pair)
+            except Exception:
+                logger.exception("{}: could not reconcile stop", pair)
+                continue
+            if held <= 0:
+                self._stop_tracker.remove(pair)
+            elif native_orders_cancelled:
+                stop.order_id = None
+
+    # ------------------------------------------------------------------
+    # Private — kill-switch and persisted risk state
+    # ------------------------------------------------------------------
+
+    async def _handle_risk_trigger(self, state: TradingState) -> None:
+        """Liquidate and notify once, on entering DAILY_PAUSED or HALTED."""
+        assert self._executor is not None
+        assert self._drawdown_monitor is not None
+        reason = self._drawdown_monitor.halt_reason
+        if state == TradingState.HALTED:
+            message = (
+                f"KILL SWITCH — {reason}. Emergency liquidation in progress. "
+                "Trading HALTED until manual reset (RISK_RESET=true)."
+            )
+        else:
+            message = (
+                f"DAILY LOSS LIMIT — {reason}. Liquidating; new entries paused "
+                "until the next UTC day."
+            )
+        logger.warning(message)
+        if self._notifier is not None:
+            await self._notifier.send_alert(message, level="kill_switch")
+        try:
+            await self._executor.close_all_positions()
+        finally:
+            await self._reconcile_stops(native_orders_cancelled=True)
+
+    def _risk_state_path(self) -> Path:
+        s = self._settings
+        return Path(str(s.RISK_STATE_PATH).replace("{mode}", str(s.BOT_MODE)))
+
+    async def _load_risk_state(self, portfolio_value: float) -> None:
+        """Restore drawdown latch and stops from disk, or start fresh."""
+        self._risk_store = RiskStateStore(self._risk_state_path())
+        data = self._risk_store.load()
+
+        monitor: DrawdownMonitor | None = None
+        tracker = StopTracker()
+        if data is not None:
+            try:
+                monitor = DrawdownMonitor.from_dict(data["drawdown"])
+                tracker = StopTracker.from_dict(data.get("stops") or {})
+            except (KeyError, TypeError, ValueError, AttributeError):
+                logger.warning(
+                    "Risk state at {} is invalid — starting fresh",
+                    self._risk_store.path,
+                )
+                monitor, tracker = None, StopTracker()
+
+        if monitor is None:
+            monitor = DrawdownMonitor(initial_value=portfolio_value)
+            logger.info("Drawdown baseline: ${:,.2f}", portfolio_value)
+        else:
+            logger.info(
+                "Risk state restored from {} — state={}, stops={}",
+                self._risk_store.path,
+                monitor.state.value,
+                len(tracker),
+            )
+            if self._settings.BOT_MODE != "live":
+                # The paper account restarts at INITIAL_BALANCE: an old peak
+                # would read as a drawdown. Keep the latch, re-anchor values.
+                monitor.rebaseline(portfolio_value)
+
+        if self._settings.RISK_RESET is True:
+            logger.warning(
+                "RISK_RESET=true — clearing risk state {} and re-baselining at "
+                "${:,.2f}. Remove RISK_RESET from the environment.",
+                monitor.state.value,
+                portfolio_value,
+            )
+            monitor.reset(portfolio_value)
+
+        self._drawdown_monitor = monitor
+        self._stop_tracker = tracker
+        await self._reconcile_stops(native_orders_cancelled=False)
+        self._save_risk_state()
+
+    def _save_risk_state(self) -> None:
+        if self._risk_store is None or self._drawdown_monitor is None:
+            return
+        try:
+            self._risk_store.save(
+                {
+                    "version": 1,
+                    "mode": str(self._settings.BOT_MODE),
+                    "saved_at": datetime.now(UTC).isoformat(),
+                    "drawdown": self._drawdown_monitor.to_dict(),
+                    "stops": self._stop_tracker.to_dict(),
+                }
+            )
+        except Exception:
+            logger.exception("Failed to persist risk state")
 
     # ------------------------------------------------------------------
     # Private — signal handling
@@ -633,12 +990,3 @@ class TradingOrchestrator:
             except RuntimeError:
                 signal.signal(signal.SIGINT, _handle_shutdown)
                 signal.signal(signal.SIGTERM, _handle_shutdown)
-
-    @staticmethod
-    def _signal_side(signal_type: SignalType) -> str | None:
-        """Map SignalType to order side string."""
-        if signal_type == SignalType.LONG:
-            return "buy"
-        if signal_type in (SignalType.SHORT, SignalType.CLOSE):
-            return "sell"
-        return None
