@@ -79,6 +79,11 @@ def _make_settings(**overrides):
         "ENSEMBLE_MODELS": ["lightgbm"],
         "RISK_STATE_PATH": _RISK_STATE_PATH,
         "RISK_RESET": False,
+        "LLM_ANALYSIS_INTERVAL_MIN": 15,
+        "OHLCV_FETCH_MAX_RETRIES": 5,
+        "OHLCV_FETCH_TIMEOUT_S": 60.0,
+        "DL_MODEL_TYPE": "lightgbm",
+        "ML_MODEL_DIR": "var/models/prediction",
         "TELEGRAM_BOT_TOKEN": "",
         "TELEGRAM_CHAT_ID": "",
     }
@@ -269,7 +274,7 @@ class TestInitialisation:
         """Feature flags False -> no AI components."""
         orch = _setup_orchestrator()
         assert orch._sentiment_analyzer is None
-        assert orch._predictor is None
+        assert orch._predictors == {}
         assert orch._news_fetcher is None
         assert orch._fear_greed is None
 
@@ -818,9 +823,7 @@ class TestPositionAwareness:
         monkeypatch.setattr(ccxt_async, "binance", MagicMock(), raising=False)
         fetcher = MagicMock()
         fetcher.__aenter__ = AsyncMock(return_value=fetcher)
-        monkeypatch.setattr(
-            bot_module, "BinanceFetcher", MagicMock(return_value=fetcher)
-        )
+        monkeypatch.setattr(bot_module, "CCXTFetcher", MagicMock(return_value=fetcher))
         monkeypatch.setattr(
             LiveExecutor,
             "get_balance",
@@ -911,7 +914,9 @@ class TestStopLoss:
         assert stop.stop_price == 49_000.0  # from _make_position_size
         assert stop.quantity == pytest.approx(0.01)
         assert stop.order_id is None
-        assert stop.last_checked == ohlcv.index[-1].isoformat()
+        # The candle forming at entry (last closed + 1h) is never checked.
+        entry_candle = ohlcv.index[-1] + pd.Timedelta(hours=1)
+        assert stop.last_checked == entry_candle.isoformat()
 
     @pytest.mark.asyncio
     async def test_paper_stop_hit_by_low_sells_at_stop(self):
@@ -950,7 +955,19 @@ class TestStopLoss:
     @pytest.mark.asyncio
     async def test_paper_stop_not_touched_keeps_position(self):
         ohlcv = _flat_ohlcv()
-        ohlcv.iloc[-1, ohlcv.columns.get_loc("low")] = 40_000.0  # forming candle
+        # A still-forming candle (opens now) breaching the stop is dropped
+        # before stops run: its low is not final.
+        forming = pd.DataFrame(
+            {
+                "open": [50_000.0],
+                "high": [50_100.0],
+                "low": [40_000.0],
+                "close": [49_000.0],
+                "volume": [1.0],
+            },
+            index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC").floor("h")]),
+        )
+        ohlcv = pd.concat([ohlcv, forming])
         orch = self._orch(ohlcv)
         orch._executor = await _paper_with_btc()
         orch._stop_tracker.register(
@@ -1337,3 +1354,272 @@ class TestLifecycle:
         context = await orch._build_llm_context("BTC/USDT")
 
         assert context["open_positions"] == 1
+
+
+# ===========================================================================
+# Group 11: Market data, ML predictors, sentiment, cache expiry
+# ===========================================================================
+
+
+class TestMarketData:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("tf", "minutes"), [("15m", 15), ("1h", 60), ("4h", 240)])
+    async def test_since_matches_timeframe(self, tf, minutes):
+        orch = _setup_orchestrator(TRADING_TIMEFRAME=tf, OHLCV_LOOKBACK_BARS=100)
+        orch._fetcher = AsyncMock()
+        orch._fetcher.fetch_ohlcv = AsyncMock(return_value=_make_ohlcv())
+
+        before = datetime.now(UTC)
+        await orch._fetch_ohlcv("BTC/USDT")
+
+        kwargs = orch._fetcher.fetch_ohlcv.call_args.kwargs
+        # 100 closed bars + the forming one, plus one bar of slack.
+        expected = before - pd.Timedelta(minutes=minutes * 102)
+        assert abs((kwargs["since"] - expected).total_seconds()) < 5
+        assert kwargs["limit"] == 101
+        assert kwargs["timeframe"] == tf
+
+    @pytest.mark.asyncio
+    async def test_cycle_drops_open_candle_but_prices_it(self):
+        closed = _flat_ohlcv(price=50_000.0)
+        forming = pd.DataFrame(
+            {
+                "open": [50_000.0],
+                "high": [52_000.0],
+                "low": [49_000.0],
+                "close": [51_234.0],
+                "volume": [1.0],
+            },
+            index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC").floor("h")]),
+        )
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch, ohlcv=pd.concat([closed, forming]))
+
+        await orch.run_trading_cycle()
+
+        # Signals saw closed candles only; valuation/fills got the live price.
+        seen = orch._strategy_selectors["BTC/USDT"].generate_signal.call_args.args[0]
+        assert seen.index[-1] == closed.index[-1]
+        orch._executor.update_prices.assert_called_once_with({"BTC/USDT": 51_234.0})
+        assert orch._executor.place_order.call_args.kwargs["price"] == 51_234.0
+
+    @pytest.mark.asyncio
+    async def test_fetcher_uses_configured_exchange(self, monkeypatch):
+        import trading_bot.core.bot as bot_module
+
+        orch = _setup_orchestrator(
+            EXCHANGE_ID="kraken",
+            OHLCV_FETCH_MAX_RETRIES=2,
+            OHLCV_FETCH_TIMEOUT_S=7.0,
+        )
+        fetcher = MagicMock()
+        fetcher.__aenter__ = AsyncMock(return_value=fetcher)
+        factory = MagicMock(return_value=fetcher)
+        monkeypatch.setattr(bot_module, "CCXTFetcher", factory)
+
+        await orch._init_components()
+
+        kwargs = factory.call_args.kwargs
+        assert kwargs["exchange_id"] == "kraken"
+        assert kwargs["max_retries"] == 2
+        assert kwargs["timeout_s"] == 7.0
+
+
+class TestPredictors:
+    def _train_and_save(self, path):
+        from trading_bot.ai.prediction.lightgbm_model import LightGBMPredictor
+
+        rng = np.random.default_rng(0)
+        x = rng.normal(0, 1, (120, 3))
+        y = (x[:, 0] > 0).astype(int)
+        df = pd.DataFrame(x, columns=["a", "b", "c"])
+        df["label"] = y
+        model = LightGBMPredictor(
+            params={"early_stopping_rounds": 0, "n_estimators": 10}
+        )
+        model.train(df.iloc[:100], df.iloc[100:])
+        model.save(str(path))
+
+    def test_one_predictor_per_pair_loaded_by_path(self, tmp_path):
+        from trading_bot.ai.prediction.base import model_path
+
+        self._train_and_save(model_path(tmp_path, "BTC/USDT", "1h"))
+        orch = _setup_orchestrator(
+            TRADING_PAIRS=["BTC/USDT", "ETH/USDT"],
+            DL_MODEL_TYPE="lightgbm",
+            ML_MODEL_DIR=str(tmp_path),
+        )
+
+        orch._init_predictors()
+
+        assert list(orch._predictors) == ["BTC/USDT"]  # ETH has no model file
+        assert orch._predictors["BTC/USDT"].is_loaded()
+
+    def test_stub_model_type_disables_prediction(self, tmp_path):
+        from trading_bot.ai.prediction.base import model_path
+
+        self._train_and_save(model_path(tmp_path, "BTC/USDT", "1h"))
+        orch = _setup_orchestrator(DL_MODEL_TYPE="gru", ML_MODEL_DIR=str(tmp_path))
+
+        orch._init_predictors()
+
+        assert orch._predictors == {}
+
+    def test_prediction_unavailable_means_no_ai_prediction(self):
+        from trading_bot.ai.prediction.base import PredictionUnavailableError
+
+        orch = _setup_orchestrator()
+        _wire_mocks(orch)
+        predictor = MagicMock()
+        predictor.is_loaded.return_value = True
+        predictor.predict.side_effect = PredictionUnavailableError("NaN")
+        orch._predictors = {"BTC/USDT": predictor}
+
+        assert orch._build_ai_signals("BTC/USDT", _make_ohlcv()) is None
+
+    def test_each_pair_uses_its_own_predictor(self):
+        from trading_bot.core.models import Prediction
+
+        orch = _setup_orchestrator()
+        _wire_mocks(orch)
+
+        def predictor(conf):
+            p = MagicMock()
+            p.is_loaded.return_value = True
+            p.predict.return_value = Prediction(
+                pair="x",
+                timeframe="1h",
+                predicted_return=0.001,
+                predicted_direction="up",
+                confidence=conf,
+                model_type="lightgbm",
+                model_version="1.0",
+                features_used=[],
+                timestamp=datetime.now(UTC),
+            )
+            return p
+
+        orch._predictors = {"BTC/USDT": predictor(0.3), "ETH/USDT": predictor(0.8)}
+
+        btc = orch._build_ai_signals("BTC/USDT", _make_ohlcv())
+        eth = orch._build_ai_signals("ETH/USDT", _make_ohlcv())
+        assert btc.prediction_confidence == 0.3
+        assert eth.prediction_confidence == 0.8
+
+
+class TestSentimentAndCaches:
+    @pytest.mark.asyncio
+    async def test_sentiment_inference_does_not_block_event_loop(self):
+        import asyncio
+        import time
+
+        from trading_bot.core.models import NewsArticle, SentimentResult
+
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch)
+
+        def slow_batch(texts):
+            time.sleep(0.3)  # CPU-bound transformer inference stand-in
+            return [
+                SentimentResult(
+                    score=0.5,
+                    confidence=0.9,
+                    label="bullish",
+                    model_used="m",
+                    analyzed_text=t,
+                )
+                for t in texts
+            ]
+
+        analyzer = MagicMock()
+        analyzer.analyze_batch = MagicMock(side_effect=slow_batch)
+        orch._sentiment_analyzer = analyzer
+        orch._sentiment_aggregator = MagicMock()
+        orch._news_fetcher = AsyncMock()
+        orch._news_fetcher.fetch_by_pair = AsyncMock(
+            return_value=[
+                NewsArticle(
+                    title=f"t{i}",
+                    body="b",
+                    source="s",
+                    url="u",
+                    published_at=datetime.now(UTC),
+                )
+                for i in range(3)
+            ]
+        )
+        orch._fear_greed = None
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        tick_task = asyncio.create_task(ticker())
+        await orch._run_sentiment_cycle()
+        tick_task.cancel()
+
+        assert analyzer.analyze_batch.call_count == 1  # one batched call
+        assert len(analyzer.analyze_batch.call_args.args[0]) == 3
+        assert ticks >= 5  # the loop kept running during inference
+
+    def _sentiment(self, age_min):
+        return AggregatedSentiment(
+            pair="BTC/USDT",
+            overall_score=0.6,
+            news_score=0.5,
+            social_score=0.0,
+            fear_greed_score=0.7,
+            num_sources_analyzed=3,
+            time_window="1h",
+            timestamp=datetime.now(UTC) - pd.Timedelta(minutes=age_min),
+        )
+
+    def test_stale_sentiment_is_ignored(self):
+        orch = _setup_orchestrator(SENTIMENT_INTERVAL_MIN=15)
+        _wire_mocks(orch)
+
+        orch._latest_sentiment["BTC/USDT"] = self._sentiment(age_min=29)
+        assert orch._build_ai_signals("BTC/USDT", _make_ohlcv()) is not None
+
+        orch._latest_sentiment["BTC/USDT"] = self._sentiment(age_min=31)
+        assert orch._build_ai_signals("BTC/USDT", _make_ohlcv()) is None
+
+    def test_stale_llm_decision_is_ignored(self):
+        from trading_bot.core.models import OrchestratorDecision
+
+        orch = _setup_orchestrator(LLM_ANALYSIS_INTERVAL_MIN=15)
+        _wire_mocks(orch)
+
+        def decision(age_min):
+            return OrchestratorDecision(
+                pair="BTC/USDT",
+                final_recommendation="BUY",
+                confidence=0.8,
+                consensus=True,
+                agent_analyses=[],
+                reasoning="r",
+                total_tokens=0,
+                total_cost_usd=0.0,
+                total_latency_ms=0,
+                timestamp=datetime.now(UTC) - pd.Timedelta(minutes=age_min),
+            )
+
+        orch._latest_llm_decision["BTC/USDT"] = decision(age_min=10)
+        assert orch._build_ai_signals("BTC/USDT", _make_ohlcv()).llm_confidence == 0.8
+
+        orch._latest_llm_decision["BTC/USDT"] = decision(age_min=45)
+        assert orch._build_ai_signals("BTC/USDT", _make_ohlcv()) is None
+
+    @pytest.mark.asyncio
+    async def test_llm_context_ignores_stale_sentiment(self):
+        orch = _setup_orchestrator(SENTIMENT_INTERVAL_MIN=15)
+        _wire_mocks(orch)
+        orch._latest_sentiment["BTC/USDT"] = self._sentiment(age_min=120)
+
+        context = await orch._build_llm_context("BTC/USDT")
+
+        assert context["sentiment_score"] == 0.0

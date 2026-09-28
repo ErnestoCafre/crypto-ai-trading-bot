@@ -12,7 +12,7 @@ import pandas as pd
 from loguru import logger
 
 from trading_bot.ai.agents.orchestrator import Orchestrator
-from trading_bot.ai.prediction.base import BasePredictor
+from trading_bot.ai.prediction.base import BasePredictor, PredictionUnavailableError
 from trading_bot.ai.prediction.feature_engine import FeatureEngine
 from trading_bot.ai.sentiment.aggregator import SentimentAggregator
 from trading_bot.ai.sentiment.base import BaseSentimentAnalyzer
@@ -31,7 +31,11 @@ from trading_bot.core.signal_combiner import SignalCombiner
 from trading_bot.core.strategies.mean_reversion import MeanReversion
 from trading_bot.core.strategies.trend_following import TrendFollowing
 from trading_bot.core.strategy_selector import StrategySelector
-from trading_bot.data.market.binance import BinanceFetcher
+from trading_bot.data.market.candles import (
+    split_closed_candles,
+    timeframe_to_timedelta,
+)
+from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 from trading_bot.data.news.cryptocompare import CryptoCompareNews
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
 from trading_bot.execution.base import BaseExecutor
@@ -55,7 +59,7 @@ class TradingOrchestrator:
         self._closed: bool = False
 
         # Core components — initialised in start()
-        self._fetcher: BinanceFetcher | None = None
+        self._fetcher: CCXTFetcher | None = None
         self._executor: BaseExecutor | None = None
         self._feature_engine: FeatureEngine | None = None
         self._strategy_selectors: dict[str, StrategySelector] = {}
@@ -72,7 +76,7 @@ class TradingOrchestrator:
         self._sentiment_aggregator: SentimentAggregator | None = None
         self._news_fetcher: CryptoCompareNews | None = None
         self._fear_greed: FearGreedIndex | None = None
-        self._predictor: BasePredictor | None = None
+        self._predictors: dict[str, BasePredictor] = {}
 
         # LLM multi-agent components — optional, feature-flagged
         self._llm_orchestrator: Orchestrator | None = None
@@ -184,20 +188,21 @@ class TradingOrchestrator:
         assert self._executor is not None
         assert self._drawdown_monitor is not None
 
-        # Fetch market data first so the portfolio is valued at current prices
+        # Fetch market data first so the portfolio is valued at current prices.
+        # Signals/stops use closed candles only; the forming candle's close is
+        # the freshest price and drives valuation and fills.
         market_data: dict[str, pd.DataFrame] = {}
+        prices: dict[str, float] = {}
         for pair in self._settings.TRADING_PAIRS:
             try:
-                market_data[pair] = await self._fetch_ohlcv(pair)
+                closed, price = await self._fetch_market(pair)
             except Exception:
                 logger.exception("Error fetching market data for {}", pair)
-        self._executor.update_prices(
-            {
-                pair: float(ohlcv["close"].iloc[-1])
-                for pair, ohlcv in market_data.items()
-                if len(ohlcv) > 0
-            }
-        )
+                continue
+            market_data[pair] = closed
+            if price is not None:
+                prices[pair] = price
+        self._executor.update_prices(prices)
 
         # Stops run before valuation and signals, and regardless of halts.
         await self._process_stops(market_data)
@@ -226,8 +231,10 @@ class TradingOrchestrator:
             return
 
         for pair, ohlcv in market_data.items():
+            if pair not in prices:
+                continue
             try:
-                await self._process_pair(pair, ohlcv, portfolio_value)
+                await self._process_pair(pair, ohlcv, portfolio_value, prices[pair])
             except Exception:
                 logger.exception("Error processing {}", pair)
                 continue
@@ -306,10 +313,14 @@ class TradingOrchestrator:
         await self._load_risk_state(initial_balance["total"])
 
         # Data fetcher
-        self._fetcher = BinanceFetcher(
+        # Same exchange as execution: valuation and stops must see its prices.
+        self._fetcher = CCXTFetcher(
+            exchange_id=s.EXCHANGE_ID,
             api_key=s.EXCHANGE_API_KEY,
             api_secret=s.EXCHANGE_API_SECRET,
             sandbox=s.EXCHANGE_SANDBOX,
+            max_retries=s.OHLCV_FETCH_MAX_RETRIES,
+            timeout_s=s.OHLCV_FETCH_TIMEOUT_S,
         )
         await self._fetcher.__aenter__()
 
@@ -368,24 +379,47 @@ class TradingOrchestrator:
                 self._llm_orchestrator = None
 
         if s.USE_DL_PREDICTION or s.USE_ENSEMBLE:
-            try:
-                from trading_bot.ai.prediction.lightgbm_model import LightGBMPredictor
+            self._init_predictors()
 
-                self._predictor = LightGBMPredictor(
-                    pair=s.TRADING_PAIRS[0],
-                    timeframe=s.TRADING_TIMEFRAME,
-                )
-                logger.info("ML predictor initialised")
+    def _init_predictors(self) -> None:
+        """Load one trained model per pair; pairs without one get no ML."""
+        s = self._settings
+        self._predictors = {}
+        if str(s.DL_MODEL_TYPE).lower() != "lightgbm":
+            logger.warning(
+                "DL_MODEL_TYPE={} is not implemented (only 'lightgbm') — "
+                "ML prediction disabled",
+                s.DL_MODEL_TYPE,
+            )
+            return
+
+        from trading_bot.ai.prediction.base import model_path
+        from trading_bot.ai.prediction.lightgbm_model import LightGBMPredictor
+
+        for pair in s.TRADING_PAIRS:
+            path = model_path(s.ML_MODEL_DIR, pair, s.TRADING_TIMEFRAME)
+            if not path.exists():
+                logger.info("{}: no ML model at {} — no prediction", pair, path)
+                continue
+            predictor = LightGBMPredictor(pair=pair, timeframe=s.TRADING_TIMEFRAME)
+            try:
+                predictor.load(str(path))
             except Exception:
-                logger.exception("Failed to init predictor — continuing without ML")
-                self._predictor = None
+                logger.exception("{}: failed to load ML model {}", pair, path)
+                continue
+            self._predictors[pair] = predictor
+            logger.info("{}: ML model loaded from {}", pair, path)
 
     # ------------------------------------------------------------------
     # Private — per-pair pipeline
     # ------------------------------------------------------------------
 
     async def _process_pair(
-        self, pair: str, ohlcv: pd.DataFrame, portfolio_value: float
+        self,
+        pair: str,
+        ohlcv: pd.DataFrame,
+        portfolio_value: float,
+        price: float,
     ) -> None:
         """Full pipeline for one pair: signal -> risk -> position -> execute."""
         assert self._executor is not None
@@ -393,7 +427,7 @@ class TradingOrchestrator:
         assert self._ai_confidence_filter is not None
         assert self._position_sizer is not None
 
-        # A. Validate OHLCV (fetched by run_trading_cycle)
+        # A. Validate OHLCV (closed candles, fetched by run_trading_cycle)
         if len(ohlcv) < 50:
             logger.warning(
                 "{}: insufficient data ({} bars), skipping", pair, len(ohlcv)
@@ -415,7 +449,7 @@ class TradingOrchestrator:
             return
 
         # E. Map the signal onto the current spot position
-        entry_price = float(ohlcv["close"].iloc[-1])
+        entry_price = price
         position_qty = await self._executor.get_position(pair)
 
         if combined.type in (SignalType.CLOSE, SignalType.SHORT):
@@ -479,42 +513,51 @@ class TradingOrchestrator:
         await self._register_stop(pair, position_size.stop_loss_price, ohlcv)
 
     async def _fetch_ohlcv(self, pair: str) -> pd.DataFrame:
-        """Fetch recent OHLCV from the exchange."""
+        """Fetch the lookback window plus the forming candle (may be partial)."""
         assert self._fetcher is not None
         s = self._settings
-        since = datetime.now(UTC) - timedelta(
-            hours=s.OHLCV_LOOKBACK_BARS
-            * (60 if s.TRADING_TIMEFRAME == "1h" else 1)
-            / 60
+        bars = s.OHLCV_LOOKBACK_BARS + 1  # +1: the forming candle is dropped
+        since = datetime.now(UTC) - (bars + 1) * timeframe_to_timedelta(
+            s.TRADING_TIMEFRAME
         )
         return await self._fetcher.fetch_ohlcv(
             pair=pair,
             timeframe=s.TRADING_TIMEFRAME,
             since=since,
-            limit=s.OHLCV_LOOKBACK_BARS,
+            limit=bars,
+        )
+
+    async def _fetch_market(self, pair: str) -> tuple[pd.DataFrame, float | None]:
+        """Closed candles for signals and the latest traded price."""
+        raw = await self._fetch_ohlcv(pair)
+        return split_closed_candles(
+            raw, self._settings.TRADING_TIMEFRAME, datetime.now(UTC)
         )
 
     def _build_ai_signals(self, pair: str, ohlcv: pd.DataFrame) -> AISignals | None:
         """Build AISignals from cached sentiment + inline ML prediction + LLM."""
-        sentiment = self._latest_sentiment.get(pair)
+        sentiment = self._fresh_sentiment(pair)
         prediction_conf: float | None = None
         prediction_ret: float | None = None
 
-        if self._predictor is not None and self._predictor.is_loaded():
+        predictor = self._predictors.get(pair)
+        if predictor is not None and predictor.is_loaded():
             try:
                 features = (
                     self._feature_engine.build_features(ohlcv)
                     if self._feature_engine is not None
                     else None
                 )
-                pred = self._predictor.predict(ohlcv, features=features)
+                pred = predictor.predict(ohlcv, features=features)
                 prediction_conf = pred.confidence
                 prediction_ret = pred.predicted_return
+            except PredictionUnavailableError as exc:
+                logger.debug("{}: no ML prediction ({})", pair, exc)
             except Exception:
-                logger.warning("{}: ML prediction failed", pair)
+                logger.exception("{}: ML prediction failed", pair)
 
         # LLM multi-agent decision from cache
-        llm_decision = self._latest_llm_decision.get(pair)
+        llm_decision = self._fresh_llm_decision(pair)
         llm_rec: str | None = None
         llm_conf: float | None = None
         if llm_decision is not None:
@@ -531,6 +574,36 @@ class TradingOrchestrator:
             llm_recommendation=llm_rec,
             llm_confidence=llm_conf,
         )
+
+    def _is_fresh(self, pair: str, kind: str, ts: datetime, interval_min: int) -> bool:
+        """Cached AI results expire after 2x their job interval."""
+        age = datetime.now(UTC) - ts
+        if age <= timedelta(minutes=2 * interval_min):
+            return True
+        logger.debug("{}: ignoring stale {} ({} old)", pair, kind, age)
+        return False
+
+    def _fresh_sentiment(self, pair: str) -> AggregatedSentiment | None:
+        sentiment = self._latest_sentiment.get(pair)
+        if sentiment is None or not self._is_fresh(
+            pair,
+            "sentiment",
+            sentiment.timestamp,
+            self._settings.SENTIMENT_INTERVAL_MIN,
+        ):
+            return None
+        return sentiment
+
+    def _fresh_llm_decision(self, pair: str) -> OrchestratorDecision | None:
+        decision = self._latest_llm_decision.get(pair)
+        if decision is None or not self._is_fresh(
+            pair,
+            "LLM decision",
+            decision.timestamp,
+            self._settings.LLM_ANALYSIS_INTERVAL_MIN,
+        ):
+            return None
+        return decision
 
     async def _run_llm_cycle(self) -> None:
         """Separate job: run LLM agents for each pair, cache decisions."""
@@ -562,7 +635,7 @@ class TradingOrchestrator:
 
         # Technical indicators
         try:
-            ohlcv = await self._fetch_ohlcv(pair)
+            ohlcv, _ = await self._fetch_market(pair)
             if self._feature_engine is not None and len(ohlcv) >= 50:
                 features = self._feature_engine.build_features(ohlcv)
                 last_row = features.iloc[-1]
@@ -595,8 +668,8 @@ class TradingOrchestrator:
             context["indicators"] = {}
             context["regime"] = "UNKNOWN"
 
-        # Sentiment from cache
-        sentiment = self._latest_sentiment.get(pair)
+        # Sentiment from cache (expired entries are ignored)
+        sentiment = self._fresh_sentiment(pair)
         context["sentiment_score"] = sentiment.overall_score if sentiment else 0.0
         context["fear_greed"] = sentiment.fear_greed_score if sentiment else "N/A"
         context["headlines"] = []
@@ -649,10 +722,15 @@ class TradingOrchestrator:
                     articles = await self._news_fetcher.fetch_by_pair(
                         pair, since=since, limit=10
                     )
-                    for article in articles:
-                        text = f"{article.title}. {article.body}"
-                        result = self._sentiment_analyzer.analyze(text)
-                        sentiment_results.append(result)
+                    texts = [f"{a.title}. {a.body}" for a in articles]
+                    if texts:
+                        # Transformer inference is CPU-bound and synchronous:
+                        # keep it off the event loop (trading cycle, stops).
+                        sentiment_results.extend(
+                            await asyncio.to_thread(
+                                self._sentiment_analyzer.analyze_batch, texts
+                            )
+                        )
 
                 # Fear & Greed
                 if self._fear_greed is not None:
@@ -748,8 +826,12 @@ class TradingOrchestrator:
         if quantity <= 0:
             return
         order_id = await self._executor.place_stop_loss(pair, quantity, stop_price)
+        # The candle forming at entry (last closed + one bar) is never checked:
+        # its low may predate the fill.
         entry_candle = (
-            ohlcv.index[-1] if isinstance(ohlcv.index, pd.DatetimeIndex) else None
+            ohlcv.index[-1] + timeframe_to_timedelta(self._settings.TRADING_TIMEFRAME)
+            if isinstance(ohlcv.index, pd.DatetimeIndex) and len(ohlcv) > 0
+            else None
         )
         self._stop_tracker.register(pair, stop_price, quantity, order_id, entry_candle)
         logger.info(

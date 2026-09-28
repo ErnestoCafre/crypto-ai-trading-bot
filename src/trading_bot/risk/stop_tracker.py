@@ -34,8 +34,8 @@ class StopTracker:
     ) -> StopState:
         """Track a stop for a freshly filled entry.
 
-        Candles up to and including ``entry_candle`` are never evaluated:
-        their lows may predate the entry.
+        Candles up to and including ``entry_candle`` (the one forming at the
+        fill) are never evaluated: their lows may predate the entry.
         """
         stop = StopState(
             pair=pair,
@@ -63,11 +63,12 @@ class StopTracker:
         return len(self._stops)
 
     def check_hit(self, pair: str, ohlcv: pd.DataFrame) -> float | None:
-        """Fill price if a closed candle since the last check hit the stop.
+        """Fill price if a candle since the last check hit the stop.
 
-        The last row of ``ohlcv`` is the still-forming candle and is skipped.
-        A candle that opens at or below the stop (gap) fills at its open;
-        otherwise a low at or below the stop fills at the stop price.
+        ``ohlcv`` must hold closed candles only (see
+        ``data.market.candles.split_closed_candles``): a forming candle's low
+        is not final. A candle that opens at or below the stop (gap) fills at
+        its open; otherwise a low at or below the stop fills at the stop.
         """
         stop = self._stops.get(pair)
         if stop is None:
@@ -76,7 +77,7 @@ class StopTracker:
             logger.warning("{}: OHLCV has no timestamps, cannot check stop", pair)
             return None
 
-        closed = ohlcv.iloc[:-1]
+        closed = ohlcv
         if stop.last_checked is not None:
             closed = closed[closed.index > pd.Timestamp(stop.last_checked)]
         if closed.empty:

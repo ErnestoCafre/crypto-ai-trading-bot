@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     TRADING_TIMEFRAME: str = "1h"
     TRADING_INTERVAL_MINUTES: int = 60
     OHLCV_LOOKBACK_BARS: int = 250
+    # Bounded retries (exponential backoff + jitter) and a total timeout per
+    # OHLCV fetch, so an exchange outage cannot stall the trading cycle.
+    OHLCV_FETCH_MAX_RETRIES: int = 5
+    OHLCV_FETCH_TIMEOUT_S: float = 60.0
     INITIAL_BALANCE: float = 100_000.0
     PAPER_SLIPPAGE_PCT: float = 0.05
     PAPER_FEE_PCT: float = 0.1
@@ -77,7 +81,8 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
 
     # --- Deep Learning ---
-    DL_MODEL_TYPE: str = "gru"
+    # Only "lightgbm" is implemented; "gru"/"cnn_lstm" are stubs.
+    DL_MODEL_TYPE: str = "lightgbm"
     DL_WEIGHT: float = 0.2
     DL_RETRAIN_DAYS: int = 14
     DL_LOOKBACK_BARS: int = 168
@@ -116,6 +121,8 @@ class Settings(BaseSettings):
     # --- Ensemble ML ---
     USE_ENSEMBLE: bool = False
     ENSEMBLE_MODELS: list[str] = Field(default=["lightgbm"])
+    # Per-pair models: {ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl
+    ML_MODEL_DIR: str = "var/models/prediction"
     ML_LABEL_HORIZON: int = 1
     ML_LABEL_THRESHOLD: float = 0.001
     ML_TRAIN_RATIO: float = 0.7

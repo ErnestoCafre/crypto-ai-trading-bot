@@ -72,6 +72,23 @@ RISK_RESET=true uv run trading-bot   # una sola vez; re-baselinea al balance act
 # o bien: detener el bot y borrar var/state/risk_state_<modo>.json
 ```
 
+## Señales de IA y datos de mercado
+
+- **Velas**: señales, stops y ML usan solo velas cerradas; la vela en
+  formación se descarta (`data/market/candles.py`), pero su close es el precio
+  de mercado para valorar el portfolio y ejecutar. La descarga histórica
+  tampoco guarda la vela abierta.
+- **Fetcher**: reintentos acotados (`OHLCV_FETCH_MAX_RETRIES`) con backoff
+  exponencial + jitter y timeout total (`OHLCV_FETCH_TIMEOUT_S`); los datos se
+  piden al mismo exchange de ejecución (`EXCHANGE_ID`).
+- **Sentimiento**: `ElKulako/cryptobert` por defecto (ver ADR-003).
+- **Predicción ML**: un modelo LightGBM por par, cargado al arrancar desde
+  `{ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl` (lo publica `ModelTrainer`). Sin
+  archivo, ese par opera sin predicción. Los `.pkl` usan pickle: cargar solo
+  archivos generados por este proyecto; si existe el sidecar `.sha256` se
+  verifica.
+- Sentimiento y decisiones LLM cacheadas vencen a 2x el intervalo de su job.
+
 ## Desarrollo
 
 ```bash

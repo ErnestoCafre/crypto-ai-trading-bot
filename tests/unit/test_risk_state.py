@@ -23,7 +23,7 @@ class _Clock:
 
 
 def _bars(rows: list[tuple[float, float]]) -> pd.DataFrame:
-    """Hourly OHLCV from (open, low) tuples; the last row is still forming."""
+    """Hourly closed-candle OHLCV from (open, low) tuples."""
     index = pd.date_range("2026-01-01", periods=len(rows), freq="h", tz="UTC")
     return pd.DataFrame(
         {
@@ -137,11 +137,15 @@ class TestStopTracker:
         bars = _bars([(50_000, 49_900), (49_500, 48_100), (49_000, 48_500)])
         assert self._tracker(bars).check_hit("BTC/USDT", bars) is None
 
-    def test_entry_candle_and_forming_candle_are_ignored(self) -> None:
-        # Entry candle low (before the fill) and the forming candle both
-        # breach the stop; neither is a closed candle after entry.
-        bars = _bars([(50_000, 40_000), (49_500, 48_100), (48_200, 40_000)])
+    def test_entry_candle_is_ignored(self) -> None:
+        # The entry candle's low may predate the fill.
+        bars = _bars([(50_000, 40_000), (49_500, 48_100), (48_200, 48_150)])
         assert self._tracker(bars).check_hit("BTC/USDT", bars) is None
+
+    def test_last_row_is_evaluated_as_closed(self) -> None:
+        # Callers pass closed candles only, so the last row counts.
+        bars = _bars([(50_000, 49_900), (49_500, 48_100), (48_200, 47_000)])
+        assert self._tracker(bars).check_hit("BTC/USDT", bars) == 48_000.0
 
     def test_candles_are_checked_only_once(self) -> None:
         bars = _bars([(50_000, 49_900), (49_500, 48_100), (49_000, 48_500)])
@@ -149,13 +153,15 @@ class TestStopTracker:
         assert tracker.check_hit("BTC/USDT", bars) is None
         stop = tracker.get("BTC/USDT")
         assert stop is not None
-        assert stop.last_checked == bars.index[1].isoformat()
+        assert stop.last_checked == bars.index[2].isoformat()
+        # Re-checking the same candles does nothing.
+        assert tracker.check_hit("BTC/USDT", bars) is None
 
         # Next cycle: a new closed candle breaches the stop.
         later = _bars(
-            [(50_000, 49_900), (49_500, 48_100), (49_000, 47_000), (47_500, 47_400)]
+            [(50_000, 49_900), (49_500, 48_100), (49_000, 48_500), (47_500, 47_400)]
         )
-        assert tracker.check_hit("BTC/USDT", later) == 48_000.0
+        assert tracker.check_hit("BTC/USDT", later) == 47_500.0  # gap open
 
     def test_round_trip_dict(self) -> None:
         bars = _bars([(50_000, 49_900), (49_500, 48_100)])
