@@ -50,8 +50,12 @@ class OHLCVRepository:
                 ON CONFLICT (exchange, pair, timeframe, timestamp) DO NOTHING
                 """
             )
-            await self._session.execute(stmt, chunk)
-            rows_inserted += len(chunk)
+            result = await self._session.execute(stmt, chunk)
+            rc = getattr(result, "rowcount", None)
+            if rc is not None and rc >= 0:
+                rows_inserted += int(rc)
+            else:
+                rows_inserted += len(chunk)
 
         await self._session.commit()
         logger.debug(
