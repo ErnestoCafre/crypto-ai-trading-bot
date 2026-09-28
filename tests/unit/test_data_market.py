@@ -241,3 +241,153 @@ class TestBinanceFetcher:
 
         assert len(df) == 1
         assert fetcher._fetcher._exchange_id == "binance"
+
+
+# ---------------------------------------------------------------------------
+# CCXTFetcher — bounded retries, timeout, most-recent candles
+# ---------------------------------------------------------------------------
+
+
+def _fetcher(**kwargs: object):
+    from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
+
+    with patch("trading_bot.data.market.ccxt_fetcher.ccxt_async") as mock_ccxt:
+        import ccxt.async_support as real_ccxt
+
+        # Keep the real exception classes for the except clauses.
+        mock_ccxt.NetworkError = real_ccxt.NetworkError
+        mock_ccxt.RateLimitExceeded = real_ccxt.RateLimitExceeded
+        exchange = AsyncMock()
+        exchange.rateLimit = 50
+        mock_ccxt.binance.return_value = exchange
+        fetcher = CCXTFetcher(exchange_id="binance", sandbox=False, **kwargs)
+    return fetcher
+
+
+def _rows(n: int, start_ms: int = 1704067200000) -> list[list[float]]:
+    return [
+        [start_ms + i * 3_600_000, 1.0 + i, 2.0 + i, 0.5 + i, 1.5 + i, 10.0]
+        for i in range(n)
+    ]
+
+
+class TestFetcherResilience:
+    @pytest.mark.asyncio
+    async def test_reraises_after_max_retries(self) -> None:
+        import ccxt.async_support as ccxt_async
+
+        fetcher = _fetcher(max_retries=3)
+        fetcher._exchange.fetch_ohlcv = AsyncMock(
+            side_effect=ccxt_async.NetworkError("exchange down")
+        )
+        sleep = AsyncMock()
+        with (
+            patch("trading_bot.data.market.ccxt_fetcher.asyncio.sleep", sleep),
+            pytest.raises(ccxt_async.NetworkError),
+        ):
+            await fetcher.fetch_ohlcv(
+                "BTC/USDT", "1h", since=datetime(2024, 1, 1, tzinfo=UTC)
+            )
+
+        assert fetcher._exchange.fetch_ohlcv.await_count == 4  # 1 + 3 retries
+        delays = [c.args[0] for c in sleep.await_args_list]
+        assert len(delays) == 3
+        # Exponential backoff with jitter: each delay within [cap/2, cap].
+        for attempt, delay in enumerate(delays):
+            cap = min(30.0, 1.0 * 2**attempt)
+            assert cap / 2 <= delay <= cap
+
+    @pytest.mark.asyncio
+    async def test_recovers_within_retry_budget(self) -> None:
+        import ccxt.async_support as ccxt_async
+
+        fetcher = _fetcher(max_retries=3)
+        fetcher._exchange.fetch_ohlcv = AsyncMock(
+            side_effect=[ccxt_async.RequestTimeout("slow"), _rows(3)]
+        )
+        with patch("trading_bot.data.market.ccxt_fetcher.asyncio.sleep", AsyncMock()):
+            df = await fetcher.fetch_ohlcv(
+                "BTC/USDT", "1h", since=datetime(2024, 1, 1, tzinfo=UTC)
+            )
+        assert len(df) == 3
+
+    @pytest.mark.asyncio
+    async def test_total_timeout(self) -> None:
+        import asyncio
+
+        fetcher = _fetcher(timeout_s=0.05)
+
+        async def hang(*args: object, **kwargs: object) -> list[list[float]]:
+            await asyncio.sleep(10)
+            return []
+
+        fetcher._exchange.fetch_ohlcv = AsyncMock(side_effect=hang)
+        with pytest.raises(TimeoutError):
+            await fetcher.fetch_ohlcv(
+                "BTC/USDT", "1h", since=datetime(2024, 1, 1, tzinfo=UTC)
+            )
+
+    @pytest.mark.asyncio
+    async def test_limit_keeps_most_recent_candles(self) -> None:
+        fetcher = _fetcher()
+        rows = _rows(8)
+        # Pages of `limit` rows: 5 then 3 (short page ends pagination).
+        fetcher._exchange.fetch_ohlcv = AsyncMock(side_effect=[rows[:5], rows[5:]])
+        with patch("trading_bot.data.market.ccxt_fetcher.asyncio.sleep", AsyncMock()):
+            df = await fetcher.fetch_ohlcv(
+                "BTC/USDT", "1h", since=datetime(2024, 1, 1, tzinfo=UTC), limit=5
+            )
+        assert len(df) == 5
+        expected_last = pd.Timestamp(rows[-1][0], unit="ms", tz="UTC")
+        assert df.index[-1] == expected_last
+        assert df.index[0] == pd.Timestamp(rows[3][0], unit="ms", tz="UTC")
+
+
+class TestCandles:
+    @pytest.mark.parametrize(
+        ("tf", "seconds"), [("15m", 900), ("1h", 3600), ("4h", 14400), ("1d", 86400)]
+    )
+    def test_timeframe_to_timedelta(self, tf: str, seconds: int) -> None:
+        from trading_bot.data.market.candles import timeframe_to_timedelta
+
+        assert timeframe_to_timedelta(tf).total_seconds() == seconds
+
+    def test_open_candle_is_dropped_but_prices_latest(self) -> None:
+        from trading_bot.data.market.candles import split_closed_candles
+
+        index = pd.date_range("2026-01-01 00:00", periods=3, freq="h", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": [10.0, 11.0, 12.5],
+                "volume": 1.0,
+            },
+            index=index,
+        )
+        now = datetime(2026, 1, 1, 2, 30, tzinfo=UTC)  # 02:00 candle still open
+
+        closed, price = split_closed_candles(df, "1h", now)
+
+        assert list(closed.index) == list(index[:2])
+        assert price == 12.5
+
+    def test_candle_closing_exactly_now_is_closed(self) -> None:
+        from trading_bot.data.market.candles import split_closed_candles
+
+        index = pd.date_range("2026-01-01 00:00", periods=2, freq="15min", tz="UTC")
+        df = pd.DataFrame(
+            {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+            index=index,
+        )
+        closed, _ = split_closed_candles(
+            df, "15m", datetime(2026, 1, 1, 0, 30, tzinfo=UTC)
+        )
+        assert len(closed) == 2
+
+    def test_empty_frame(self) -> None:
+        from trading_bot.data.market.candles import split_closed_candles
+
+        closed, price = split_closed_candles(pd.DataFrame(), "1h", datetime.now(UTC))
+        assert closed.empty and price is None

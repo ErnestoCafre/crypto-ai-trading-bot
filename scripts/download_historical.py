@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from trading_bot.config import get_settings
 from trading_bot.config.logging import setup_logging
+from trading_bot.data.market.candles import split_closed_candles
 from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 from trading_bot.data.news.cryptocompare import CryptoCompareNews
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
@@ -48,6 +49,10 @@ async def download_ohlcv(
         )
 
         df = await fetcher.fetch_ohlcv(pair, timeframe, since=start)
+        # Never persist the forming candle: inserts are ON CONFLICT DO NOTHING
+        # and resume after the last stored timestamp, so its partial values
+        # would never be corrected.
+        df, _ = split_closed_candles(df, timeframe, datetime.now(UTC))
 
         if df.empty:
             logger.info("No new data for {} {} {}", pair, timeframe, exchange)
@@ -114,6 +119,9 @@ async def main() -> None:
         api_key=settings.EXCHANGE_API_KEY,
         api_secret=settings.EXCHANGE_API_SECRET,
         sandbox=False,
+        # Multi-year pagination legitimately takes minutes; retries still bound
+        # each page, so no total timeout here.
+        timeout_s=None,
     )
 
     semaphore = asyncio.Semaphore(5)
