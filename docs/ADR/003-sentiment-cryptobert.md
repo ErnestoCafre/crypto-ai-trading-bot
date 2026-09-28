@@ -34,3 +34,26 @@ Se necesita un modelo de NLP para analizar sentimiento en noticias y redes socia
 - Requiere ~500MB de disco y ~1-2GB de RAM para mantener el modelo cargado.
 - Si el modelo se elimina de Hugging Face, fallback a FinBERT (menos preciso en crypto).
 - Para sentimiento más sofisticado (resúmenes, contexto), se complementa con LLM en la Capa 2 (Fase 9).
+
+## Revisión 2026-09-28
+
+**Cambio de modelo por defecto**: `kk08/CryptoBERT` → `ElKulako/cryptobert`.
+
+- `kk08/CryptoBERT` no define `id2label` en su `config.json`: el pipeline
+  devuelve `LABEL_0` (negativo) / `LABEL_1` (positivo), que el analizador no
+  reconocía, así que el score de sentimiento era **siempre 0.0**. Además está
+  sin mantenimiento (última actualización dic-2024, ~950 descargas) y su card
+  indica un corpus propio reducido.
+- `ElKulako/cryptobert` (RoBERTa, 3 clases `Bearish`/`Neutral`/`Bullish`,
+  fine-tuned sobre 2M posts de StockTwits; actualizado may-2025, ~457k
+  descargas). Entrenado con secuencias de **128 tokens**: se usa ese
+  `max_length`.
+- Cada modelo soportado tiene un perfil explícito de etiquetas → polaridad
+  (verificado contra su `config.json`); los no perfilados se mapean desde
+  `config.id2label` y una etiqueta desconocida genera un warning, nunca un 0
+  silencioso.
+- El score pasa a ser la polaridad ponderada por probabilidad de todas las
+  clases (P(bullish) − P(bearish)), en [-1, 1].
+- La inferencia corre en batch y fuera del event loop (`asyncio.to_thread`).
+
+El fallback documentado sigue siendo `ProsusAI/finbert`.

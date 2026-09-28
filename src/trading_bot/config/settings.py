@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     USE_RL_AGENT: bool = False
 
     # --- Sentiment ---
-    SENTIMENT_MODEL: str = "kk08/CryptoBERT"
+    SENTIMENT_MODEL: str = "ElKulako/cryptobert"
     SENTIMENT_WEIGHT: float = 0.2
     SENTIMENT_INTERVAL_MIN: int = 15
 
