@@ -44,9 +44,11 @@ class RiskEvaluatorAgent(BaseAgent):
         return self._parse_response(raw, latency_ms, tokens_used)
 
     def _build_prompt(self, context: dict[str, object]) -> str:
+        pv = context.get("portfolio_value", 0.0)
+        portfolio_val = float(pv) if isinstance(pv, (int, float, str)) else 0.0
         return RISK_EVALUATOR_PROMPT.format(
             pair=context.get("pair", "UNKNOWN"),
-            portfolio_value=float(context.get("portfolio_value", 0.0)),
+            portfolio_value=portfolio_val,
             drawdown_pct=context.get("drawdown_pct", 0.0),
             open_positions=context.get("open_positions", 0),
             max_risk_pct=context.get("max_risk_pct", 1.0),
