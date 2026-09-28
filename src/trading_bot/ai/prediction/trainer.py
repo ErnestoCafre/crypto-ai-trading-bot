@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from trading_bot.ai.prediction.base import BasePredictor
+from trading_bot.ai.prediction.base import model_path as model_path_for
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +85,13 @@ class ModelTrainer:
         metrics: dict[str, float],
         pair: str,
         timeframe: str,
+        publish: bool = True,
     ) -> str:
-        """Save model and metadata, return the model path."""
+        """Save a timestamped model + metadata, return its path.
+
+        With ``publish`` the model is also written to the canonical
+        ``{pair}_{timeframe}.pkl`` path the trading bot loads at startup.
+        """
         timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         model_name = type(model).__name__.lower()
         fname = f"{model_name}_{pair.replace('/', '_')}_{timestamp}.pkl"
@@ -106,4 +112,8 @@ class ModelTrainer:
             json.dump(metadata, f, indent=2)
 
         logger.info("Model saved to %s", model_path)
+        if publish:
+            published = model_path_for(self._model_dir, pair, timeframe)
+            model.save(str(published))
+            logger.info("Model published for the bot at %s", published)
         return model_path

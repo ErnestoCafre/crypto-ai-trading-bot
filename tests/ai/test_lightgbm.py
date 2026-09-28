@@ -100,3 +100,101 @@ class TestLightGBMIsLoaded:
         train, val = _make_train_val()
         model.train(train, val)
         assert model.is_loaded()
+
+
+# ---------------------------------------------------------------------------
+# Inference correctness
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def trained() -> tuple[LightGBMPredictor, pd.DataFrame]:
+    model = LightGBMPredictor(params={"early_stopping_rounds": 0, "n_estimators": 50})
+    train, val = _make_train_val()
+    model.train(train, val)
+    return model, val.iloc[:, :-1]
+
+
+class TestLightGBMInference:
+    def test_confidence_varies_between_zero_and_one(self, trained) -> None:
+        model, feat = trained
+        confidences = {
+            round(model.predict(feat.iloc[: i + 1], feat.iloc[: i + 1]).confidence, 6)
+            for i in range(len(feat))
+        }
+        # predict() used to return the class label, so confidence was 1.0.
+        assert len(confidences) > 5
+        assert all(0.0 <= c <= 1.0 for c in confidences)
+        assert any(c < 0.99 for c in confidences)
+
+    def test_uses_probability_of_up_class(self, trained) -> None:
+        model, feat = trained
+        pred = model.predict(feat, feat)
+        prob_up = model._model.predict_proba(feat.iloc[[-1]])[0, 1]
+        assert pred.confidence == pytest.approx(abs(prob_up - 0.5) * 2)
+        assert pred.predicted_direction == ("up" if prob_up > 0.5 else "down")
+
+    def test_columns_aligned_with_extra_and_shuffled_columns(self, trained) -> None:
+        model, feat = trained
+        messy = feat[list(reversed(feat.columns))].copy()
+        messy["unrelated"] = 123.0
+        assert model.predict(messy, messy).confidence == pytest.approx(
+            model.predict(feat, feat).confidence
+        )
+
+    def test_nan_in_latest_row_means_no_prediction(self, trained) -> None:
+        from trading_bot.ai.prediction.base import PredictionUnavailableError
+
+        model, feat = trained
+        bad = feat.copy()
+        bad.iloc[-1, 2] = np.nan
+        with pytest.raises(PredictionUnavailableError, match="NaN"):
+            model.predict(bad, bad)
+
+    def test_missing_column_means_no_prediction(self, trained) -> None:
+        from trading_bot.ai.prediction.base import PredictionUnavailableError
+
+        model, feat = trained
+        with pytest.raises(PredictionUnavailableError, match="missing"):
+            model.predict(feat, feat.drop(columns=["feat_0"]))
+
+    def test_save_writes_checksum_and_load_verifies_it(
+        self, trained, tmp_path: Path
+    ) -> None:
+        model, feat = trained
+        path = tmp_path / "BTC_USDT_1h.pkl"
+        model.save(str(path))
+        sidecar = tmp_path / "BTC_USDT_1h.pkl.sha256"
+        assert sidecar.exists()
+
+        loaded = LightGBMPredictor()
+        loaded.load(str(path))
+        assert loaded.predict(feat, feat).confidence == pytest.approx(
+            model.predict(feat, feat).confidence
+        )
+
+        path.write_bytes(path.read_bytes() + b"tampered")
+        with pytest.raises(ValueError, match="Checksum mismatch"):
+            LightGBMPredictor().load(str(path))
+
+
+def test_model_path_is_sanitized() -> None:
+    from trading_bot.ai.prediction.base import model_path
+
+    assert model_path("var/m", "BTC/USDT", "1h") == Path("var/m/BTC_USDT_1h.pkl")
+    assert model_path("d", "BTC/USDT:USDT", "4h").name == "BTC_USDT_USDT_4h.pkl"
+
+
+def test_trainer_publishes_canonical_model(tmp_path: Path) -> None:
+    from trading_bot.ai.prediction.base import model_path
+    from trading_bot.ai.prediction.trainer import ModelTrainer
+
+    model = LightGBMPredictor(params={"early_stopping_rounds": 0, "n_estimators": 10})
+    train, val = _make_train_val()
+    model.train(train, val)
+
+    ModelTrainer(model_dir=str(tmp_path)).save_model_with_metadata(
+        model, {"accuracy": 0.5}, "ETH/USDT", "4h"
+    )
+
+    assert model_path(tmp_path, "ETH/USDT", "4h").exists()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import pickle
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from typing import Any
 
 import pandas as pd
 
-from trading_bot.ai.prediction.base import BasePredictor
+from trading_bot.ai.prediction.base import BasePredictor, PredictionUnavailableError
 from trading_bot.core.models import Prediction
 
 logger = logging.getLogger(__name__)
@@ -48,17 +49,31 @@ class LightGBMPredictor(BasePredictor):
         ohlcv: pd.DataFrame,
         features: pd.DataFrame | None = None,
     ) -> Prediction:
-        """Predict price direction. Must be trained first."""
+        """Predict the direction of the next bar from the latest feature row.
+
+        Features are aligned to the training columns (extra columns are
+        dropped, order restored). Raises PredictionUnavailableError when a
+        training column is missing or the latest row has NaN.
+        """
         if self._model is None:
             raise RuntimeError("Model not trained. Call train() or load() first.")
+        if not self._feature_names:
+            raise PredictionUnavailableError("model has no recorded feature names")
 
         feat = features if features is not None else ohlcv
-        proba = self._model.predict(feat)
+        if feat.empty:
+            raise PredictionUnavailableError("no feature rows")
+        missing = [c for c in self._feature_names if c not in feat.columns]
+        if missing:
+            raise PredictionUnavailableError(f"missing feature columns: {missing}")
+        latest = feat[self._feature_names].iloc[[-1]]
+        nan_cols = latest.columns[latest.isna().iloc[0]].tolist()
+        if nan_cols:
+            raise PredictionUnavailableError(f"NaN in latest row: {nan_cols}")
 
-        if hasattr(proba, "__len__") and len(proba) > 0:
-            prob_up = float(proba[-1])
-        else:
-            prob_up = 0.5
+        # LGBMClassifier.predict returns the class (0/1); the probability of
+        # the "up" class is what confidence must be derived from.
+        prob_up = float(self._model.predict_proba(latest)[0, 1])
 
         direction = "up" if prob_up > 0.5 else "down"
         predicted_return = (prob_up - 0.5) * 0.02
@@ -134,26 +149,44 @@ class LightGBMPredictor(BasePredictor):
         return metrics
 
     def load(self, model_path: str) -> None:
-        """Load a trained model from disk."""
-        with open(model_path, "rb") as f:
-            data = pickle.load(f)  # noqa: S301
+        """Load a trained model from disk.
+
+        Trust boundary: pickle executes code on load, so only load files this
+        project produced (save()/ModelTrainer) from the local model dir,
+        never downloaded or user-supplied ones. When a ``.sha256`` sidecar
+        exists the file must match it (guards against corrupt/partial files).
+        """
+        path = Path(model_path)
+        payload = path.read_bytes()
+        sidecar = _checksum_path(path)
+        if sidecar.exists():
+            expected = sidecar.read_text(encoding="utf-8").split()[0]
+            actual = hashlib.sha256(payload).hexdigest()
+            if actual != expected:
+                raise ValueError(f"Checksum mismatch for {path}")
+        else:
+            logger.warning("No checksum sidecar for %s; loading unverified", path)
+        data = pickle.loads(payload)  # noqa: S301 — trusted local artifact
         self._model = data["model"]
-        self._feature_names = data.get("feature_names", [])
+        self._feature_names = list(data.get("feature_names", []))
 
     def save(self, model_path: str) -> None:
         """Save the trained model to disk."""
         if self._model is None:
             raise RuntimeError("No trained model to save.")
 
-        Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(model_path, "wb") as f:
-            pickle.dump(
-                {
-                    "model": self._model,
-                    "feature_names": self._feature_names,
-                },
-                f,
-            )
+        path = Path(model_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = pickle.dumps(
+            {
+                "model": self._model,
+                "feature_names": self._feature_names,
+            }
+        )
+        path.write_bytes(payload)
+        _checksum_path(path).write_text(
+            f"{hashlib.sha256(payload).hexdigest()}  {path.name}\n", encoding="utf-8"
+        )
 
     def is_loaded(self) -> bool:
         """Return True if a model is available for prediction."""
@@ -172,3 +205,7 @@ class LightGBMPredictor(BasePredictor):
                 strict=False,
             )
         )
+
+
+def _checksum_path(path: Path) -> Path:
+    return path.with_name(path.name + ".sha256")
