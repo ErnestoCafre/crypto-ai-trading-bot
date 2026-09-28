@@ -94,6 +94,7 @@ python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+disable_error_code = ["import-untyped"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -101,7 +102,7 @@ module = [
     "optuna.*", "transformers.*", "stable_baselines3.*",
     "gymnasium.*", "quantstats.*", "riskfolio.*", "streamlit.*",
     "plotly.*", "telegram.*", "pandas_ta_classic.*", "talib.*",
-    "apscheduler.*",
+    "apscheduler.*", "pandas", "pandas.*", "sklearn", "sklearn.*",
 ]
 ignore_missing_imports = true
 
