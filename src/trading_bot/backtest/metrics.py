@@ -110,7 +110,7 @@ class MetricsCalculator:
             daily_rf = risk_free_rate / 252
             excess = returns - daily_rf
             downside = excess[excess < 0]
-            if len(downside) > 0 and np.std(downside, ddof=1) > 0:
+            if len(downside) > 1 and np.std(downside, ddof=1) > 0:
                 metrics["sortino_ratio"] = float(
                     np.mean(excess) / np.std(downside, ddof=1) * np.sqrt(252)
                 )
