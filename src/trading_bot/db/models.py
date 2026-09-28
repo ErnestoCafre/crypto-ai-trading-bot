@@ -7,6 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     Index,
@@ -21,6 +22,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from trading_bot.db.base import Base
 
+JSONVariant = JSON().with_variant(JSONB, "postgresql")
+BigIntPK = BigInteger().with_variant(Integer, "sqlite")
+
+
 # ---------------------------------------------------------------------------
 # 1. ohlcv_data — Market data cache
 # ---------------------------------------------------------------------------
@@ -29,7 +34,7 @@ from trading_bot.db.base import Base
 class OHLCVData(Base):
     __tablename__ = "ohlcv_data"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     exchange: Mapped[str] = mapped_column(String(50))
     pair: Mapped[str] = mapped_column(String(20))
     timeframe: Mapped[str] = mapped_column(String(10))
@@ -127,7 +132,7 @@ class Trade(Base):
 class PortfolioSnapshot(Base):
     __tablename__ = "portfolio_snapshots"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     timestamp: Mapped[datetime] = mapped_column()
     total_value_usd: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     cash_balance_usd: Mapped[Decimal] = mapped_column(Numeric(20, 8))
@@ -152,7 +157,7 @@ class PortfolioSnapshot(Base):
 class SentimentHistory(Base):
     __tablename__ = "sentiment_history"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     pair: Mapped[str] = mapped_column(String(20))
     source: Mapped[str] = mapped_column(String(30))
     model_used: Mapped[str] = mapped_column(String(50))
@@ -160,7 +165,7 @@ class SentimentHistory(Base):
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     aggregated_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     raw_text: Mapped[str | None] = mapped_column(Text)
-    metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSONVariant)
     analyzed_at: Mapped[datetime] = mapped_column()
 
     __table_args__ = (
@@ -177,7 +182,7 @@ class SentimentHistory(Base):
 class PredictionRecord(Base):
     __tablename__ = "predictions"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     pair: Mapped[str] = mapped_column(String(20))
     timeframe: Mapped[str] = mapped_column(String(10))
     model_type: Mapped[str] = mapped_column(String(30))
@@ -187,7 +192,7 @@ class PredictionRecord(Base):
     confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
     actual_return: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     was_correct: Mapped[bool | None] = mapped_column(Boolean)
-    features_snapshot: Mapped[dict | None] = mapped_column(JSONB)
+    features_snapshot: Mapped[dict | None] = mapped_column(JSONVariant)
     predicted_at: Mapped[datetime] = mapped_column()
     evaluated_at: Mapped[datetime | None] = mapped_column()
 
@@ -205,14 +210,14 @@ class PredictionRecord(Base):
 class LLMAnalysisLog(Base):
     __tablename__ = "llm_analysis_log"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     pair: Mapped[str] = mapped_column(String(20))
     llm_provider: Mapped[str] = mapped_column(String(20))
     llm_model: Mapped[str] = mapped_column(String(50))
-    technical_analysis: Mapped[dict] = mapped_column(JSONB)
-    sentiment_analysis: Mapped[dict] = mapped_column(JSONB)
-    risk_evaluation: Mapped[dict] = mapped_column(JSONB)
-    orchestrator_decision: Mapped[dict] = mapped_column(JSONB)
+    technical_analysis: Mapped[dict] = mapped_column(JSONVariant)
+    sentiment_analysis: Mapped[dict] = mapped_column(JSONVariant)
+    risk_evaluation: Mapped[dict] = mapped_column(JSONVariant)
+    orchestrator_decision: Mapped[dict] = mapped_column(JSONVariant)
     final_recommendation: Mapped[str] = mapped_column(String(10))
     confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
     reasoning: Mapped[str] = mapped_column(Text)
@@ -236,7 +241,7 @@ class LLMAnalysisLog(Base):
 class ModelMetric(Base):
     __tablename__ = "model_metrics"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     model_name: Mapped[str] = mapped_column(String(50))
     model_type: Mapped[str] = mapped_column(String(30))
     version: Mapped[str] = mapped_column(String(50))
@@ -250,8 +255,8 @@ class ModelMetric(Base):
     sharpe_ratio: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     mse: Mapped[Decimal | None] = mapped_column(Numeric(15, 8))
     mae: Mapped[Decimal | None] = mapped_column(Numeric(15, 8))
-    hyperparameters: Mapped[dict | None] = mapped_column(JSONB)
-    feature_importance: Mapped[dict | None] = mapped_column(JSONB)
+    hyperparameters: Mapped[dict | None] = mapped_column(JSONVariant)
+    feature_importance: Mapped[dict | None] = mapped_column(JSONVariant)
     model_path: Mapped[str] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean)
     trained_at: Mapped[datetime] = mapped_column()
