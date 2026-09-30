@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from importlib.util import find_spec
 from typing import Any
 
 from trading_bot.ai.sentiment.base import BaseSentimentAnalyzer
@@ -54,6 +55,20 @@ _GENERIC_POLARITY = {
 }
 
 
+def _require_backend() -> None:
+    """Fail at construction, not on the first analysis, without the extra.
+
+    transformers and torch are the optional ``sentiment`` extra; the bot's
+    init catches this and runs without sentiment.
+    """
+    missing = [m for m in ("transformers", "torch") if find_spec(m) is None]
+    if missing:
+        raise ImportError(
+            f"Sentiment analysis needs {', '.join(missing)}: "
+            "install with `uv sync --extra sentiment`"
+        )
+
+
 class CryptoBERTAnalyzer(BaseSentimentAnalyzer):
     """Sentiment analysis with a Hugging Face text-classification model.
 
@@ -71,6 +86,7 @@ class CryptoBERTAnalyzer(BaseSentimentAnalyzer):
         max_length: int | None = None,
         batch_size: int = 16,
     ) -> None:
+        _require_backend()
         self._model_name = model_name
         self._device = device
         self._profile = MODEL_PROFILES.get(model_name.lower())

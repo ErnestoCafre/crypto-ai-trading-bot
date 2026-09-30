@@ -146,3 +146,14 @@ class TestIsLoaded:
 
     def test_loaded_after_pipeline_set(self) -> None:
         assert _analyzer("ElKulako/cryptobert", _pipe()).is_loaded()
+
+
+def test_missing_optional_backend_fails_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import trading_bot.ai.sentiment.cryptobert as mod
+
+    monkeypatch.undo()  # drop the conftest stub
+    monkeypatch.setattr(mod, "find_spec", lambda name: None)
+    with pytest.raises(ImportError, match="--extra sentiment"):
+        mod.CryptoBERTAnalyzer()

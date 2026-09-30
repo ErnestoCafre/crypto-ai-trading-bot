@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from trading_bot.ai.prediction.base import BasePredictor, PredictionUnavailableError
@@ -122,7 +123,8 @@ class LightGBMPredictor(BasePredictor):
         model.fit(
             x_train,
             y_train,
-            eval_set=[(x_val, y_val)],
+            eval_X=(x_val,),
+            eval_y=(y_val,),
             callbacks=callbacks,
         )
 
@@ -134,7 +136,7 @@ class LightGBMPredictor(BasePredictor):
             roc_auc_score,
         )
 
-        y_pred_proba = model.predict_proba(x_val)[:, 1]
+        y_pred_proba = np.asarray(model.predict_proba(x_val))[:, 1]
         y_pred = model.predict(x_val)
 
         metrics: dict[str, float] = {

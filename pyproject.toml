@@ -8,46 +8,33 @@ license = {text = "MIT"}
 
 dependencies = [
     # Core
-    "ccxt>=4.0",
-    "pandas>=2.2",
+    "ccxt>=4.5",
+    "pandas>=2.2,<3",
     "numpy>=1.26",
-    "sqlalchemy>=2.0.48",
+    "sqlalchemy[asyncio]>=2.0.48,<2.2",
     "alembic>=1.18",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "loguru>=0.7",
-    "structlog>=24.0",
-    "apscheduler>=3.10",
-    "python-telegram-bot>=21.0",
+    "apscheduler>=3.10,<4",
     # Technical analysis
-    "pandas-ta-classic>=0.1",
-    # Backtesting
-    "vectorbt>=0.26",
-    "backtesting>=0.3",
+    "pandas-ta-classic>=0.8.32",
     # ML
     "scikit-learn>=1.4",
-    "lightgbm>=4.0",
-    "optuna>=3.6",
-    # AI
-    "torch>=2.2",
-    "transformers>=4.36",
-    "anthropic>=0.25",
-    "openai>=1.12",
-    "stable-baselines3>=2.3",
-    "gymnasium>=0.29",
+    "lightgbm>=4.7",
+    "optuna>=4.0,<6",
+    # LLM agents (anthropic 1.x breaks the agents' client code)
+    "anthropic>=0.25,<1",
+    "openai>=1.12,<3",
     # Data
-    "aiohttp>=3.9",
     "httpx>=0.27",
     # Metrics
     "quantstats>=0.0.62",
-    # Portfolio
-    "riskfolio-lib>=7.0",
     # Dashboard
-    "streamlit>=1.32",
+    "streamlit>=1.50",
     "plotly>=5.18",
-    # DB driver
+    # DB driver (URLs are rewritten to postgresql+asyncpg://)
     "asyncpg>=0.29",
-    "psycopg2-binary>=2.9",
 ]
 
 [project.scripts]
@@ -60,13 +47,32 @@ dev = [
     "aiosqlite>=0.20",
     "pytest-asyncio>=0.23",
     "hypothesis>=6.98",
-    "ruff>=0.3",
-    "mypy>=1.9",
+    "ruff>=0.15",
+    "mypy>=1.19",
     "pre-commit>=3.6",
 ]
 ta-lib = [
     "TA-Lib>=0.4",
 ]
+# Transformer sentiment (USE_SENTIMENT=true): transformers needs torch as backend.
+sentiment = [
+    "transformers>=4.36",
+    "torch>=2.2",
+]
+# Planned deep-learning predictors (GRU / CNN-LSTM stubs).
+dl = [
+    "torch>=2.2",
+]
+# Planned reinforcement-learning agent (stubs).
+rl = [
+    "stable-baselines3>=2.3",
+    "gymnasium>=0.29",
+]
+
+[tool.uv]
+# ccxt pins urllib3 to the exact release current when it was published;
+# override it to pick up security fixes (CVE-2026-97689, fixed in 2.8.0).
+override-dependencies = ["urllib3>=2.8"]
 
 [tool.ruff]
 target-version = "py312"
@@ -81,13 +87,22 @@ select = [
     "UP",
     "B",
     "SIM",
+    "TID",
 ]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# ADR-005: indicators come from pandas_ta_classic; metrics from quantstats.
+"pandas_ta".msg = "Use pandas_ta_classic (ADR-005)."
+"pyfolio".msg = "Unmaintained; use quantstats (ADR-005)."
+"empyrical".msg = "Unmaintained; use quantstats (ADR-005)."
 
 [tool.ruff.lint.isort]
 known-first-party = ["trading_bot"]
 
 [tool.ruff.format]
 quote-style = "double"
+# Code blocks in the docs are illustrative specs, not source.
+exclude = ["*.md"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -98,10 +113,9 @@ disable_error_code = ["import-untyped"]
 
 [[tool.mypy.overrides]]
 module = [
-    "ccxt.*", "vectorbt.*", "backtesting.*", "lightgbm.*",
-    "optuna.*", "transformers.*", "stable_baselines3.*",
-    "gymnasium.*", "quantstats.*", "riskfolio.*", "streamlit.*",
-    "plotly.*", "telegram.*", "pandas_ta_classic.*", "talib.*",
+    "ccxt.*", "lightgbm.*",
+    "optuna.*", "transformers.*", "quantstats.*", "streamlit.*",
+    "plotly.*", "pandas_ta_classic.*",
     "apscheduler.*", "pandas", "pandas.*", "sklearn", "sklearn.*",
 ]
 ignore_missing_imports = true
