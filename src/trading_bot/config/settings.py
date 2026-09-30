@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from typing import Annotated
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -30,7 +32,11 @@ class Settings(BaseSettings):
     EXCHANGE_SANDBOX: bool = True
 
     # --- Trading ---
-    TRADING_PAIRS: list[str] = Field(default=["BTC/USDT", "ETH/USDT", "SOL/USDT"])
+    # NoDecode: pydantic-settings would otherwise JSON-decode list fields read
+    # from the environment and reject the comma-separated form in .env.example.
+    TRADING_PAIRS: Annotated[list[str], NoDecode] = Field(
+        default=["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    )
 
     # --- Orchestrator ---
     TRADING_TIMEFRAME: str = "1h"
@@ -134,7 +140,7 @@ class Settings(BaseSettings):
     # Not wired into live trading yet: enabling it only logs a warning and
     # the per-pair LightGBM models are used (see TradingOrchestrator).
     USE_ENSEMBLE: bool = False
-    ENSEMBLE_MODELS: list[str] = Field(default=["lightgbm"])
+    ENSEMBLE_MODELS: Annotated[list[str], NoDecode] = Field(default=["lightgbm"])
     # Per-pair models: {ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl
     ML_MODEL_DIR: str = "var/models/prediction"
     ML_LABEL_HORIZON: int = 1
@@ -152,11 +158,14 @@ class Settings(BaseSettings):
             raise ValueError("TECHNICAL_WEIGHT must be > 0")
         return self
 
-    @field_validator("TRADING_PAIRS", mode="before")
+    @field_validator("TRADING_PAIRS", "ENSEMBLE_MODELS", mode="before")
     @classmethod
-    def parse_trading_pairs(cls, v: str | list[str]) -> list[str]:
+    def parse_str_list(cls, v: str | list[str]) -> list[str]:
+        """Accept a comma-separated string or a JSON array for list settings."""
         if isinstance(v, str):
-            return [p.strip() for p in v.split(",")]
+            if v.strip().startswith("["):
+                return list(json.loads(v))
+            return [p.strip() for p in v.split(",") if p.strip()]
         return v
 
 

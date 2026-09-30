@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -22,6 +24,28 @@ class TestSettings:
     def test_trading_pairs_accepts_list(self) -> None:
         s = Settings(TRADING_PAIRS=["SOL/USDT"])
         assert s.TRADING_PAIRS == ["SOL/USDT"]
+
+    def test_trading_pairs_csv_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRADING_PAIRS", "BTC/USDT, ETH/USDT,SOL/USDT")
+        s = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert s.TRADING_PAIRS == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
+    def test_trading_pairs_csv_from_env_file(self, tmp_path: Path) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text("TRADING_PAIRS=BTC/USDT,ETH/USDT,SOL/USDT\n")
+        s = Settings(_env_file=env_file)  # type: ignore[call-arg]
+        assert s.TRADING_PAIRS == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
+    def test_list_settings_accept_json_array_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRADING_PAIRS", '["BTC/USDT", "ETH/USDT"]')
+        monkeypatch.setenv("ENSEMBLE_MODELS", "lightgbm,gru")
+        s = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert s.TRADING_PAIRS == ["BTC/USDT", "ETH/USDT"]
+        assert s.ENSEMBLE_MODELS == ["lightgbm", "gru"]
 
     def test_ai_flags_default_disabled(self) -> None:
         s = Settings()
