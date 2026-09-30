@@ -2,43 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
 from trading_bot.config import get_settings
-
-
-def generate_mock_ohlcv(pair: str, n_bars: int = 100) -> pd.DataFrame:
-    """Generate sample OHLCV data for dashboard visualization when offline."""
-    rng = np.random.default_rng(42)
-    base_price = 65000.0 if "BTC" in pair else (3400.0 if "ETH" in pair else 140.0)
-    returns = rng.normal(0.0005, 0.015, n_bars)
-    prices = base_price * np.exp(np.cumsum(returns))
-
-    dates = pd.date_range(end=datetime.now(UTC), periods=n_bars, freq="1h")
-    highs = prices * (1 + rng.uniform(0.001, 0.01, n_bars))
-    lows = prices * (1 - rng.uniform(0.001, 0.01, n_bars))
-    opens = np.roll(prices, 1)
-    opens[0] = base_price
-    volumes = rng.uniform(50, 500, n_bars) * (base_price / 1000)
-
-    df = pd.DataFrame(
-        {
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": prices,
-            "volume": volumes,
-        },
-        index=dates,
-    )
-    df.index.name = "timestamp"
-    return df
+from trading_bot.config.settings import Settings
+from trading_bot.dashboard.data import (
+    DbView,
+    RiskView,
+    load_db_view,
+    load_ohlcv,
+    load_risk_view,
+)
+from trading_bot.healthcheck import risk_state_path
 
 
 def build_candlestick_chart(df: pd.DataFrame, pair: str) -> go.Figure:
@@ -104,6 +84,68 @@ def build_candlestick_chart(df: pd.DataFrame, pair: str) -> go.Figure:
     return fig
 
 
+NO_DATA = "sin datos"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_ohlcv(pair: str, timeframe: str) -> pd.DataFrame | None:
+    return load_ohlcv(get_settings(), pair, timeframe)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_db() -> DbView | None:
+    return load_db_view()
+
+
+def _fmt_age(age: timedelta | None) -> str:
+    if age is None:
+        return NO_DATA
+    minutes = int(age.total_seconds() // 60)
+    return (
+        f"hace {minutes // 60}h {minutes % 60}m"
+        if minutes >= 60
+        else f"hace {minutes}m"
+    )
+
+
+def render_header(settings: Settings, risk: RiskView | None, db: DbView | None) -> None:
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        if risk is not None:
+            st.metric(
+                "Portfolio (último ciclo)",
+                f"${risk.last_value:,.2f}",
+                f"{risk.daily_pnl_pct:+.2f}% hoy",
+            )
+        else:
+            st.metric("Portfolio (último ciclo)", NO_DATA)
+    with col2:
+        if risk is not None:
+            st.metric(
+                "Drawdown actual",
+                f"{risk.drawdown_pct:.2f}%",
+                f"Límite: {settings.MAX_DRAWDOWN_PCT}%",
+                delta_color="off",
+            )
+        else:
+            st.metric("Drawdown actual", NO_DATA)
+    with col3:
+        win_rate = db.win_rate if db is not None else None
+        if win_rate is not None and db is not None:
+            st.metric(
+                "Win rate (trades cerrados)",
+                f"{win_rate:.1%}",
+                f"{len(db.trades)} trades",
+                delta_color="off",
+            )
+        else:
+            st.metric("Win rate (trades cerrados)", NO_DATA)
+    with col4:
+        st.metric("Estado de riesgo", risk.state.upper() if risk else NO_DATA)
+        if risk is not None and risk.halt_reason:
+            st.caption(risk.halt_reason)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="AI Crypto Trading Bot",
@@ -113,137 +155,109 @@ def main() -> None:
     )
 
     settings = get_settings()
+    risk = load_risk_view(settings)
+    db = _cached_db()
 
     # --- Sidebar ---
-    st.sidebar.title("🤖 Trading Bot Control")
+    st.sidebar.title("🤖 Trading Bot")
     st.sidebar.markdown(f"**Modo:** `{settings.BOT_MODE.upper()}`")
     st.sidebar.markdown(f"**Exchange:** `{settings.EXCHANGE_ID.capitalize()}`")
 
     selected_pair = st.sidebar.selectbox(
         "Par seleccionado", settings.TRADING_PAIRS, index=0
     )
-    _ = st.sidebar.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], index=1)
+    timeframes = ["15m", "1h", "4h", "1d"]
+    default_tf = (
+        timeframes.index(settings.TRADING_TIMEFRAME)
+        if settings.TRADING_TIMEFRAME in timeframes
+        else 1
+    )
+    timeframe = st.sidebar.selectbox("Timeframe", timeframes, index=default_tf)
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🛡️ Risk Parameters")
-    st.sidebar.text(f"Max Risk/Trade: {settings.MAX_RISK_PER_TRADE_PCT}%")
-    st.sidebar.text(f"Max Drawdown: {settings.MAX_DRAWDOWN_PCT}%")
-    st.sidebar.text("Kill-Switch: Activo")
+    st.sidebar.subheader("🛡️ Parámetros de riesgo")
+    st.sidebar.text(f"Riesgo máx./trade: {settings.MAX_RISK_PER_TRADE_PCT}%")
+    st.sidebar.text(f"Drawdown máx.: {settings.MAX_DRAWDOWN_PCT}%")
+    st.sidebar.text(f"Pérdida diaria máx.: {settings.MAX_DAILY_LOSS_PCT}%")
+    st.sidebar.text(
+        f"Último ciclo: {_fmt_age(risk.heartbeat_age) if risk else NO_DATA}"
+    )
+    if st.sidebar.button("Refrescar"):
+        st.cache_data.clear()
 
     # --- Header Metrics ---
     st.title("📊 Crypto AI Trading Terminal")
     st.caption(
-        f"Última actualización: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        f"Renderizado: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        + (f" · estado guardado: {risk.saved_at}" if risk and risk.saved_at else "")
     )
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Portfolio Total", f"${settings.INITIAL_BALANCE:,.2f}", "+2.4% (24h)")
-    with col2:
-        st.metric("Drawdown Actual", "3.2%", f"Límite: {settings.MAX_DRAWDOWN_PCT}%")
-    with col3:
-        st.metric("Win Rate Estimado", "63.5%", "+1.2%")
-    with col4:
-        st.metric("Kill Switch", "NORMAL", delta_color="normal")
-
-    st.markdown("---")
-
-    # --- Main Content Grid ---
-    chart_col, ai_col = st.columns([3, 1])
-
-    with chart_col:
-        df_bars = generate_mock_ohlcv(selected_pair)
-        fig = build_candlestick_chart(df_bars, selected_pair)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with ai_col:
-        st.subheader("🧠 Señales de IA")
-
-        # Sentiment Indicator
-        st.markdown("**1. Sentimiento (CryptoBERT)**")
-        sentiment_score = 0.68
-        st.progress(sentiment_score)
-        st.caption(f"Score: `{sentiment_score:.2f}` (Alcista moderado)")
-
-        # Prediction Indicator
-        st.markdown("**2. Predicción ML (LightGBM)**")
-        st.metric(label="Retorno esperado 1h", value="+0.84%", delta="BUY")
-
-        # LLM Multi-Agent Decision
-        st.markdown("**3. Consenso Agentes LLM**")
-        st.success("Recomendación: **LONG** (Confianza: 78%)")
-        st.caption(
-            "Los indicadores técnicos confirman tendencia alcista "
-            "con soporte respetado y sentimiento positivo."
+    if risk is None:
+        st.info(
+            "No hay estado de riesgo del bot en "
+            f"`{risk_state_path(settings)}`: el bot no corrió todavía en modo "
+            f"`{settings.BOT_MODE}` o el volumen no está montado."
         )
+    render_header(settings, risk, db)
 
     st.markdown("---")
 
-    # --- Recent Activity Tabs ---
-    tab1, tab2, tab3 = st.tabs(
-        ["📋 Órdenes Recientes", "💼 Posiciones Abiertas", "⚙️ Configuración del Bot"]
+    # --- Market chart ---
+    df_bars = _cached_ohlcv(selected_pair, timeframe)
+    if df_bars is not None:
+        st.plotly_chart(
+            build_candlestick_chart(df_bars, selected_pair), width="stretch"
+        )
+    else:
+        st.warning(f"Datos de mercado de {selected_pair}: {NO_DATA}")
+
+    if db is not None and not db.equity.empty:
+        st.subheader("Equity (snapshots)")
+        st.line_chart(db.equity)
+
+    # --- Activity tabs ---
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["📋 Trades cerrados", "💼 Posiciones abiertas", "🛑 Stops", "⚙️ Configuración"]
     )
 
     with tab1:
-        mock_trades = pd.DataFrame(
-            [
-                {
-                    "ID": "ord-001",
-                    "Par": "BTC/USDT",
-                    "Lado": "BUY",
-                    "Precio": 64850.0,
-                    "Cantidad": 0.15,
-                    "Fee": "$9.72",
-                    "Estado": "FILLED",
-                },
-                {
-                    "ID": "ord-002",
-                    "Par": "ETH/USDT",
-                    "Lado": "BUY",
-                    "Precio": 3410.5,
-                    "Cantidad": 2.5,
-                    "Fee": "$8.52",
-                    "Estado": "FILLED",
-                },
-                {
-                    "ID": "ord-003",
-                    "Par": "SOL/USDT",
-                    "Lado": "SELL",
-                    "Precio": 142.2,
-                    "Cantidad": 20.0,
-                    "Fee": "$2.84",
-                    "Estado": "FILLED",
-                },
-            ]
-        )
-        st.dataframe(mock_trades, use_container_width=True)
+        if db is None:
+            st.write(f"Base de datos: {NO_DATA} (no disponible)")
+        elif db.trades.empty:
+            st.write(NO_DATA)
+        else:
+            st.dataframe(db.trades, width="stretch")
 
     with tab2:
-        mock_positions = pd.DataFrame(
-            [
-                {
-                    "Par": "BTC/USDT",
-                    "Tamaño": 0.15,
-                    "Precio Entrada": 64850.0,
-                    "Precio Actual": 65320.0,
-                    "PnL No Realizado": "+$70.50 (+0.72%)",
-                },
-                {
-                    "Par": "ETH/USDT",
-                    "Tamaño": 2.5,
-                    "Precio Entrada": 3410.5,
-                    "Precio Actual": 3425.0,
-                    "PnL No Realizado": "+$36.25 (+0.42%)",
-                },
-            ]
-        )
-        st.dataframe(mock_positions, use_container_width=True)
+        if db is None or db.open_trades.empty:
+            st.write(NO_DATA)
+        else:
+            st.dataframe(db.open_trades, width="stretch")
 
     with tab3:
+        if risk is None or not risk.stops:
+            st.write(NO_DATA)
+        else:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Par": s.pair,
+                            "Stop": s.stop_price,
+                            "Cantidad": s.quantity,
+                            "Orden en exchange": s.exchange_order,
+                        }
+                        for s in risk.stops
+                    ]
+                ),
+                width="stretch",
+            )
+
+    with tab4:
         st.json(
             {
                 "BOT_MODE": settings.BOT_MODE,
                 "EXCHANGE": settings.EXCHANGE_ID,
+                "TRADING_TIMEFRAME": settings.TRADING_TIMEFRAME,
                 "USE_SENTIMENT": settings.USE_SENTIMENT,
                 "USE_LLM_AGENT": settings.USE_LLM_AGENT,
                 "USE_DL_PREDICTION": settings.USE_DL_PREDICTION,
