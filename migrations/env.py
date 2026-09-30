@@ -10,8 +10,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 import trading_bot.db.models  # noqa: F401
-from trading_bot.config import get_settings
-from trading_bot.db.base import Base
+from trading_bot.db.base import Base, build_url
 
 config = context.config
 
@@ -23,10 +22,7 @@ target_metadata = Base.metadata
 
 def _get_url() -> str:
     """Get database URL from settings, converting to asyncpg driver."""
-    url = get_settings().DATABASE_URL
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
+    return build_url()
 
 
 def run_migrations_offline() -> None:

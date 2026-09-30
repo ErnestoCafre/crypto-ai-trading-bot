@@ -20,7 +20,7 @@ from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 from trading_bot.data.news.cryptocompare import CryptoCompareNews
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
 from trading_bot.data.storage import OHLCVRepository
-from trading_bot.db.base import async_session_factory
+from trading_bot.db.base import get_session_factory
 
 
 async def download_ohlcv(
@@ -132,7 +132,7 @@ async def main() -> None:
         # Each task gets its own DB session (AsyncSession is not task-safe)
         tasks = [
             download_ohlcv(
-                fetcher, async_session_factory, exchange, pair, tf, since, semaphore
+                fetcher, get_session_factory(), exchange, pair, tf, since, semaphore
             )
             for pair in pairs
             for tf in timeframes
