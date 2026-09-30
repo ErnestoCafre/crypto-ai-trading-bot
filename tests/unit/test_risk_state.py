@@ -206,7 +206,7 @@ class TestRiskStateStore:
         def boom(*_: object, **__: object) -> None:
             raise OSError("disk full")
 
-        monkeypatch.setattr("trading_bot.risk.risk_state.os.replace", boom)
+        monkeypatch.setattr("trading_bot.state_file.os.replace", boom)
         with pytest.raises(OSError):
             store.save({"version": 2})
         assert store.load() == {"version": 1}

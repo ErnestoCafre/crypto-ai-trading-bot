@@ -160,7 +160,7 @@ class TestStrategySelector:
         assert classification.regime == MarketRegime.RANGING
 
     def test_volatile_reduces_sizing(self) -> None:
-        """VOLATILE regime should reduce signal confidence/strength."""
+        """VOLATILE tags the signal for reduced sizing; confidence unchanged."""
         selector = self._make_selector()
         selector._detector.classify = MagicMock(  # type: ignore[method-assign]
             return_value=RegimeClassification(
@@ -192,7 +192,59 @@ class TestStrategySelector:
         signal, classification = selector.generate_signal(ohlcv)
 
         assert signal is not None
-        # default volatile_sizing_factor = 0.5
-        assert signal.confidence == pytest.approx(0.8 * 0.5)
-        assert signal.strength == pytest.approx(0.7 * 0.5)
+        # Scaling confidence would drop 0.8 → 0.4 < threshold and block the
+        # entry; the factor must reach the sizer instead.
+        assert signal.confidence == pytest.approx(0.8)
+        assert signal.strength == pytest.approx(0.7)
         assert signal.metadata.get("regime") == "volatile"
+        # default volatile_sizing_factor = 0.5
+        assert signal.metadata.get("sizing_factor") == 0.5
+
+
+class TestRegimeDisabled:
+    @staticmethod
+    def _selector(use_regime: bool, regime: MarketRegime) -> StrategySelector:
+        fe = MagicMock(spec=FeatureEngine)
+        fe.build_features = MagicMock(side_effect=lambda df: df)
+        trend = TrendFollowing(pair="BTC/USDT", feature_engine=fe)
+        reversion = MeanReversion(pair="BTC/USDT", feature_engine=fe)
+        detector = RegimeDetector(feature_engine=fe)
+        detector.classify = MagicMock(  # type: ignore[method-assign]
+            return_value=RegimeClassification(
+                regime=regime,
+                confidence=0.7,
+                adx_value=15.0,
+                volatility_percentile=95.0,
+                trend_strength=0.3,
+                timestamp=pd.Timestamp.now(tz="UTC"),
+            )
+        )
+        return StrategySelector(trend, reversion, detector, use_regime=use_regime)
+
+    def test_disabled_always_uses_trend(self) -> None:
+        selector = self._selector(False, MarketRegime.RANGING)
+        strategy, classification = selector.select(_make_ohlcv(100))
+        assert strategy.name == "trend_following"
+        # Still classified, for reporting.
+        assert classification.regime == MarketRegime.RANGING
+
+    def test_disabled_never_tags_volatile_sizing(self) -> None:
+        from datetime import UTC, datetime
+
+        from trading_bot.core.models import Signal
+
+        selector = self._selector(False, MarketRegime.VOLATILE)
+        selector._trend.generate_signal = MagicMock(  # type: ignore[method-assign]
+            return_value=Signal(
+                type=SignalType.LONG,
+                pair="BTC/USDT",
+                confidence=0.8,
+                strength=0.7,
+                source="trend_following",
+                metadata={},
+                timestamp=datetime.now(UTC),
+            )
+        )
+        signal, _ = selector.generate_signal(_make_ohlcv(100))
+        assert signal is not None
+        assert "sizing_factor" not in signal.metadata

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from trading_bot.config.settings import get_settings
+from trading_bot.config.settings import Settings, get_settings
 
 
 class TradingState(StrEnum):
@@ -27,8 +27,9 @@ class DrawdownMonitor:
         self,
         initial_value: float = 0.0,
         clock: Callable[[], datetime] = _utc_now,
+        settings: Settings | None = None,
     ) -> None:
-        settings = get_settings()
+        settings = settings or get_settings()
         self._max_dd_pct = settings.MAX_DRAWDOWN_PCT
         self._max_daily_loss_pct = settings.MAX_DAILY_LOSS_PCT
         self._clock = clock
@@ -158,12 +159,15 @@ class DrawdownMonitor:
         cls,
         data: dict[str, Any],
         clock: Callable[[], datetime] = _utc_now,
+        settings: Settings | None = None,
     ) -> DrawdownMonitor:
         """Rebuild a monitor from :meth:`to_dict` output.
 
         Raises KeyError/TypeError/ValueError on malformed data.
         """
-        monitor = cls(initial_value=float(data["peak_value"]), clock=clock)
+        monitor = cls(
+            initial_value=float(data["peak_value"]), clock=clock, settings=settings
+        )
         monitor._day_start_value = float(data["day_start_value"])
         monitor._current_day = str(data["current_day"])
         monitor._last_value = float(data["last_value"])

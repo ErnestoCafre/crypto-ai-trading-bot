@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from trading_bot.config.settings import Settings
 
 
@@ -32,3 +35,17 @@ class TestSettings:
         assert s.MAX_RISK_PER_TRADE_PCT == 1.0
         assert s.MAX_DRAWDOWN_PCT == 15.0
         assert s.MAX_DAILY_LOSS_PCT == 3.0
+
+
+class TestSignalWeightValidation:
+    def test_negative_weight_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, SENTIMENT_WEIGHT=-0.1)  # type: ignore[call-arg]
+
+    def test_zero_technical_weight_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, TECHNICAL_WEIGHT=0.0)  # type: ignore[call-arg]
+
+    def test_threshold_must_be_a_probability(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, MIN_CONFIDENCE_THRESHOLD=1.5)  # type: ignore[call-arg]

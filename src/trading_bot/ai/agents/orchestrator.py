@@ -7,17 +7,14 @@ import logging
 from collections import Counter
 from datetime import UTC, datetime
 
-from trading_bot.ai.agents.base import BaseAgent
+from trading_bot.ai.agents.base import DEFAULT_LLM_MODEL, BaseAgent
 from trading_bot.ai.sentiment.cost_tracker import SentimentCostTracker
 from trading_bot.core.models import AgentAnalysis, OrchestratorDecision
 
 logger = logging.getLogger(__name__)
 
-# Estimated tokens per agent call (~800 prompt + response)
-_ESTIMATED_TOKENS_PER_AGENT = 800
-# Haiku rate: $0.25 per 1M input + $1.25 per 1M output ≈ $0.00025 per 1K tokens
-_COST_PER_1K_TOKENS = 0.00025
 _AGENT_TIMEOUT_S = 15.0
+_TIMED_OUT = object()
 
 
 class Orchestrator:
@@ -28,7 +25,7 @@ class Orchestrator:
         agents: list[BaseAgent],
         cost_tracker: SentimentCostTracker,
         provider: str = "anthropic",
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = DEFAULT_LLM_MODEL,
     ) -> None:
         self._agents = agents
         self._cost_tracker = cost_tracker
@@ -39,12 +36,17 @@ class Orchestrator:
         self, pair: str, context: dict[str, object]
     ) -> OrchestratorDecision | None:
         """Execute all agents, apply consensus, return decision or None."""
-        # Budget check
-        estimated_cost = (
-            len(self._agents) * _ESTIMATED_TOKENS_PER_AGENT / 1000 * _COST_PER_1K_TOKENS
-        )
-        if not self._cost_tracker.can_spend(estimated_cost):
-            logger.warning("LLM budget exceeded — skipping agent analysis")
+        # Budget check against the worst case: every agent uses its whole
+        # prompt and output budget.
+        max_costs = [agent.estimate_max_cost_usd(context) for agent in self._agents]
+        if not self._cost_tracker.can_spend(sum(max_costs)):
+            logger.warning(
+                "LLM budget exceeded (spent $%.4f today, next run up to $%.4f) "
+                "— skipping agent analysis",
+                self._cost_tracker.daily_spent_usd,
+                sum(max_costs),
+            )
+            self._cost_tracker.mark_exhausted()
             return None
 
         # Run agents in parallel
@@ -52,8 +54,19 @@ class Orchestrator:
             *[self._safe_analyze(agent, context) for agent in self._agents]
         )
 
-        # Filter failures
-        analyses: list[AgentAnalysis] = [r for r in results if r is not None]
+        # A timed-out call may still be billed: charge its worst case.
+        timed_out_cost = sum(
+            cost
+            for result, cost in zip(results, max_costs, strict=True)
+            if result is _TIMED_OUT
+        )
+        analyses: list[AgentAnalysis] = [
+            r for r in results if isinstance(r, AgentAnalysis)
+        ]
+        actual_cost = sum(a.cost_usd for a in analyses) + timed_out_cost
+        if actual_cost > 0:
+            self._cost_tracker.record_cost(actual_cost)
+
         if not analyses:
             logger.warning("All agents failed for %s", pair)
             return None
@@ -61,11 +74,7 @@ class Orchestrator:
         # Consensus
         recommendation, confidence, consensus = self._apply_consensus(analyses)
 
-        # Record cost
         total_tokens = sum(a.tokens_used for a in analyses)
-        actual_cost = total_tokens / 1000 * _COST_PER_1K_TOKENS
-        self._cost_tracker.record_cost(actual_cost)
-
         total_latency = max((a.latency_ms for a in analyses), default=0)
 
         reasoning_parts = [f"{a.agent_name}: {a.recommendation}" for a in analyses]
@@ -86,8 +95,8 @@ class Orchestrator:
 
     async def _safe_analyze(
         self, agent: BaseAgent, context: dict[str, object]
-    ) -> AgentAnalysis | None:
-        """Run a single agent with timeout; return None on failure."""
+    ) -> AgentAnalysis | object | None:
+        """Run a single agent with timeout; _TIMED_OUT or None on failure."""
         try:
             return await asyncio.wait_for(
                 agent.analyze(context), timeout=_AGENT_TIMEOUT_S
@@ -96,7 +105,7 @@ class Orchestrator:
             logger.warning(
                 "Agent %s timed out after %.0fs", agent.name, _AGENT_TIMEOUT_S
             )
-            return None
+            return _TIMED_OUT
         except Exception:
             logger.exception("Agent %s failed", agent.name)
             return None

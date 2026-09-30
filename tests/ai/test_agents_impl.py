@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from trading_bot.ai.agents.base import LLMCompletion
 from trading_bot.ai.agents.orchestrator import Orchestrator
 from trading_bot.ai.agents.risk_evaluator import RiskEvaluatorAgent
 from trading_bot.ai.agents.sentiment_analyst import SentimentAnalystAgent
@@ -35,10 +36,15 @@ def _valid_json(**overrides) -> str:
     return json.dumps(data)
 
 
+def _llm_returns(text: str, input_tokens: int = 300, output_tokens: int = 80):
+    return AsyncMock(return_value=LLMCompletion(text, input_tokens, output_tokens))
+
+
 def _make_analysis(
     name: str = "test_agent",
     recommendation: str = "LONG",
     confidence: float = 0.8,
+    cost_usd: float = 0.001,
 ) -> AgentAnalysis:
     return AgentAnalysis(
         agent_name=name,
@@ -49,7 +55,19 @@ def _make_analysis(
         raw_response="{}",
         tokens_used=100,
         latency_ms=50,
+        input_tokens=80,
+        output_tokens=20,
+        cost_usd=cost_usd,
     )
+
+
+def _mock_agent(name: str, max_cost_usd: float = 0.002, **analyze) -> MagicMock:
+    """Agent double; ``analyze`` kwargs configure its AsyncMock."""
+    agent = MagicMock()
+    agent.name = name
+    agent.estimate_max_cost_usd = MagicMock(return_value=max_cost_usd)
+    agent.analyze = AsyncMock(**analyze)
+    return agent
 
 
 def _make_ohlcv(n: int = 250, seed: int = 42) -> pd.DataFrame:
@@ -99,10 +117,13 @@ def _make_settings(**overrides):
         "CRYPTOCOMPARE_API_KEY": "",
         "TECHNICAL_WEIGHT": 0.4,
         "MIN_CONFIDENCE_THRESHOLD": 0.5,
+        "AI_SIZING_FLOOR": 0.25,
         "ENSEMBLE_MODELS": ["lightgbm"],
         "LLM_PROVIDER": "anthropic",
         "LLM_MODEL": "claude-haiku-4-5-20251001",
         "LLM_WEIGHT": 0.2,
+        "DL_WEIGHT": 0.2,
+        "LLM_COST_STATE_PATH": "unused",
         "LLM_ANALYSIS_INTERVAL_MIN": 15,
         "LLM_MAX_DAILY_COST_USD": 5.0,
         "ANTHROPIC_API_KEY": "test-key",
@@ -142,7 +163,7 @@ class TestTechnicalAnalystAgent:
     @pytest.mark.asyncio
     async def test_technical_parses_valid_json(self):
         agent = TechnicalAnalystAgent()
-        agent._call_llm_async = AsyncMock(return_value=_valid_json())
+        agent._call_llm_async = _llm_returns(_valid_json())
 
         result = await agent.analyze({"pair": "BTC/USDT", "timeframe": "1h"})
 
@@ -155,7 +176,7 @@ class TestTechnicalAnalystAgent:
     @pytest.mark.asyncio
     async def test_technical_handles_malformed_json(self):
         agent = TechnicalAnalystAgent()
-        agent._call_llm_async = AsyncMock(return_value="not valid json {{{")
+        agent._call_llm_async = _llm_returns("not valid json {{{")
 
         result = await agent.analyze({"pair": "BTC/USDT"})
 
@@ -202,8 +223,8 @@ class TestSentimentAnalystAgent:
     @pytest.mark.asyncio
     async def test_sentiment_parses_valid_response(self):
         agent = SentimentAnalystAgent()
-        agent._call_llm_async = AsyncMock(
-            return_value=_valid_json(recommendation="SHORT", confidence=0.7)
+        agent._call_llm_async = _llm_returns(
+            _valid_json(recommendation="SHORT", confidence=0.7)
         )
 
         result = await agent.analyze({"pair": "BTC/USDT"})
@@ -243,8 +264,8 @@ class TestRiskEvaluatorAgent:
     @pytest.mark.asyncio
     async def test_risk_parses_valid_response(self):
         agent = RiskEvaluatorAgent()
-        agent._call_llm_async = AsyncMock(
-            return_value=_valid_json(recommendation="NEUTRAL", confidence=0.9)
+        agent._call_llm_async = _llm_returns(
+            _valid_json(recommendation="NEUTRAL", confidence=0.9)
         )
 
         result = await agent.analyze({"pair": "BTC/USDT"})
@@ -264,12 +285,12 @@ class TestSharedParsing:
     async def test_clamps_confidence(self):
         agent = TechnicalAnalystAgent()
         # confidence > 1
-        agent._call_llm_async = AsyncMock(return_value=_valid_json(confidence=5.0))
+        agent._call_llm_async = _llm_returns(_valid_json(confidence=5.0))
         result = await agent.analyze({"pair": "BTC/USDT"})
         assert result.confidence == 1.0
 
         # confidence < 0
-        agent._call_llm_async = AsyncMock(return_value=_valid_json(confidence=-0.5))
+        agent._call_llm_async = _llm_returns(_valid_json(confidence=-0.5))
         result = await agent.analyze({"pair": "BTC/USDT"})
         assert result.confidence == 0.0
 
@@ -277,16 +298,12 @@ class TestSharedParsing:
     async def test_normalizes_recommendation(self):
         agent = TechnicalAnalystAgent()
         # lowercase → LONG
-        agent._call_llm_async = AsyncMock(
-            return_value=_valid_json(recommendation="long")
-        )
+        agent._call_llm_async = _llm_returns(_valid_json(recommendation="long"))
         result = await agent.analyze({"pair": "BTC/USDT"})
         assert result.recommendation == "LONG"
 
         # unknown → NEUTRAL
-        agent._call_llm_async = AsyncMock(
-            return_value=_valid_json(recommendation="BUY_NOW")
-        )
+        agent._call_llm_async = _llm_returns(_valid_json(recommendation="BUY_NOW"))
         result = await agent.analyze({"pair": "BTC/USDT"})
         assert result.recommendation == "NEUTRAL"
 
@@ -294,7 +311,7 @@ class TestSharedParsing:
     async def test_strips_markdown_code_blocks(self):
         agent = TechnicalAnalystAgent()
         wrapped = "```json\n" + _valid_json() + "\n```"
-        agent._call_llm_async = AsyncMock(return_value=wrapped)
+        agent._call_llm_async = _llm_returns(wrapped)
 
         result = await agent.analyze({"pair": "BTC/USDT"})
 
@@ -313,9 +330,7 @@ class TestOrchestratorConsensus:
         """All 3 agents agree → consensus=True, full confidence."""
         agents = []
         for name in ("a1", "a2", "a3"):
-            agent = MagicMock()
-            agent.name = name
-            agent.analyze = AsyncMock(return_value=_make_analysis(name, "LONG", 0.8))
+            agent = _mock_agent(name, return_value=_make_analysis(name, "LONG", 0.8))
             agents.append(agent)
 
         tracker = SentimentCostTracker(max_daily_cost_usd=10.0)
@@ -334,9 +349,7 @@ class TestOrchestratorConsensus:
         """2 LONG + 1 SHORT → LONG with reduced confidence."""
         agents = []
         for name, rec in [("a1", "LONG"), ("a2", "LONG"), ("a3", "SHORT")]:
-            agent = MagicMock()
-            agent.name = name
-            agent.analyze = AsyncMock(return_value=_make_analysis(name, rec, 0.8))
+            agent = _mock_agent(name, return_value=_make_analysis(name, rec, 0.8))
             agents.append(agent)
 
         tracker = SentimentCostTracker(max_daily_cost_usd=10.0)
@@ -355,9 +368,7 @@ class TestOrchestratorConsensus:
         """L + S + N → NEUTRAL, confidence=0, no consensus."""
         agents = []
         for name, rec in [("a1", "LONG"), ("a2", "SHORT"), ("a3", "NEUTRAL")]:
-            agent = MagicMock()
-            agent.name = name
-            agent.analyze = AsyncMock(return_value=_make_analysis(name, rec, 0.8))
+            agent = _mock_agent(name, return_value=_make_analysis(name, rec, 0.8))
             agents.append(agent)
 
         tracker = SentimentCostTracker(max_daily_cost_usd=10.0)
@@ -373,17 +384,11 @@ class TestOrchestratorConsensus:
     @pytest.mark.asyncio
     async def test_partial_failure_2_agents(self):
         """1 agent fails, 2 agree → consensus works."""
-        good1 = MagicMock()
-        good1.name = "g1"
-        good1.analyze = AsyncMock(return_value=_make_analysis("g1", "LONG", 0.9))
+        good1 = _mock_agent("g1", return_value=_make_analysis("g1", "LONG", 0.9))
 
-        good2 = MagicMock()
-        good2.name = "g2"
-        good2.analyze = AsyncMock(return_value=_make_analysis("g2", "LONG", 0.7))
+        good2 = _mock_agent("g2", return_value=_make_analysis("g2", "LONG", 0.7))
 
-        bad = MagicMock()
-        bad.name = "bad"
-        bad.analyze = AsyncMock(side_effect=RuntimeError("LLM down"))
+        bad = _mock_agent("bad", side_effect=RuntimeError("LLM down"))
 
         tracker = SentimentCostTracker(max_daily_cost_usd=10.0)
         orch = Orchestrator([good1, good2, bad], tracker)
@@ -400,9 +405,7 @@ class TestOrchestratorConsensus:
         """All agents raise → returns None."""
         agents = []
         for name in ("a1", "a2", "a3"):
-            agent = MagicMock()
-            agent.name = name
-            agent.analyze = AsyncMock(side_effect=RuntimeError("fail"))
+            agent = _mock_agent(name, side_effect=RuntimeError("fail"))
             agents.append(agent)
 
         tracker = SentimentCostTracker(max_daily_cost_usd=10.0)
@@ -422,9 +425,7 @@ class TestCostControl:
     @pytest.mark.asyncio
     async def test_budget_exceeded_returns_none(self):
         """Budget exceeded → orchestrator returns None without calling agents."""
-        agent = MagicMock()
-        agent.name = "a1"
-        agent.analyze = AsyncMock(return_value=_make_analysis())
+        agent = _mock_agent("a1", return_value=_make_analysis())
 
         tracker = SentimentCostTracker(max_daily_cost_usd=0.0)  # zero budget
         orch = Orchestrator([agent], tracker)
@@ -437,9 +438,7 @@ class TestCostControl:
     @pytest.mark.asyncio
     async def test_cost_recorded(self):
         """After successful run, cost is recorded in tracker."""
-        agent = MagicMock()
-        agent.name = "a1"
-        agent.analyze = AsyncMock(return_value=_make_analysis())
+        agent = _mock_agent("a1", return_value=_make_analysis())
 
         tracker = SentimentCostTracker(max_daily_cost_usd=10.0)
         orch = Orchestrator([agent], tracker)
@@ -456,13 +455,12 @@ class TestCostControl:
             await asyncio.sleep(60)  # way over the 15s limit
             return _make_analysis("slow")  # pragma: no cover
 
-        slow_agent = MagicMock()
-        slow_agent.name = "slow"
+        slow_agent = _mock_agent("slow")
         slow_agent.analyze = slow_analyze
 
-        fast_agent = MagicMock()
-        fast_agent.name = "fast"
-        fast_agent.analyze = AsyncMock(return_value=_make_analysis("fast", "LONG", 0.8))
+        fast_agent = _mock_agent(
+            "fast", return_value=_make_analysis("fast", "LONG", 0.8)
+        )
 
         tracker = SentimentCostTracker(max_daily_cost_usd=10.0)
         orch = Orchestrator([slow_agent, fast_agent], tracker)
@@ -548,3 +546,4 @@ class TestBotIntegration:
         assert result is not None
         assert result.llm_recommendation == "SHORT"
         assert result.llm_confidence == 0.75
+        assert result.llm_consensus is True

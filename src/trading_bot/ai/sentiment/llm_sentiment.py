@@ -22,19 +22,22 @@ _SYSTEM_PROMPT = (
 
 
 class LLMSentimentAnalyzer(BaseSentimentAnalyzer):
-    """Sentiment analysis using LLM APIs (Anthropic or OpenAI)."""
+    """Sentiment analysis using LLM APIs (Anthropic or OpenAI).
+
+    Not wired into TradingOrchestrator: its calls are outside the daily LLM
+    budget (SentimentCostTracker). Route them through it before enabling.
+    """
 
     def __init__(
         self,
         provider: str = "anthropic",
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-haiku-4-5",
         api_key: str = "",
     ) -> None:
         self._provider = provider
         self._model = model
         self._api_key = api_key
         self._client: Any = None
-        self._total_cost: float = 0.0
 
     def analyze(self, text: str) -> SentimentResult:
         """Analyze a single text for sentiment using an LLM."""

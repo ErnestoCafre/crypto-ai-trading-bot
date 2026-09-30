@@ -27,11 +27,17 @@ class Signal:
 
 @dataclass
 class AISignals:
+    # [-1, 1]: bearish .. bullish
     sentiment_score: float | None = None
     prediction_return: float | None = None
+    # [0, 1]: strength of the prediction, whatever its direction
     prediction_confidence: float | None = None
+    # "up" | "down"; falls back to the sign of prediction_return when unset
+    prediction_direction: str | None = None
     llm_recommendation: str | None = None
     llm_confidence: float | None = None
+    # True when the LLM agents reached a majority (ADR-006)
+    llm_consensus: bool | None = None
 
 
 @dataclass
@@ -43,7 +49,6 @@ class CombinedSignal:
     ai_signals: AISignals | None
     weights_used: dict[str, float]
     should_trade: bool
-    recommended_sizing_pct: float
     reasoning: str
     timestamp: datetime
 
@@ -90,8 +95,12 @@ class AgentAnalysis:
     reasoning: str
     key_factors: list[str]
     raw_response: str
+    # input_tokens + output_tokens, as reported by the provider
     tokens_used: int
     latency_ms: int
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 @dataclass
@@ -118,6 +127,8 @@ class PositionSize:
     ai_adjustment: float
     stop_loss_price: float
     stop_loss_pct: float
+    # Risk multiplier from the market regime (VOLATILE < 1.0)
+    regime_adjustment: float = 1.0
 
 
 @dataclass

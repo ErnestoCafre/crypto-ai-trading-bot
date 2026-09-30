@@ -16,7 +16,7 @@ from trading_bot.ai.prediction.base import BasePredictor, PredictionUnavailableE
 from trading_bot.ai.prediction.feature_engine import FeatureEngine
 from trading_bot.ai.sentiment.aggregator import SentimentAggregator
 from trading_bot.ai.sentiment.base import BaseSentimentAnalyzer
-from trading_bot.ai.sentiment.cost_tracker import SentimentCostTracker
+from trading_bot.ai.sentiment.cost_tracker import EXHAUSTED, SentimentCostTracker
 from trading_bot.config.settings import Settings, get_settings
 from trading_bot.core.models import (
     AggregatedSentiment,
@@ -24,6 +24,7 @@ from trading_bot.core.models import (
     OrchestratorDecision,
     OrderResult,
     SentimentResult,
+    Signal,
     SignalType,
 )
 from trading_bot.core.regime import RegimeDetector
@@ -47,6 +48,14 @@ from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.risk.risk_state import RiskStateStore
 from trading_bot.risk.stop_loss import StopLossManager
 from trading_bot.risk.stop_tracker import StopTracker
+
+
+def _regime_size_factor(signal: Signal | None) -> float | None:
+    """Risk multiplier the StrategySelector attached (VOLATILE regime)."""
+    if signal is None:
+        return None
+    factor = signal.metadata.get("sizing_factor")
+    return float(factor) if isinstance(factor, (int, float)) else None
 
 
 class TradingOrchestrator:
@@ -84,6 +93,8 @@ class TradingOrchestrator:
 
         # State cache
         self._latest_sentiment: dict[str, AggregatedSentiment] = {}
+        # Headlines behind each cached sentiment; they expire with it.
+        self._latest_headlines: dict[str, list[str]] = {}
         self._latest_llm_decision: dict[str, OrchestratorDecision] = {}
 
     # ------------------------------------------------------------------
@@ -263,13 +274,19 @@ class TradingOrchestrator:
             trend = TrendFollowing(pair=pair, feature_engine=self._feature_engine)
             reversion = MeanReversion(pair=pair, feature_engine=self._feature_engine)
             self._strategy_selectors[pair] = StrategySelector(
-                trend, reversion, regime_detector, s.REGIME_VOLATILE_SIZING_FACTOR
+                trend,
+                reversion,
+                regime_detector,
+                s.REGIME_VOLATILE_SIZING_FACTOR,
+                use_regime=s.USE_REGIME_DETECTION,
             )
 
         # Risk components
-        self._position_sizer = PositionSizer(stop_loss_mgr=StopLossManager())
-        self._ai_confidence_filter = AIConfidenceFilter()
-        self._signal_combiner = SignalCombiner()
+        self._position_sizer = PositionSizer(
+            stop_loss_mgr=StopLossManager(), settings=s
+        )
+        self._ai_confidence_filter = AIConfidenceFilter(settings=s)
+        self._signal_combiner = SignalCombiner(settings=s)
 
         # Notifier
         if s.TELEGRAM_BOT_TOKEN and s.TELEGRAM_CHAT_ID:
@@ -369,7 +386,10 @@ class TradingOrchestrator:
                     SentimentAnalystAgent(s.LLM_PROVIDER, s.LLM_MODEL, api_key),
                     RiskEvaluatorAgent(s.LLM_PROVIDER, s.LLM_MODEL, api_key),
                 ]
-                self._llm_cost_tracker = SentimentCostTracker(s.LLM_MAX_DAILY_COST_USD)
+                self._llm_cost_tracker = SentimentCostTracker(
+                    s.LLM_MAX_DAILY_COST_USD,
+                    state_path=self._mode_path(s.LLM_COST_STATE_PATH),
+                )
                 self._llm_orchestrator = Orchestrator(
                     agents, self._llm_cost_tracker, s.LLM_PROVIDER, s.LLM_MODEL
                 )
@@ -378,6 +398,13 @@ class TradingOrchestrator:
                 logger.exception("Failed to init LLM agents — continuing without LLM")
                 self._llm_orchestrator = None
 
+        if s.USE_ENSEMBLE:
+            logger.warning(
+                "USE_ENSEMBLE/ENSEMBLE_MODELS={} are not wired into live trading "
+                "(no trained ensemble artifacts); using the per-pair LightGBM "
+                "models instead",
+                s.ENSEMBLE_MODELS,
+            )
         if s.USE_DL_PREDICTION or s.USE_ENSEMBLE:
             self._init_predictors()
 
@@ -497,7 +524,8 @@ class TradingOrchestrator:
             portfolio_value=portfolio_value,
             entry_price=entry_price,
             side="buy",
-            ai_confidence=(ai_signals.prediction_confidence if ai_signals else None),
+            ai_size_multiplier=self._position_sizer.ai_size_multiplier(combined),
+            regime_size_multiplier=_regime_size_factor(signal),
             ohlcv=ohlcv,
         )
         if position_size.quantity <= 0:
@@ -539,6 +567,7 @@ class TradingOrchestrator:
         sentiment = self._fresh_sentiment(pair)
         prediction_conf: float | None = None
         prediction_ret: float | None = None
+        prediction_dir: str | None = None
 
         predictor = self._predictors.get(pair)
         if predictor is not None and predictor.is_loaded():
@@ -551,6 +580,7 @@ class TradingOrchestrator:
                 pred = predictor.predict(ohlcv, features=features)
                 prediction_conf = pred.confidence
                 prediction_ret = pred.predicted_return
+                prediction_dir = pred.predicted_direction
             except PredictionUnavailableError as exc:
                 logger.debug("{}: no ML prediction ({})", pair, exc)
             except Exception:
@@ -560,9 +590,11 @@ class TradingOrchestrator:
         llm_decision = self._fresh_llm_decision(pair)
         llm_rec: str | None = None
         llm_conf: float | None = None
+        llm_consensus: bool | None = None
         if llm_decision is not None:
             llm_rec = llm_decision.final_recommendation
             llm_conf = llm_decision.confidence
+            llm_consensus = llm_decision.consensus
 
         if sentiment is None and prediction_conf is None and llm_rec is None:
             return None
@@ -571,8 +603,10 @@ class TradingOrchestrator:
             sentiment_score=(sentiment.overall_score if sentiment else None),
             prediction_return=prediction_ret,
             prediction_confidence=prediction_conf,
+            prediction_direction=prediction_dir,
             llm_recommendation=llm_rec,
             llm_confidence=llm_conf,
+            llm_consensus=llm_consensus,
         )
 
     def _is_fresh(self, pair: str, kind: str, ts: datetime, interval_min: int) -> bool:
@@ -627,6 +661,34 @@ class TradingOrchestrator:
                     )
             except Exception:
                 logger.exception("LLM cycle failed for {}", pair)
+            await self._notify_llm_budget()
+
+    async def _notify_llm_budget(self) -> None:
+        """Budget alerts, once per UTC day each: 50 % log, 80 % and 100 % Telegram."""
+        tracker = self._llm_cost_tracker
+        if tracker is None:
+            return
+        for threshold in tracker.pop_alerts():
+            spent, cap = tracker.daily_spent_usd, tracker.max_daily_usd
+            if threshold >= EXHAUSTED:
+                message = (
+                    f"LLM budget exhausted: ${spent:.2f} of ${cap:.2f} spent today. "
+                    "LLM analysis paused until the next UTC day."
+                )
+            else:
+                message = (
+                    f"LLM spend at {threshold:.0%} of the daily budget: "
+                    f"${spent:.2f} of ${cap:.2f}."
+                )
+            if threshold < 0.8:
+                logger.info(message)
+                continue
+            logger.warning(message)
+            if self._notifier is not None:
+                try:
+                    await self._notifier.send_alert(message, level="warning")
+                except Exception:
+                    logger.exception("Failed to send LLM budget alert")
 
     async def _build_llm_context(self, pair: str) -> dict[str, object]:
         """Build unified context dict for all LLM agents."""
@@ -672,7 +734,9 @@ class TradingOrchestrator:
         sentiment = self._fresh_sentiment(pair)
         context["sentiment_score"] = sentiment.overall_score if sentiment else 0.0
         context["fear_greed"] = sentiment.fear_greed_score if sentiment else "N/A"
-        context["headlines"] = []
+        context["headlines"] = (
+            list(self._latest_headlines.get(pair, [])) if sentiment else []
+        )
 
         # Risk data
         if self._executor is not None:
@@ -715,6 +779,7 @@ class TradingOrchestrator:
         for pair in self._settings.TRADING_PAIRS:
             try:
                 sentiment_results = []
+                headlines: list[str] = []
 
                 # News sentiment
                 if self._news_fetcher is not None:
@@ -723,6 +788,7 @@ class TradingOrchestrator:
                         pair, since=since, limit=10
                     )
                     texts = [f"{a.title}. {a.body}" for a in articles]
+                    headlines = [a.title for a in articles if a.title]
                     if texts:
                         # Transformer inference is CPU-bound and synchronous:
                         # keep it off the event loop (trading cycle, stops).
@@ -755,6 +821,7 @@ class TradingOrchestrator:
                         sentiment_results, pair=pair
                     )
                     self._latest_sentiment[pair] = aggregated
+                    self._latest_headlines[pair] = headlines
                     logger.debug(
                         "{}: sentiment score={:.2f} ({} sources)",
                         pair,
@@ -983,9 +1050,12 @@ class TradingOrchestrator:
         finally:
             await self._reconcile_stops(native_orders_cancelled=True)
 
+    def _mode_path(self, template: str) -> Path:
+        """State file path; "{mode}" keeps paper and live state apart."""
+        return Path(str(template).replace("{mode}", str(self._settings.BOT_MODE)))
+
     def _risk_state_path(self) -> Path:
-        s = self._settings
-        return Path(str(s.RISK_STATE_PATH).replace("{mode}", str(s.BOT_MODE)))
+        return self._mode_path(self._settings.RISK_STATE_PATH)
 
     async def _load_risk_state(self, portfolio_value: float) -> None:
         """Restore drawdown latch and stops from disk, or start fresh."""
@@ -996,7 +1066,9 @@ class TradingOrchestrator:
         tracker = StopTracker()
         if data is not None:
             try:
-                monitor = DrawdownMonitor.from_dict(data["drawdown"])
+                monitor = DrawdownMonitor.from_dict(
+                    data["drawdown"], settings=self._settings
+                )
                 tracker = StopTracker.from_dict(data.get("stops") or {})
             except (KeyError, TypeError, ValueError, AttributeError):
                 logger.warning(
@@ -1006,7 +1078,9 @@ class TradingOrchestrator:
                 monitor, tracker = None, StopTracker()
 
         if monitor is None:
-            monitor = DrawdownMonitor(initial_value=portfolio_value)
+            monitor = DrawdownMonitor(
+                initial_value=portfolio_value, settings=self._settings
+            )
             logger.info("Drawdown baseline: ${:,.2f}", portfolio_value)
         else:
             logger.info(

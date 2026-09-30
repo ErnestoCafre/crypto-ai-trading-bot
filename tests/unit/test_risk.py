@@ -6,9 +6,10 @@ from datetime import UTC, datetime
 
 import pytest
 
+from trading_bot.config.settings import Settings, get_settings
 from trading_bot.core.models import AISignals, CombinedSignal, SignalType
 from trading_bot.risk.ai_confidence import AIConfidenceFilter
-from trading_bot.risk.drawdown import DrawdownMonitor
+from trading_bot.risk.drawdown import DrawdownMonitor, TradingState
 from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.risk.stop_loss import StopLossManager
 
@@ -76,7 +77,9 @@ class TestPositionSizer:
 
     def test_ai_confidence_reduces_risk(self) -> None:
         sl = StopLossManager()
-        ps = PositionSizer(stop_loss_mgr=sl)
+        # Wide position cap so the risk budget, not the cap, sets the size.
+        settings = Settings(_env_file=None, MAX_POSITION_PCT=100.0)  # type: ignore[call-arg]
+        ps = PositionSizer(stop_loss_mgr=sl, settings=settings)
         full = ps.calculate(
             pair="BTC/USDT",
             signal_confidence=0.8,
@@ -88,9 +91,39 @@ class TestPositionSizer:
             signal_confidence=0.8,
             portfolio_value=100_000,
             entry_price=50000.0,
-            ai_confidence=0.5,
+            ai_size_multiplier=0.5,
         )
-        assert reduced.quantity <= full.quantity
+        assert reduced.quantity == pytest.approx(full.quantity * 0.5)
+        assert reduced.ai_adjustment == 0.5
+
+    def test_regime_multiplier_stacks_with_ai(self) -> None:
+        settings = Settings(_env_file=None, MAX_POSITION_PCT=100.0)  # type: ignore[call-arg]
+        ps = PositionSizer(stop_loss_mgr=StopLossManager(), settings=settings)
+        kwargs = dict(
+            pair="BTC/USDT",
+            signal_confidence=0.8,
+            portfolio_value=100_000,
+            entry_price=50000.0,
+        )
+        full = ps.calculate(**kwargs)
+        reduced = ps.calculate(
+            **kwargs, ai_size_multiplier=0.5, regime_size_multiplier=0.5
+        )
+        assert reduced.quantity == pytest.approx(full.quantity * 0.25)
+        assert reduced.regime_adjustment == 0.5
+
+    def test_ai_multiplier_never_raises_risk(self) -> None:
+        settings = Settings(_env_file=None, MAX_POSITION_PCT=100.0)  # type: ignore[call-arg]
+        ps = PositionSizer(stop_loss_mgr=StopLossManager(), settings=settings)
+        kwargs = dict(
+            pair="BTC/USDT",
+            signal_confidence=0.8,
+            portfolio_value=100_000,
+            entry_price=50000.0,
+        )
+        full = ps.calculate(**kwargs)
+        boosted = ps.calculate(**kwargs, ai_size_multiplier=3.0)
+        assert boosted.quantity == pytest.approx(full.quantity)
 
     def test_quantity_non_negative(self) -> None:
         sl = StopLossManager()
@@ -152,7 +185,6 @@ class TestAIConfidenceFilter:
             ai_signals=ai,
             weights_used={"technical": 0.4},
             should_trade=True,
-            recommended_sizing_pct=5.0,
             reasoning="test",
             timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
@@ -173,3 +205,115 @@ class TestAIConfidenceFilter:
         ai = AISignals(sentiment_score=0.9)
         sig = self._make_combined(0.8, ai=ai)
         assert f.should_trade(sig) is True
+
+
+# ---------- Injected settings ----------
+
+
+class TestInjectedSettings:
+    """Risk components use the Settings they are given, not a fresh .env read."""
+
+    @staticmethod
+    def _settings(**overrides: object) -> Settings:
+        return Settings(_env_file=None, **overrides)  # type: ignore[arg-type]
+
+    def test_ai_filter_uses_injected_threshold(self) -> None:
+        f = AIConfidenceFilter(settings=self._settings(MIN_CONFIDENCE_THRESHOLD=0.9))
+        sig = TestAIConfidenceFilter()._make_combined(0.8, ai=AISignals(0.5))
+        assert f.should_trade(sig) is False
+
+    def test_position_sizer_uses_injected_limits(self) -> None:
+        ps = PositionSizer(
+            stop_loss_mgr=StopLossManager(),
+            settings=self._settings(MAX_RISK_PER_TRADE_PCT=50.0, MAX_POSITION_PCT=2.0),
+        )
+        result = ps.calculate(
+            pair="BTC/USDT",
+            signal_confidence=1.0,
+            portfolio_value=100_000.0,
+            entry_price=50_000.0,
+        )
+        assert result.value_usd == pytest.approx(2_000.0)
+        assert result.risk_pct == 50.0
+
+    def test_drawdown_monitor_uses_injected_limits(self) -> None:
+        settings = self._settings(MAX_DRAWDOWN_PCT=5.0, MAX_DAILY_LOSS_PCT=50.0)
+        dm = DrawdownMonitor(initial_value=100_000, settings=settings)
+        assert dm.update(94_000) == TradingState.HALTED
+
+        restored = DrawdownMonitor.from_dict(dm.to_dict(), settings=settings)
+        assert restored.state == TradingState.HALTED
+
+    def test_get_settings_is_cached(self) -> None:
+        assert get_settings() is get_settings()
+
+
+# ---------- AI sizing multiplier ----------
+
+
+class TestAISizeMultiplier:
+    @staticmethod
+    def _sizer(**overrides: object) -> PositionSizer:
+        values: dict[str, object] = {
+            "MIN_CONFIDENCE_THRESHOLD": 0.5,
+            "AI_SIZING_FLOOR": 0.25,
+        }
+        values.update(overrides)
+        settings = Settings(_env_file=None, **values)  # type: ignore[arg-type]
+        return PositionSizer(stop_loss_mgr=StopLossManager(), settings=settings)
+
+    @staticmethod
+    def _combined(confidence: float, weights: dict[str, float]) -> CombinedSignal:
+        return CombinedSignal(
+            type=SignalType.LONG,
+            pair="BTC/USDT",
+            combined_confidence=confidence,
+            technical_signal=None,
+            ai_signals=AISignals(sentiment_score=0.1),
+            weights_used=weights,
+            should_trade=True,
+            reasoning="test",
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+    def test_technical_only_is_not_scaled(self) -> None:
+        sig = self._combined(0.6, {"technical": 1.0})
+        assert self._sizer().ai_size_multiplier(sig) is None
+
+    @pytest.mark.parametrize(
+        ("confidence", "expected"),
+        [(0.5, 0.25), (0.75, 0.625), (1.0, 1.0), (0.3, 0.25)],
+    )
+    def test_linear_from_floor_at_threshold(
+        self, confidence: float, expected: float
+    ) -> None:
+        sig = self._combined(confidence, {"technical": 0.6, "prediction": 0.4})
+        assert self._sizer().ai_size_multiplier(sig) == pytest.approx(expected)
+
+    def test_opposing_prediction_shrinks_position(self) -> None:
+        """Regression: a strong opposing prediction used to size near full."""
+        from trading_bot.core.models import Signal
+        from trading_bot.core.signal_combiner import SignalCombiner
+
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        combiner = SignalCombiner(settings=settings)
+        sizer = PositionSizer(stop_loss_mgr=StopLossManager(), settings=settings)
+        tech = Signal(
+            type=SignalType.LONG,
+            pair="BTC/USDT",
+            confidence=0.9,
+            strength=0.8,
+            source="test",
+            metadata={},
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        against = combiner.combine(
+            tech, AISignals(prediction_confidence=0.8, prediction_direction="down")
+        )
+        along = combiner.combine(
+            tech, AISignals(prediction_confidence=0.8, prediction_direction="up")
+        )
+        m_against = sizer.ai_size_multiplier(against)
+        m_along = sizer.ai_size_multiplier(along)
+        assert m_against is not None and m_along is not None
+        assert m_against < m_along

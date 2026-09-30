@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from trading_bot.ai.prediction.feature_engine import FeatureEngine
+from trading_bot.config.settings import get_settings
 from trading_bot.core.models import (
     AISignals,
     CombinedSignal,
@@ -18,6 +19,14 @@ from trading_bot.core.models import (
     Signal,
     SignalType,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings():
+    """get_settings() is cached: never leak one test's environment into another."""
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture()
@@ -72,7 +81,10 @@ def sample_ai_signals() -> AISignals:
     return AISignals(
         sentiment_score=0.7,
         prediction_confidence=0.8,
+        prediction_direction="up",
+        llm_recommendation="LONG",
         llm_confidence=0.6,
+        llm_consensus=True,
     )
 
 
@@ -86,7 +98,6 @@ def sample_combined_signal_no_ai(sample_signal: Signal) -> CombinedSignal:
         ai_signals=None,
         weights_used={"technical": 0.4},
         should_trade=True,
-        recommended_sizing_pct=7.5,
         reasoning="test",
         timestamp=datetime(2026, 1, 1, tzinfo=UTC),
     )
@@ -104,7 +115,6 @@ def sample_combined_signal_with_ai(
         ai_signals=sample_ai_signals,
         weights_used={"technical": 0.4},
         should_trade=True,
-        recommended_sizing_pct=7.2,
         reasoning="test",
         timestamp=datetime(2026, 1, 1, tzinfo=UTC),
     )

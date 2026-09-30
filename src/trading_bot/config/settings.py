@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from functools import lru_cache
+
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -65,15 +67,18 @@ class Settings(BaseSettings):
 
     # --- Sentiment ---
     SENTIMENT_MODEL: str = "ElKulako/cryptobert"
-    SENTIMENT_WEIGHT: float = 0.2
+    SENTIMENT_WEIGHT: float = Field(default=0.2, ge=0.0)
     SENTIMENT_INTERVAL_MIN: int = 15
 
     # --- LLM Agent ---
     LLM_PROVIDER: str = "anthropic"
-    LLM_MODEL: str = "claude-haiku-4-5-20251001"
-    LLM_WEIGHT: float = 0.2
+    LLM_MODEL: str = "claude-haiku-4-5"
+    LLM_WEIGHT: float = Field(default=0.2, ge=0.0)
     LLM_ANALYSIS_INTERVAL_MIN: int = 15
+    # Daily LLM budget, priced per model (ai/pricing.py). The day's spend
+    # persists across restarts; "{mode}" is replaced by BOT_MODE.
     LLM_MAX_DAILY_COST_USD: float = 5.0
+    LLM_COST_STATE_PATH: str = "var/state/llm_cost_{mode}.json"
 
     # --- API Keys LLM ---
     ANTHROPIC_API_KEY: str = ""
@@ -83,7 +88,7 @@ class Settings(BaseSettings):
     # --- Deep Learning ---
     # Only "lightgbm" is implemented; "gru"/"cnn_lstm" are stubs.
     DL_MODEL_TYPE: str = "lightgbm"
-    DL_WEIGHT: float = 0.2
+    DL_WEIGHT: float = Field(default=0.2, ge=0.0)
     DL_RETRAIN_DAYS: int = 14
     DL_LOOKBACK_BARS: int = 168
 
@@ -91,8 +96,13 @@ class Settings(BaseSettings):
     RL_ALGORITHM: str = "PPO"
 
     # --- Signal Combiner ---
-    TECHNICAL_WEIGHT: float = 0.4
-    MIN_CONFIDENCE_THRESHOLD: float = 0.5
+    # Weights are renormalised over the sources present (see SignalCombiner).
+    TECHNICAL_WEIGHT: float = Field(default=0.4, ge=0.0)
+    MIN_CONFIDENCE_THRESHOLD: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Position risk multiplier when AI signals take part: AI_SIZING_FLOOR at
+    # MIN_CONFIDENCE_THRESHOLD, 1.0 at full confidence (linear). AI never
+    # raises risk above MAX_RISK_PER_TRADE_PCT. Technical-only: 1.0.
+    AI_SIZING_FLOOR: float = Field(default=0.25, ge=0.0, le=1.0)
 
     # --- Data APIs ---
     COINGECKO_API_KEY: str = ""
@@ -105,10 +115,12 @@ class Settings(BaseSettings):
     REDDIT_USER_AGENT: str = "trading-bot/1.0"
 
     # --- Regime Detection ---
+    # False: always trend-following at full size (regime still classified).
     USE_REGIME_DETECTION: bool = True
     REGIME_ADX_TRENDING: float = 25.0
     REGIME_VOLATILITY_HIGH_PCT: float = 80.0
-    REGIME_VOLATILE_SIZING_FACTOR: float = 0.5
+    # VOLATILE regime: risk per trade × this factor (confidence unchanged).
+    REGIME_VOLATILE_SIZING_FACTOR: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # --- Backtesting ---
     BACKTEST_INITIAL_CAPITAL: float = 100_000.0
@@ -119,6 +131,8 @@ class Settings(BaseSettings):
     OPTUNA_N_TRIALS: int = 100
 
     # --- Ensemble ML ---
+    # Not wired into live trading yet: enabling it only logs a warning and
+    # the per-pair LightGBM models are used (see TradingOrchestrator).
     USE_ENSEMBLE: bool = False
     ENSEMBLE_MODELS: list[str] = Field(default=["lightgbm"])
     # Per-pair models: {ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl
@@ -132,6 +146,12 @@ class Settings(BaseSettings):
     # --- Infrastructure ---
     PROMETHEUS_ENABLED: bool = False
 
+    @model_validator(mode="after")
+    def check_signal_weights(self) -> Settings:
+        if self.TECHNICAL_WEIGHT <= 0:
+            raise ValueError("TECHNICAL_WEIGHT must be > 0")
+        return self
+
     @field_validator("TRADING_PAIRS", mode="before")
     @classmethod
     def parse_trading_pairs(cls, v: str | list[str]) -> list[str]:
@@ -140,5 +160,10 @@ class Settings(BaseSettings):
         return v
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Process-wide settings, read from the environment and .env once.
+
+    Call ``get_settings.cache_clear()`` after changing the environment.
+    """
     return Settings()

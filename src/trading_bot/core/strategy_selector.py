@@ -16,10 +16,17 @@ logger = logging.getLogger(__name__)
 class StrategySelector:
     """Select and run the appropriate strategy based on the detected market regime.
 
-    Routing:
+    Routing (``use_regime=True``):
     - TRENDING -> trend_strategy
     - RANGING -> reversion_strategy
-    - VOLATILE -> either strategy with reduced sizing (or None if confidence too low)
+    - VOLATILE -> trend_strategy; the signal carries
+      ``metadata["sizing_factor"] = volatile_sizing_factor`` so the position
+      is taken with reduced risk. Confidence is left untouched: scaling it
+      would push most signals under MIN_CONFIDENCE_THRESHOLD and block the
+      entry instead of shrinking it.
+
+    With ``use_regime=False`` the trend strategy always runs at full size;
+    the regime is still classified for reporting (e.g. the LLM context).
     """
 
     def __init__(
@@ -28,23 +35,24 @@ class StrategySelector:
         reversion_strategy: BaseStrategy,
         regime_detector: RegimeDetector,
         volatile_sizing_factor: float = 0.5,
+        use_regime: bool = True,
     ) -> None:
         self._trend = trend_strategy
         self._reversion = reversion_strategy
         self._detector = regime_detector
         self._volatile_factor = volatile_sizing_factor
+        self._use_regime = use_regime
 
     def select(self, ohlcv: pd.DataFrame) -> tuple[BaseStrategy, RegimeClassification]:
         """Return the strategy to use and the regime classification."""
         classification = self._detector.classify(ohlcv)
 
-        if classification.regime == MarketRegime.TRENDING:
+        if not self._use_regime:
             return self._trend, classification
-        elif classification.regime == MarketRegime.RANGING:
+        if classification.regime == MarketRegime.RANGING:
             return self._reversion, classification
-        else:  # VOLATILE
-            # Use trend strategy in volatile regime but with reduced sizing
-            return self._trend, classification
+        # TRENDING, and VOLATILE with reduced sizing (see generate_signal)
+        return self._trend, classification
 
     def generate_signal(
         self,
@@ -53,23 +61,26 @@ class StrategySelector:
     ) -> tuple[Signal | None, RegimeClassification]:
         """Generate a signal using the regime-appropriate strategy.
 
-        In VOLATILE regime, signal strength is reduced by volatile_sizing_factor.
+        In VOLATILE regime the signal is tagged with the sizing factor.
         """
         strategy, classification = self.select(ohlcv)
         signal = strategy.generate_signal(ohlcv, ai_signals)
 
-        # Reduce strength in volatile regime
-        if signal is not None and classification.regime == MarketRegime.VOLATILE:
+        if (
+            signal is not None
+            and self._use_regime
+            and classification.regime == MarketRegime.VOLATILE
+        ):
             signal = Signal(
                 type=signal.type,
                 pair=signal.pair,
-                confidence=signal.confidence * self._volatile_factor,
-                strength=signal.strength * self._volatile_factor,
+                confidence=signal.confidence,
+                strength=signal.strength,
                 source=signal.source,
                 metadata={
                     **signal.metadata,
                     "regime": "volatile",
-                    "sizing_reduced": True,
+                    "sizing_factor": self._volatile_factor,
                 },
                 timestamp=signal.timestamp,
             )

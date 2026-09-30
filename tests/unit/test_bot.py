@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -73,9 +73,12 @@ def _make_settings(**overrides):
         "SENTIMENT_MODEL": "kk08/CryptoBERT",
         "SENTIMENT_INTERVAL_MIN": 15,
         "SENTIMENT_WEIGHT": 0.2,
+        "LLM_WEIGHT": 0.2,
+        "DL_WEIGHT": 0.2,
         "CRYPTOCOMPARE_API_KEY": "",
         "TECHNICAL_WEIGHT": 0.4,
         "MIN_CONFIDENCE_THRESHOLD": 0.5,
+        "AI_SIZING_FLOOR": 0.25,
         "ENSEMBLE_MODELS": ["lightgbm"],
         "RISK_STATE_PATH": _RISK_STATE_PATH,
         "RISK_RESET": False,
@@ -142,7 +145,6 @@ def _make_combined(
         ai_signals=ai_signals,
         weights_used={"technical": 0.4},
         should_trade=should_trade,
-        recommended_sizing_pct=7.5,
         reasoning="test",
         timestamp=datetime.now(UTC),
     )
@@ -503,6 +505,16 @@ class TestSentimentCycle:
         await orch._run_sentiment_cycle()
 
         assert len(orch._latest_sentiment) > 0
+        # The headlines behind the sentiment reach the LLM sentiment agent...
+        assert orch._latest_headlines["BTC/USDT"] == ["BTC pumps"]
+        context = await orch._build_llm_context("BTC/USDT")
+        assert context["headlines"] == ["BTC pumps"]
+
+        # ...and expire with it.
+        stale = orch._latest_sentiment["BTC/USDT"]
+        stale.timestamp = datetime.now(UTC) - timedelta(hours=2)
+        context = await orch._build_llm_context("BTC/USDT")
+        assert context["headlines"] == []
 
     @pytest.mark.asyncio
     async def test_sentiment_skipped_when_disabled(self):
@@ -604,10 +616,14 @@ class TestIntegration:
 
         orch._feature_engine = fe
         orch._strategy_selectors = {"BTC/USDT": selector}
-        orch._signal_combiner = SignalCombiner()
-        orch._position_sizer = PositionSizer(stop_loss_mgr=StopLossManager())
-        orch._drawdown_monitor = DrawdownMonitor(initial_value=100_000.0)
-        orch._ai_confidence_filter = AIConfidenceFilter()
+        orch._signal_combiner = SignalCombiner(settings=settings)
+        orch._position_sizer = PositionSizer(
+            stop_loss_mgr=StopLossManager(), settings=settings
+        )
+        orch._drawdown_monitor = DrawdownMonitor(
+            initial_value=100_000.0, settings=settings
+        )
+        orch._ai_confidence_filter = AIConfidenceFilter(settings=settings)
         orch._executor = PaperExecutor(
             initial_balance=100_000.0, slippage_pct=0.05, fee_pct=0.1
         )
@@ -623,6 +639,58 @@ class TestIntegration:
         balance = await orch._executor.get_balance()
         # Balance may or may not change depending on signal direction
         assert balance["total"] > 0
+
+    @pytest.mark.asyncio
+    async def test_volatile_regime_reduces_size_not_confidence(self):
+        """VOLATILE: the entry goes through, with the regime risk factor."""
+        from dataclasses import replace
+
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch)
+        selector = orch._strategy_selectors["BTC/USDT"]
+        signal, regime = selector.generate_signal.return_value
+        tagged = replace(signal, metadata={"regime": "volatile", "sizing_factor": 0.5})
+        selector.generate_signal.return_value = (tagged, regime)
+
+        await orch._process_pair("BTC/USDT", _make_ohlcv(), 100_000.0, 50_000.0)
+
+        kwargs = orch._position_sizer.calculate.call_args.kwargs
+        assert kwargs["regime_size_multiplier"] == 0.5
+        orch._executor.place_order.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("consensus", [True, False])
+    async def test_llm_consensus_short_vetoes_long_entry(self, consensus):
+        """Cached LLM consensus SHORT blocks a technical LONG (ADR-006).
+
+        LLM_WEIGHT is tiny so confidence alone stays above the threshold:
+        only the veto can block the entry.
+        """
+        from trading_bot.core.models import OrchestratorDecision
+        from trading_bot.core.signal_combiner import SignalCombiner
+
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"], LLM_WEIGHT=0.01)
+        _wire_mocks(orch)
+        orch._signal_combiner = SignalCombiner(settings=orch._settings)
+        orch._latest_llm_decision["BTC/USDT"] = OrchestratorDecision(
+            pair="BTC/USDT",
+            final_recommendation="SHORT",
+            confidence=0.8,
+            agent_analyses=[],
+            consensus=consensus,
+            reasoning="test",
+            total_tokens=0,
+            total_cost_usd=0.0,
+            total_latency_ms=0,
+            timestamp=datetime.now(UTC),
+        )
+
+        await orch._process_pair("BTC/USDT", _make_ohlcv(), 100_000.0, 50_000.0)
+
+        if consensus:
+            orch._executor.place_order.assert_not_called()
+        else:
+            orch._executor.place_order.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_cycle_with_ai_signals(self):

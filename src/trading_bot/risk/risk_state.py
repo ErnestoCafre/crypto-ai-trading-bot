@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from trading_bot.state_file import atomic_write_json
 
 
 class RiskStateStore:
@@ -38,16 +38,4 @@ class RiskStateStore:
 
     def save(self, data: dict[str, Any]) -> None:
         """Atomically replace the state file (temp file + fsync + os.replace)."""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=self._path.parent, prefix=f".{self._path.name}.", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=2, sort_keys=True)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_name, self._path)
-        except BaseException:
-            Path(tmp_name).unlink(missing_ok=True)
-            raise
+        atomic_write_json(self._path, data)
