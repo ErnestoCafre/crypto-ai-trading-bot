@@ -135,12 +135,20 @@ class OHLCVRepository:
         pair: str,
         timeframe: str,
     ) -> Path:
-        """Save DataFrame as parquet file in cache directory."""
+        """Merge *df* into the parquet cache file (newer rows win).
+
+        Downloads are incremental, so overwriting would leave only the
+        latest batch in the cache.
+        """
         pair_clean = pair.replace("/", "")
         cache_path = CACHE_DIR / exchange / pair_clean
         cache_path.mkdir(parents=True, exist_ok=True)
 
         file_path = cache_path / f"{timeframe}.parquet"
+        if file_path.exists():
+            existing = pd.read_parquet(file_path)
+            df = pd.concat([existing, df])
+            df = df[~df.index.duplicated(keep="last")].sort_index()
         df.to_parquet(file_path)
         logger.debug("Saved parquet: {}", file_path)
         return file_path

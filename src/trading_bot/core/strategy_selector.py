@@ -43,6 +43,17 @@ class StrategySelector:
         self._volatile_factor = volatile_sizing_factor
         self._use_regime = use_regime
 
+    @property
+    def name(self) -> str:
+        return "strategy_selector"
+
+    def get_required_lookback(self) -> int:
+        """Bars needed before both routed strategies have warmed up."""
+        return max(
+            self._trend.get_required_lookback(),
+            self._reversion.get_required_lookback(),
+        )
+
     def select(self, ohlcv: pd.DataFrame) -> tuple[BaseStrategy, RegimeClassification]:
         """Return the strategy to use and the regime classification."""
         classification = self._detector.classify(ohlcv)

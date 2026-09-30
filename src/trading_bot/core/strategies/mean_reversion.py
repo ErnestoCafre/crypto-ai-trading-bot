@@ -12,9 +12,33 @@ from trading_bot.core.strategies.base import BaseStrategy
 
 
 class MeanReversion(BaseStrategy):
-    def __init__(self, pair: str, feature_engine: FeatureEngine | None = None) -> None:
+    """Fade RSI extremes outside the Bollinger Bands; exit near the mean.
+
+    Thresholds are constructor parameters so they can be optimized; the
+    defaults are the production values.
+    """
+
+    def __init__(
+        self,
+        pair: str,
+        feature_engine: FeatureEngine | None = None,
+        *,
+        rsi_oversold: float = 30.0,
+        rsi_overbought: float = 70.0,
+        rsi_exit_low: float = 40.0,
+        rsi_exit_high: float = 60.0,
+    ) -> None:
+        if not rsi_oversold < rsi_exit_low <= rsi_exit_high < rsi_overbought:
+            raise ValueError(
+                "RSI thresholds must satisfy "
+                "oversold < exit_low <= exit_high < overbought"
+            )
         self._pair = pair
         self._fe = feature_engine or FeatureEngine()
+        self._oversold = rsi_oversold
+        self._overbought = rsi_overbought
+        self._exit_low = rsi_exit_low
+        self._exit_high = rsi_exit_high
 
     @property
     def name(self) -> str:
@@ -46,11 +70,13 @@ class MeanReversion(BaseStrategy):
         bbu = float(last[FeatureEngine.BBU_20])
 
         # --- CLOSE: RSI returned to mean zone ---
-        if 40 <= rsi <= 60:
+        if self._exit_low <= rsi <= self._exit_high:
+            mid = (self._exit_low + self._exit_high) / 2
+            half_band = (self._exit_high - self._exit_low) / 2 or 1.0
             return Signal(
                 type=SignalType.CLOSE,
                 pair=self._pair,
-                confidence=1.0 - abs(rsi - 50) / 10.0,
+                confidence=1.0 - abs(rsi - mid) / half_band,
                 strength=0.5,
                 source=self.name,
                 metadata={"reason": "mean_reversion_close"},
@@ -58,8 +84,8 @@ class MeanReversion(BaseStrategy):
             )
 
         # --- LONG: oversold ---
-        if rsi < 30 and close < bbl:
-            confidence = (30 - rsi) / 30.0
+        if rsi < self._oversold and close < bbl:
+            confidence = (self._oversold - rsi) / self._oversold
             return Signal(
                 type=SignalType.LONG,
                 pair=self._pair,
@@ -71,8 +97,8 @@ class MeanReversion(BaseStrategy):
             )
 
         # --- SHORT: overbought ---
-        if rsi > 70 and close > bbu:
-            confidence = (rsi - 70) / 30.0
+        if rsi > self._overbought and close > bbu:
+            confidence = (rsi - self._overbought) / (100.0 - self._overbought)
             return Signal(
                 type=SignalType.SHORT,
                 pair=self._pair,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from trading_bot.backtest.data_types import BacktestResult
+from trading_bot.backtest.metrics import infer_periods_per_year
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class BacktestReporter:
         print(f"  Win Rate:        {m.get('win_rate', 0):.1%}")
         print(f"  Profit Factor:   {m.get('profit_factor', 0):.2f}")
         print(f"  Total Trades:    {int(m.get('total_trades', 0))}")
+        print(f"  Max DD Duration: {m.get('max_drawdown_duration_days', 0):.1f} days")
         print(f"  Expectancy:      {m.get('expectancy', 0):.2f}")
         print(f"{'=' * 60}\n")
 
@@ -51,6 +53,10 @@ class BacktestReporter:
                 returns,
                 benchmark=benchmark,
                 output=output_path,
+                # quantstats defaults to 252 (equities); crypto bars run 24/7.
+                periods_per_year=round(
+                    infer_periods_per_year(result.equity_curve.index)
+                ),
                 title=f"{result.strategy_name} on {result.pair}",
             )
             logger.info("HTML report saved to %s", output_path)

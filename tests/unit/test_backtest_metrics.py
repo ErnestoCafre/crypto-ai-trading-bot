@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from trading_bot.backtest.data_types import BacktestTrade
-from trading_bot.backtest.metrics import MetricsCalculator
+from trading_bot.backtest.metrics import MetricsCalculator, infer_periods_per_year
 
 
 def _make_trade(pnl: float, pnl_pct: float = 0.0, hours: float = 24.0) -> BacktestTrade:
@@ -110,3 +111,77 @@ class TestNoTrades:
         metrics = MetricsCalculator.calculate([], equity)
         assert metrics["total_trades"] == 0.0
         assert metrics["win_rate"] == 0.0
+
+
+def _curve(returns: np.ndarray, freq: str) -> pd.Series:
+    equity = 100_000 * np.cumprod(np.r_[1.0, 1.0 + returns])
+    idx = pd.date_range("2024-01-01", periods=len(equity), freq=freq, tz="UTC")
+    return pd.Series(equity, index=idx)
+
+
+class TestAnnualization:
+    @pytest.mark.parametrize(
+        ("freq", "expected"), [("h", 8760), ("4h", 2190), ("D", 365)]
+    )
+    def test_periods_per_year_from_index(self, freq: str, expected: int) -> None:
+        idx = pd.date_range("2024-01-01", periods=50, freq=freq, tz="UTC")
+        assert infer_periods_per_year(idx) == pytest.approx(expected)
+
+    def test_no_datetime_index_defaults_to_daily(self) -> None:
+        assert infer_periods_per_year(pd.RangeIndex(10)) == 365
+
+    @pytest.mark.parametrize(("freq", "ppy"), [("h", 8760), ("4h", 2190), ("D", 365)])
+    def test_sharpe_uses_bar_frequency(self, freq: str, ppy: int) -> None:
+        rng = np.random.default_rng(3)
+        rets = rng.normal(0.0002, 0.004, 2_000)
+        metrics = MetricsCalculator.calculate(
+            [_make_trade(1.0)], _curve(rets, freq), risk_free_rate=0.0
+        )
+        expected = rets.mean() / rets.std(ddof=1) * np.sqrt(ppy)
+        assert metrics["sharpe_ratio"] == pytest.approx(expected, rel=1e-6)
+
+    def test_risk_free_is_per_bar(self) -> None:
+        """A curve growing exactly at rf has zero excess return."""
+        rf = 0.04
+        per_bar = (1 + rf) ** (1 / 8760) - 1
+        rng = np.random.default_rng(4)
+        rets = per_bar + rng.normal(0, 1e-4, 5_000)
+        rets -= rets.mean() - per_bar  # exact mean
+        metrics = MetricsCalculator.calculate(
+            [_make_trade(1.0)], _curve(rets, "h"), risk_free_rate=rf
+        )
+        assert metrics["sharpe_ratio"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_sortino_uses_downside_deviation(self) -> None:
+        rets = np.array([0.01, -0.01, 0.02, -0.005] * 50)
+        metrics = MetricsCalculator.calculate(
+            [_make_trade(1.0)], _curve(rets, "D"), risk_free_rate=0.0
+        )
+        dd = np.sqrt(np.mean(np.minimum(rets, 0) ** 2))
+        assert metrics["sortino_ratio"] == pytest.approx(
+            rets.mean() / dd * np.sqrt(365), rel=1e-6
+        )
+
+    def test_cagr_uses_calendar_span_for_hourly_bars(self) -> None:
+        # One year of hourly bars doubling the equity → CAGR 100%.
+        n = 8760
+        rets = np.full(n, 2 ** (1 / n) - 1)
+        metrics = MetricsCalculator.calculate([_make_trade(1.0)], _curve(rets, "h"))
+        assert metrics["cagr"] == pytest.approx(100.0, rel=1e-6)
+
+
+class TestDrawdownDuration:
+    def test_duration_in_days_for_hourly_bars(self) -> None:
+        # Peak at bar 10, underwater for 48 hourly bars, recovers at bar 58.
+        values = [100.0 + i for i in range(11)]
+        values += [100.0] * 47 + [111.0, 112.0]
+        idx = pd.date_range("2024-01-01", periods=len(values), freq="h", tz="UTC")
+        metrics = MetricsCalculator.calculate(
+            [_make_trade(1.0)], pd.Series(values, index=idx)
+        )
+        assert metrics["max_drawdown_duration_days"] == pytest.approx(2.0)
+
+    def test_unrecovered_drawdown_runs_to_the_end(self) -> None:
+        values = [100.0, 110.0] + [90.0] * 3
+        metrics = MetricsCalculator.calculate([_make_trade(1.0)], _make_equity(values))
+        assert metrics["max_drawdown_duration_days"] == pytest.approx(3.0)

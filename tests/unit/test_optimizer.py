@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from trading_bot.backtest.engine import BacktestEngine
 from trading_bot.backtest.optimizer import StrategyOptimizer
+from trading_bot.backtest.walk_forward import WalkForwardValidator
 from trading_bot.core.models import Signal
 from trading_bot.core.strategies.base import BaseStrategy
 
@@ -30,8 +34,9 @@ def _make_ohlcv(n: int = 300) -> pd.DataFrame:
 class _ParamStrategy(BaseStrategy):
     """Strategy that accepts a threshold parameter."""
 
-    def __init__(self, threshold: float = 0.5) -> None:
-        self._threshold = threshold
+    def __init__(self, threshold: float = 0.5, window: int = 5) -> None:
+        self.threshold = threshold
+        self.window = window
 
     @property
     def name(self) -> str:
@@ -47,32 +52,100 @@ class _ParamStrategy(BaseStrategy):
 
 
 class TestOptimizer:
-    @pytest.mark.slow()
     def test_returns_best_params(self) -> None:
-        def factory(threshold: float = 0.5) -> _ParamStrategy:
-            return _ParamStrategy(threshold=threshold)
-
         optimizer = StrategyOptimizer(
-            strategy_factory=factory,
             param_space={"threshold": (0.1, 0.9)},
+            strategy_factory=_ParamStrategy,
             n_trials=3,
-            walk_forward=False,
+            seed=0,
         )
         result = optimizer.optimize(_make_ohlcv(100), "BTC/USDT")
         assert "threshold" in result
         assert "_best_metric" in result
 
-    @pytest.mark.slow()
-    def test_respects_param_ranges(self) -> None:
-        def factory(threshold: float = 0.5) -> _ParamStrategy:
-            return _ParamStrategy(threshold=threshold)
+    def test_respects_param_ranges_and_int_type(self) -> None:
+        seen: list[tuple[float, int]] = []
+
+        def factory(threshold: float, window: int) -> _ParamStrategy:
+            seen.append((threshold, window))
+            return _ParamStrategy(threshold, window)
 
         optimizer = StrategyOptimizer(
+            param_space={"threshold": (0.2, 0.8), "window": (3, 9)},
             strategy_factory=factory,
-            param_space={"threshold": (0.2, 0.8)},
-            n_trials=3,
-            walk_forward=False,
+            n_trials=5,
+            seed=0,
         )
         result = optimizer.optimize(_make_ohlcv(100), "BTC/USDT")
-        val = float(result["threshold"])  # type: ignore[arg-type]
-        assert 0.2 <= val <= 0.8
+        assert 0.2 <= float(result["threshold"]) <= 0.8  # type: ignore[arg-type]
+        assert all(isinstance(w, int) and 3 <= w <= 9 for _, w in seen)
+
+    def test_requires_exactly_one_factory(self) -> None:
+        with pytest.raises(ValueError):
+            StrategyOptimizer(param_space={"x": (0.0, 1.0)})
+
+
+class TestNestedWalkForward:
+    def test_optimizes_on_train_and_scores_on_test_only(self) -> None:
+        """Each search sees only its fold's train bars; scoring is OOS."""
+        ohlcv = _make_ohlcv(300)
+        searched_on: list[pd.Timestamp] = []
+        wf = WalkForwardValidator(n_splits=3, train_ratio=0.7)
+
+        class _SpyEngine(BacktestEngine):
+            def run(self, ohlcv, pair, ai_signals_series=None, trade_from=0):  # type: ignore[no-untyped-def]
+                if trade_from == 0:
+                    searched_on.append(ohlcv.index[-1])
+                return super().run(ohlcv, pair, ai_signals_series, trade_from)
+
+        def engine_factory(threshold: float) -> BacktestEngine:
+            return _SpyEngine(_ParamStrategy(threshold))
+
+        optimizer = StrategyOptimizer(
+            param_space={"threshold": (0.0, 1.0)},
+            engine_factory=engine_factory,
+            n_trials=2,
+            seed=0,
+        )
+        result = optimizer.walk_forward(ohlcv, "BTC/USDT", validator=wf)
+
+        folds = wf.folds(len(ohlcv))
+        assert len(result.fold_results) == len(folds)
+        train_ends = {ohlcv.index[f.train_end - 1] for f in folds}
+        assert set(searched_on) == train_ends
+        for fold, fold_result in zip(folds, result.fold_results, strict=True):
+            assert fold_result.equity_curve.index[0] == ohlcv.index[fold.test_start]
+            assert "threshold" in fold_result.parameters
+        assert len(result.parameter_stability["threshold"]) == len(folds)
+
+    @pytest.mark.slow()
+    def test_live_pipeline_params(self) -> None:
+        from trading_bot.backtest.pipeline import build_live_engine
+
+        optimizer = StrategyOptimizer(
+            param_space={"adx_min": (15.0, 35.0), "ema_fast": (5, 12)},
+            engine_factory=partial(build_live_engine, "BTC/USDT"),
+            n_trials=2,
+            seed=0,
+        )
+        result = optimizer.walk_forward(
+            _make_ohlcv(700),
+            "BTC/USDT",
+            validator=WalkForwardValidator(n_splits=2, train_ratio=0.6),
+        )
+        assert len(result.fold_results) == 2
+        assert all(isinstance(v, float) for v in result.parameter_stability["ema_fast"])
+
+
+def test_all_trials_invalid_raises_clear_error() -> None:
+    def factory(threshold: float) -> _ParamStrategy:
+        raise ValueError("inconsistent")
+
+    optimizer = StrategyOptimizer(
+        param_space={"threshold": (0.0, 1.0)},
+        strategy_factory=factory,
+        n_trials=2,
+        seed=0,
+    )
+    with pytest.raises(ValueError, match="no valid parameter combination"):
+        optimizer.optimize(_make_ohlcv(50), "BTC/USDT")

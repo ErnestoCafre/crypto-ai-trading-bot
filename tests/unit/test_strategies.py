@@ -85,3 +85,45 @@ class TestMeanReversion:
     def test_lookback_50(self) -> None:
         strat = MeanReversion(pair="BTC/USDT")
         assert strat.get_required_lookback() == 50
+
+
+class TestStrategyParameters:
+    def test_invalid_thresholds_rejected(self) -> None:
+        import pytest
+
+        from trading_bot.core.strategies.mean_reversion import MeanReversion
+        from trading_bot.core.strategies.trend_following import TrendFollowing
+
+        with pytest.raises(ValueError):
+            TrendFollowing("BTC/USDT", ema_fast=21, ema_mid=21)
+        with pytest.raises(ValueError):
+            MeanReversion("BTC/USDT", rsi_oversold=45, rsi_exit_low=40)
+
+    def test_non_default_emas_work_with_shared_engine(self) -> None:
+        """A shared engine without the EMA periods falls back to computing them."""
+        import numpy as np
+        import pandas as pd
+
+        from trading_bot.ai.prediction.feature_engine import FeatureEngine
+        from trading_bot.core.strategies.trend_following import TrendFollowing
+
+        n = 400
+        close = 100 * np.exp(np.linspace(0, 0.5, n))  # steady uptrend
+        ohlcv = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.002,
+                "low": close * 0.997,
+                "close": close,
+                "volume": np.full(n, 10.0),
+            },
+            index=pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC"),
+        )
+        shared = TrendFollowing(
+            "BTC/USDT", FeatureEngine(), ema_fast=7, ema_mid=17, ema_slow=40
+        ).generate_signal(ohlcv)
+        own = TrendFollowing(
+            "BTC/USDT", ema_fast=7, ema_mid=17, ema_slow=40
+        ).generate_signal(ohlcv)
+        assert shared is not None and own is not None
+        assert (shared.type, shared.confidence) == (own.type, own.confidence)

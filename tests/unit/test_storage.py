@@ -55,6 +55,27 @@ class TestParquetCache:
         finally:
             storage_mod.CACHE_DIR = original_cache
 
+    def test_incremental_saves_merge(
+        self,
+        sample_ohlcv_df: pd.DataFrame,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import trading_bot.data.storage as storage_mod
+
+        monkeypatch.setattr(storage_mod, "CACHE_DIR", tmp_path)
+        half = len(sample_ohlcv_df) // 2
+        OHLCVRepository.save_parquet(
+            sample_ohlcv_df.iloc[: half + 1], "binance", "BTC/USDT", "1h"
+        )
+        OHLCVRepository.save_parquet(
+            sample_ohlcv_df.iloc[half:], "binance", "BTC/USDT", "1h"
+        )
+
+        loaded = OHLCVRepository.load_parquet("binance", "BTC/USDT", "1h")
+        assert loaded is not None
+        pd.testing.assert_frame_equal(loaded, sample_ohlcv_df, check_freq=False)
+
     def test_load_parquet_returns_none_when_missing(self, tmp_path: Path) -> None:
         import trading_bot.data.storage as storage_mod
 

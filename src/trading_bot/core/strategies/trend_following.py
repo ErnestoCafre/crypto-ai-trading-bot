@@ -12,16 +12,39 @@ from trading_bot.core.strategies.base import BaseStrategy
 
 
 class TrendFollowing(BaseStrategy):
-    def __init__(self, pair: str, feature_engine: FeatureEngine | None = None) -> None:
+    """LONG when EMAs are stacked, momentum is up and the trend is strong.
+
+    Thresholds are constructor parameters so they can be optimized; the
+    defaults are the production values.
+    """
+
+    def __init__(
+        self,
+        pair: str,
+        feature_engine: FeatureEngine | None = None,
+        *,
+        ema_fast: int = 9,
+        ema_mid: int = 21,
+        ema_slow: int = 50,
+        rsi_entry_min: float = 50.0,
+        rsi_exit_below: float = 40.0,
+        adx_min: float = 25.0,
+    ) -> None:
+        if not ema_fast < ema_mid < ema_slow:
+            raise ValueError("EMA periods must satisfy fast < mid < slow")
         self._pair = pair
-        self._fe = feature_engine or FeatureEngine()
+        self._ema_periods = (ema_fast, ema_mid, ema_slow)
+        self._fe = feature_engine or FeatureEngine(extra_ema_periods=self._ema_periods)
+        self._rsi_entry_min = rsi_entry_min
+        self._rsi_exit_below = rsi_exit_below
+        self._adx_min = adx_min
 
     @property
     def name(self) -> str:
         return "trend_following"
 
     def get_required_lookback(self) -> int:
-        return 200
+        return max(200, 4 * self._ema_periods[2])
 
     def generate_signal(
         self,
@@ -29,12 +52,23 @@ class TrendFollowing(BaseStrategy):
         ai_signals: AISignals | None = None,
     ) -> Signal | None:
         df = self._fe.build_features(ohlcv)
+        cols = [FeatureEngine.ema_column(p) for p in self._ema_periods]
+        missing = {
+            col: p
+            for col, p in zip(cols, self._ema_periods, strict=True)
+            if col not in df.columns
+        }
+        if missing and len(df) >= max(missing.values()):
+            # Shared engine without these periods: slow path, only for
+            # non-default parameters.
+            df = df.assign(**{col: df.ta.ema(length=p) for col, p in missing.items()})
         last = df.iloc[-1]
 
+        fast_col, mid_col, slow_col = cols
         required = [
-            FeatureEngine.EMA_9,
-            FeatureEngine.EMA_21,
-            FeatureEngine.EMA_50,
+            fast_col,
+            mid_col,
+            slow_col,
             FeatureEngine.RSI_14,
             FeatureEngine.MACD_12_26_9,
             FeatureEngine.MACDs_12_26_9,
@@ -44,16 +78,16 @@ class TrendFollowing(BaseStrategy):
             if col not in df.columns or pd.isna(last.get(col)):
                 return None
 
-        ema9 = float(last[FeatureEngine.EMA_9])
-        ema21 = float(last[FeatureEngine.EMA_21])
-        ema50 = float(last[FeatureEngine.EMA_50])
+        ema9 = float(last[fast_col])
+        ema21 = float(last[mid_col])
+        ema50 = float(last[slow_col])
         rsi = float(last[FeatureEngine.RSI_14])
         macd = float(last[FeatureEngine.MACD_12_26_9])
         macd_signal = float(last[FeatureEngine.MACDs_12_26_9])
         adx = float(last[FeatureEngine.ADX_14])
 
         # --- CLOSE conditions (any) ---
-        close_conds = [ema9 < ema21, rsi < 40]
+        close_conds = [ema9 < ema21, rsi < self._rsi_exit_below]
         if any(close_conds):
             return Signal(
                 type=SignalType.CLOSE,
@@ -69,9 +103,9 @@ class TrendFollowing(BaseStrategy):
         long_subs = [
             ema9 > ema21,
             ema21 > ema50,
-            rsi > 50,
+            rsi > self._rsi_entry_min,
             macd > macd_signal,
-            adx > 25,
+            adx > self._adx_min,
         ]
         if all(long_subs):
             return Signal(
