@@ -4,15 +4,25 @@ Bot de trading de criptomonedas con inteligencia artificial integrada, construid
 
 ## Features
 
-- Trading exclusivo de criptomonedas (spot + futuros perpetuos)
-- Análisis de sentimiento con CryptoBERT/FinBERT
-- Predicción de precio con deep learning (GRU, CNN-LSTM) y LightGBM
+Implementado:
+
+- Trading de criptomonedas **spot** (long-only): entra solo sin posición,
+  CLOSE/SHORT venden la posición completa
+- Estrategias técnicas por régimen de mercado (trend following / mean reversion)
+- Análisis de sentimiento con CryptoBERT (extra `sentiment`)
+- Predicción de dirección con LightGBM (un modelo por par)
 - Agente LLM multi-agente (Claude/GPT) como analista de mercado
-- Reinforcement Learning (PPO/DQN) para optimización de ejecución
-- Backtesting con modelado realista de slippage y comisiones
-- Gestión de riesgo profesional (kill-switch, position sizing dinámico)
-- Dashboard interactivo (Streamlit)
-- Alertas 24/7 vía Telegram
+- Backtesting del mismo pipeline que corre en vivo, sin lookahead, con
+  walk-forward out-of-sample, slippage y comisiones
+- Gestión de riesgo (stops ATR, kill-switch enclavado, límite de pérdida diaria)
+- Dashboard (Streamlit) con datos reales del bot
+- Alertas vía Telegram
+
+Planificado (hay stubs con `NotImplementedError`, no operativos):
+
+- Futuros perpetuos y posiciones short
+- Predicción con deep learning (GRU, CNN-LSTM) — extra `dl`
+- Reinforcement Learning (PPO/DQN) para ejecución — extra `rl`
 
 Cada capa de AI es opcional y se activa por feature flag (`USE_SENTIMENT`,
 `USE_LLM_AGENT`, `USE_DL_PREDICTION`, `USE_RL_AGENT`). Si una falla, el bot
@@ -20,9 +30,9 @@ sigue operando con señales técnicas.
 
 ## Stack
 
-- **Python 3.12+** | **uv** | **PostgreSQL** | **SQLAlchemy 2.0** | **Alembic**
-- **CCXT** | **pandas-ta-classic** | **vectorbt** | **LightGBM** | **Optuna**
-- **PyTorch** | **Hugging Face Transformers** | **Stable-Baselines3**
+- **Python 3.12** (`.python-version`) | **uv** | **PostgreSQL** | **SQLAlchemy 2.1** | **Alembic**
+- **CCXT** | **pandas-ta-classic** | **LightGBM** | **Optuna** | **quantstats**
+- **Anthropic / OpenAI SDKs** | opcional: **Transformers + PyTorch** (`sentiment`)
 - **Streamlit** | **Docker** | **GitHub Actions**
 
 ## Setup
@@ -32,6 +42,10 @@ uv sync --extra dev          # dev = pytest, ruff, mypy, pre-commit
 cp .env.example .env         # editar con tus API keys
 uv run alembic upgrade head  # aplicar migraciones
 ```
+
+Extras opcionales: `sentiment` (transformers + torch, necesario con
+`USE_SENTIMENT=true`), `dl` y `rl` (reservados para los stubs planificados),
+`ta-lib`. Ejemplo: `uv sync --extra dev --extra sentiment`.
 
 ## Uso
 
@@ -89,6 +103,37 @@ RISK_RESET=true uv run trading-bot   # una sola vez; re-baselinea al balance act
   verifica.
 - Sentimiento y decisiones LLM cacheadas vencen a 2x el intervalo de su job.
 
+## Backtest
+
+```bash
+uv run python scripts/download_historical.py     # llena var/cache/<exchange>/<PAIR>/<tf>.parquet
+uv run python scripts/run_backtest.py --pair BTC/USDT --timeframe 1h
+uv run python scripts/run_backtest.py --csv datos.csv --splits 5 --html
+```
+
+`build_live_engine()` (`backtest/pipeline.py`) arma los mismos componentes que el
+bot: `StrategySelector` por régimen (con reducción en régimen volátil), gate de
+confianza del `SignalCombiner`, `PositionSizer` con stop ATR x2 y reglas spot.
+
+Qué garantiza:
+
+- **Sin lookahead**: la señal de la barra *i* usa solo velas cerradas hasta *i*
+  y se ejecuta en el open de *i+1*. Todas las features son causales (el chikou
+  span de Ichimoku, que usa closes futuros, está excluido); un test altera las
+  barras futuras y verifica que las features pasadas no cambian.
+- **Stops realistas**: si la vela abre por debajo del stop (gap) se llena al
+  open, igual que en vivo. PnL neto de fees de entrada y salida y slippage.
+- **Out-of-sample**: `WalkForwardValidator.run` usa el train solo como warm-up;
+  trades y métricas son del test, y la curva OOS se encadena rebasada.
+  `StrategyOptimizer.walk_forward` optimiza en el train de cada fold y evalúa en
+  su test (optimización anidada); `optimize()` es in-sample y no sirve para
+  reportar performance.
+- **Métricas 24/7**: Sharpe/Sortino anualizados con la frecuencia real de las
+  barras (8760/año en 1h) y rf por barra; duración de drawdown en días.
+
+No simula: señales de IA históricas (salvo que se pasen en
+`ai_signals_series`), el kill-switch de drawdown ni el rechazo de órdenes.
+
 ## Desarrollo
 
 ```bash
@@ -96,7 +141,8 @@ uv run pytest              # tests
 uv run pytest --cov        # tests con coverage
 uv run ruff check .        # lint
 uv run ruff format .       # format
-uv run mypy .              # type check
+uv run mypy src            # type check (igual que CI)
+pre-commit install         # hooks: ruff (versión del lock), EOL LF
 ```
 
 ## Arquitectura
@@ -111,7 +157,7 @@ trading-bot/
 │   ├── core/          # Estrategias, regime detection y lógica de negocio
 │   ├── ai/            # Sentiment, prediction, LLM agents, RL
 │   ├── data/          # Fetchers (CCXT, CoinGecko, noticias, social, on-chain)
-│   ├── backtest/      # vectorbt + Backtesting.py
+│   ├── backtest/      # Engine barra a barra, walk-forward, Optuna, métricas
 │   ├── execution/     # Paper trading + Live (CCXT)
 │   ├── risk/          # Position sizing, stops, kill-switch
 │   ├── dashboard/     # Streamlit
@@ -119,7 +165,7 @@ trading-bot/
 │   ├── db/            # SQLAlchemy ORM
 │   └── config/        # Pydantic settings
 ├── migrations/        # Alembic
-├── scripts/           # Utilidades (descarga de históricos)
+├── scripts/           # Descarga de históricos, backtest
 ├── tests/             # unit/, integration/, ai/
 └── var/               # Artefactos de runtime (logs, modelos, cache) — gitignored
 ```
@@ -131,8 +177,23 @@ roto falla en los tests en vez de pasar desapercibido.
 ## Docker
 
 ```bash
-docker compose up -d    # bot + dashboard + PostgreSQL
+# .env con POSTGRES_PASSWORD (y POSTGRES_USER / POSTGRES_DB si se cambian)
+docker compose up -d --build   # db → migrate (alembic) → bot + dashboard
+docker compose build --build-arg EXTRAS="--extra sentiment"   # con CryptoBERT
 ```
+
+- El contenedor corre como usuario no-root `bot` (uid 10001); el servicio
+  `volume-perms` ajusta el dueño de volúmenes creados por versiones anteriores.
+- Postgres no publica puertos; el dashboard (sin autenticación) escucha solo en
+  `127.0.0.1:8501`.
+- `HEALTHCHECK`: healthy mientras el bot complete ciclos
+  (`python -m trading_bot.healthcheck`, heartbeat en el estado de riesgo).
+- Volúmenes: `botstate` (`var/state`, latch y stops), `botlogs` (`var/logs`),
+  `pgdata`.
+- **Volumen `pgdata` existente**: Postgres solo aplica `POSTGRES_PASSWORD` al
+  inicializar un volumen vacío. Si el volumen se creó con la contraseña anterior
+  (`trading_bot`), cambiarla antes de usar la nueva en `.env`:
+  `docker compose exec db psql -U trading_bot -c "ALTER USER trading_bot PASSWORD '<nueva>'"`.
 
 ## License
 

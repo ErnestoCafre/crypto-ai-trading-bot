@@ -1,40 +1,105 @@
+# Credentials come from .env (see .env.example): POSTGRES_USER,
+# POSTGRES_PASSWORD, POSTGRES_DB. DATABASE_URL is built from them.
+
+x-app: &app
+  # Built once, shared by every app service.
+  image: trading-bot:local
+  build: .
+  env_file:
+    - .env
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER:-trading_bot}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-trading_bot}
+
 services:
   db:
+    # Debian-based on purpose: switching an existing pgdata volume to the
+    # musl (alpine) image changes collations and can corrupt text indexes.
     image: postgres:16
     environment:
-      POSTGRES_USER: trading_bot
-      POSTGRES_PASSWORD: trading_bot
-      POSTGRES_DB: trading_bot
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-trading_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
+    # Not published: reachable only from the compose network. For local
+    # tools add "127.0.0.1:5432:5432" in docker-compose.override.yml.
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Volumes created while the image ran as root hold root-owned files; hand
+  # them to the non-root "bot" user (uid 10001) before it starts.
+  volume-perms:
+    <<: *app
+    user: root
+    command: ["chown", "-R", "10001:10001", "/app/var/state", "/app/var/logs"]
+    volumes:
+      - botstate:/app/var/state
+      - botlogs:/app/var/logs
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    restart: "no"
 
   bot:
-    build: .
+    <<: *app
     depends_on:
-      - db
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://trading_bot:trading_bot@db:5432/trading_bot
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      volume-perms:
+        condition: service_completed_successfully
     volumes:
       # Kill-switch latch and stops must survive container recreation.
       - botstate:/app/var/state
+      - botlogs:/app/var/logs
     restart: unless-stopped
 
   dashboard:
-    build: .
-    command: ["streamlit", "run", "src/trading_bot/dashboard/app.py", "--server.port=8501"]
+    <<: *app
+    command:
+      - streamlit
+      - run
+      - src/trading_bot/dashboard/app.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
     depends_on:
-      - db
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://trading_bot:trading_bot@db:5432/trading_bot
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      # Read-only view of the bot's risk state.
+      - botstate:/app/var/state:ro
+    # No authentication: bind to localhost only.
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
 volumes:
   pgdata:
   botstate:
+  botlogs:
