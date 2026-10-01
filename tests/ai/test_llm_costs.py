@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import anthropic
-import httpx
+import httpx2
 import pytest
 
 from trading_bot.ai.agents.base import (
@@ -124,8 +124,8 @@ class TestUsageCost:
         ok = client.messages.create.return_value
         rejected = anthropic.BadRequestError(
             "output_config not supported",
-            response=httpx.Response(
-                400, request=httpx.Request("POST", "https://api.anthropic.com")
+            response=httpx2.Response(
+                400, request=httpx2.Request("POST", "https://api.anthropic.com")
             ),
             body=None,
         )
@@ -151,8 +151,8 @@ class TestUsageCost:
         def bad_request() -> anthropic.BadRequestError:
             return anthropic.BadRequestError(
                 "invalid model",
-                response=httpx.Response(
-                    400, request=httpx.Request("POST", "https://api.anthropic.com")
+                response=httpx2.Response(
+                    400, request=httpx2.Request("POST", "https://api.anthropic.com")
                 ),
                 body=None,
             )
