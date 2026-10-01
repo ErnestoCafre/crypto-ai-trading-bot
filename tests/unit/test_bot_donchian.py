@@ -379,6 +379,36 @@ class TestRebalanceJournal:
         assert all(t.status == "closed" for t in trades)
 
 
+class TestMarketDataSource:
+    @pytest.mark.parametrize(
+        ("mode", "sandbox", "expected_sandbox", "keyed"),
+        [
+            ("paper", True, False, False),
+            ("paper", False, False, False),
+            ("live", True, True, True),
+            ("live", False, False, True),
+        ],
+    )
+    def test_paper_reads_the_real_market(
+        self, tmp_path, mode, sandbox, expected_sandbox, keyed
+    ):
+        orch = _orchestrator(
+            tmp_path,
+            _daily(),
+            BOT_MODE=mode,
+            EXCHANGE_SANDBOX=sandbox,
+            EXCHANGE_API_KEY="key",
+            EXCHANGE_API_SECRET="secret",
+        )
+        with patch.object(bot_module, "CCXTFetcher") as fetcher_cls:
+            orch._build_fetcher()
+        kwargs = fetcher_cls.call_args.kwargs
+        assert kwargs["sandbox"] is expected_sandbox
+        assert (kwargs["api_key"], kwargs["api_secret"]) == (
+            ("key", "secret") if keyed else ("", "")
+        )
+
+
 class TestSchedule:
     def test_cycle_runs_hourly_just_after_the_daily_close(self, tmp_path):
         from apscheduler.triggers.cron import CronTrigger

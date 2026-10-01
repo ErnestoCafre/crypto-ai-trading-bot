@@ -255,6 +255,11 @@ período previo de paper trading** en este modo (`BOT_MODE=paper`,
   formación se descarta (`data/market/candles.py`), pero su close es el precio
   de mercado para valorar el portfolio y ejecutar. La descarga histórica
   tampoco guarda la vela abierta.
+- **Origen de los datos**: en live, el mismo exchange que ejecuta
+  (`EXCHANGE_SANDBOX=true` = testnet, con sus precios). En paper, siempre el
+  mercado real por endpoints públicos, sin API keys: el testnet de Binance se
+  borra más o menos una vez por mes (no alcanza la historia diaria de
+  `donchian_ensemble`) y sus precios no son los del mercado.
 - **Fetcher**: reintentos acotados (`OHLCV_FETCH_MAX_RETRIES`) con backoff
   exponencial + jitter y timeout total (`OHLCV_FETCH_TIMEOUT_S`); los datos se
   piden al mismo exchange de ejecución (`EXCHANGE_ID`).

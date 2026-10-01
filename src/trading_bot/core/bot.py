@@ -321,6 +321,31 @@ class TradingOrchestrator:
         self._save_risk_state()
         await self._record_snapshot(prices)
 
+    def _build_fetcher(self) -> CCXTFetcher:
+        """Market data from the exchange that values and fills the orders.
+
+        Live: the execution account, testnet included (its prices are the
+        ones that fill). Paper simulates fills itself, so it reads the real
+        market through public endpoints: the testnet is reset about once a
+        month (too little daily history) and its prices are not the market's.
+        """
+        s = self._settings
+        live = s.BOT_MODE == "live"
+        if not live and s.EXCHANGE_SANDBOX:
+            logger.info(
+                "Paper mode: market data from {} (EXCHANGE_SANDBOX only "
+                "applies to live)",
+                s.EXCHANGE_ID,
+            )
+        return CCXTFetcher(
+            exchange_id=s.EXCHANGE_ID,
+            api_key=s.EXCHANGE_API_KEY if live else "",
+            api_secret=s.EXCHANGE_API_SECRET if live else "",
+            sandbox=live and s.EXCHANGE_SANDBOX,
+            max_retries=s.OHLCV_FETCH_MAX_RETRIES,
+            timeout_s=s.OHLCV_FETCH_TIMEOUT_S,
+        )
+
     def _trading_trigger(self) -> BaseTrigger:
         """When the trading cycle runs."""
         if self._target_mode:
@@ -435,16 +460,7 @@ class TradingOrchestrator:
                 else:
                     await self._journal.reconcile(held)
 
-        # Data fetcher
-        # Same exchange as execution: valuation and stops must see its prices.
-        self._fetcher = CCXTFetcher(
-            exchange_id=s.EXCHANGE_ID,
-            api_key=s.EXCHANGE_API_KEY,
-            api_secret=s.EXCHANGE_API_SECRET,
-            sandbox=s.EXCHANGE_SANDBOX,
-            max_retries=s.OHLCV_FETCH_MAX_RETRIES,
-            timeout_s=s.OHLCV_FETCH_TIMEOUT_S,
-        )
+        self._fetcher = self._build_fetcher()
         await self._fetcher.__aenter__()
 
         logger.info(
