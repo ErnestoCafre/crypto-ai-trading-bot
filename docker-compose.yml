@@ -14,7 +14,7 @@ services:
   db:
     # Debian-based on purpose: switching an existing pgdata volume to the
     # musl (alpine) image changes collations and can corrupt text indexes.
-    image: postgres:16
+    image: docker.io/library/postgres:16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-trading_bot}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}

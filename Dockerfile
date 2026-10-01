@@ -4,7 +4,7 @@ ARG PYTHON_VERSION=3.12
 FROM ghcr.io/astral-sh/uv:0.12.19 AS uv
 
 # --- Build: resolve the locked environment into /app/.venv ---
-FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+FROM docker.io/library/python:${PYTHON_VERSION}-slim-bookworm AS builder
 
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 \
@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev $EXTRAS
 
 # --- Runtime ---
-FROM python:${PYTHON_VERSION}-slim-bookworm
+FROM docker.io/library/python:${PYTHON_VERSION}-slim-bookworm
 
 # libgomp1: OpenMP runtime required by LightGBM.
 RUN apt-get update \
