@@ -42,6 +42,25 @@ class Settings(BaseSettings):
         default=["BTC/USDT", "ETH/USDT", "SOL/USDT"]
     )
 
+    # --- Strategy mode ---
+    # "regime_selector": TrendFollowing / MeanReversion per regime on
+    # TRADING_TIMEFRAME, discrete entries with ATR stops. "donchian_ensemble":
+    # target exposure from 9 Donchian channels on daily candles, rebalanced
+    # with partial buys/sells (README "Modo donchian_ensemble"). In that mode
+    # MAX_POSITION_PCT is each pair's allocation: 25 % x 3 pairs caps total
+    # exposure at 75 %; 33.33 is the equal-weight portfolio that was tested.
+    STRATEGY_MODE: Literal["regime_selector", "donchian_ensemble"] = "regime_selector"
+    DONCHIAN_LOOKBACKS: Annotated[list[int], NoDecode] = Field(
+        default=[5, 10, 20, 30, 60, 90, 150, 250, 360]
+    )
+    # Annualised volatility target per pair: w = raw x min(1, target / vol).
+    DONCHIAN_VOL_TARGET: float = Field(default=0.25, gt=0.0)
+    DONCHIAN_VOL_WINDOW: int = Field(default=90, ge=2)
+    # Trade only when |target - held| exceeds this exposure (fraction of the
+    # pair's allocation); a target of 0 always closes. In the backtest 0.05
+    # cut fills 3-5x vs 0 at a similar Sharpe; 0.10 lowered it (README).
+    REBALANCE_THRESHOLD: float = Field(default=0.05, ge=0.0, lt=1.0)
+
     # --- Orchestrator ---
     TRADING_TIMEFRAME: str = "1h"
     TRADING_INTERVAL_MINUTES: int = 60
@@ -59,6 +78,8 @@ class Settings(BaseSettings):
     # risk budget should set the size and the cap only act as a backstop:
     # with 1 % / 10 % the cap set ~100 % of backtested 1h entries (real risk
     # ~0.18 %, no volatility adjustment). See README "Tamaño de posición".
+    # donchian_ensemble: MAX_POSITION_PCT is each pair's allocation instead
+    # and MAX_RISK_PER_TRADE_PCT is unused.
     MAX_RISK_PER_TRADE_PCT: float = 0.20
     MAX_POSITION_PCT: float = 25.0
     MAX_DRAWDOWN_PCT: float = 15.0
@@ -176,7 +197,7 @@ class Settings(BaseSettings):
             raise ValueError("TECHNICAL_WEIGHT must be > 0")
         return self
 
-    @field_validator("TRADING_PAIRS", mode="before")
+    @field_validator("TRADING_PAIRS", "DONCHIAN_LOOKBACKS", mode="before")
     @classmethod
     def parse_str_list(cls, v: str | list[str]) -> list[str]:
         """Accept a comma-separated string or a JSON array for list settings."""
@@ -184,6 +205,13 @@ class Settings(BaseSettings):
             if v.strip().startswith("["):
                 return list(json.loads(v))
             return [p.strip() for p in v.split(",") if p.strip()]
+        return v
+
+    @field_validator("DONCHIAN_LOOKBACKS")
+    @classmethod
+    def check_lookbacks(cls, v: list[int]) -> list[int]:
+        if not v or any(n < 2 for n in v):
+            raise ValueError("DONCHIAN_LOOKBACKS needs lookbacks >= 2")
         return v
 
 

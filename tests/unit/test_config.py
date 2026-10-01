@@ -45,6 +45,31 @@ class TestSettings:
         s = Settings(_env_file=None)  # type: ignore[call-arg]
         assert s.TRADING_PAIRS == ["BTC/USDT", "ETH/USDT"]
 
+    def test_strategy_mode_defaults(self) -> None:
+        s = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert s.STRATEGY_MODE == "regime_selector"
+        assert s.DONCHIAN_LOOKBACKS == [5, 10, 20, 30, 60, 90, 150, 250, 360]
+        assert s.DONCHIAN_VOL_TARGET == 0.25
+        assert s.DONCHIAN_VOL_WINDOW == 90
+        assert s.REBALANCE_THRESHOLD == 0.05
+
+    def test_donchian_lookbacks_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("STRATEGY_MODE", "donchian_ensemble")
+        monkeypatch.setenv("DONCHIAN_LOOKBACKS", "20, 60,360")
+        s = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert s.STRATEGY_MODE == "donchian_ensemble"
+        assert s.DONCHIAN_LOOKBACKS == [20, 60, 360]
+
+    def test_strategy_settings_validated(self) -> None:
+        with pytest.raises(ValueError):
+            Settings(STRATEGY_MODE="martingale")  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            Settings(DONCHIAN_LOOKBACKS=[1, 5])
+        with pytest.raises(ValueError):
+            Settings(REBALANCE_THRESHOLD=1.5)
+
     def test_ai_flags_default_disabled(self) -> None:
         s = Settings()
         assert s.USE_SENTIMENT is False
