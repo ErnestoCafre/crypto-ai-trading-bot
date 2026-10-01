@@ -144,13 +144,18 @@ class Settings(BaseSettings):
     REGIME_VOLATILITY_HIGH_PCT: float = 80.0
     # VOLATILE regime: risk per trade × this factor (confidence unchanged).
     REGIME_VOLATILE_SIZING_FACTOR: float = Field(default=0.5, ge=0.0, le=1.0)
+    # MeanReversion LONG entries in RANGING regime. Off: backtested on Binance
+    # 1h 2024-2026 they lowered return and raised max drawdown on BTC, ETH and
+    # SOL (README "Estrategias"). Its CLOSE/SHORT exits stay active either way.
+    MEAN_REVERSION_ENTRIES: bool = False
 
     # --- Backtesting ---
     BACKTEST_INITIAL_CAPITAL: float = 100_000.0
     BACKTEST_FEE_PCT: float = 0.1
     BACKTEST_SLIPPAGE_PCT: float = 0.05
     BACKTEST_WALK_FORWARD_SPLITS: int = 5
-    BACKTEST_WALK_FORWARD_TRAIN_RATIO: float = 0.8
+    # Warm-up share before the first OOS fold (scripts/run_backtest.py default).
+    BACKTEST_WALK_FORWARD_TRAIN_RATIO: float = 0.6
     OPTUNA_N_TRIALS: int = 100
 
     # --- ML prediction ---

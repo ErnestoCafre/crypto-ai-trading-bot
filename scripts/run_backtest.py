@@ -47,16 +47,22 @@ def _load(args: argparse.Namespace) -> pd.DataFrame:
 
 
 def main() -> None:
+    # Defaults come from the BACKTEST_* settings so .env drives both.
+    base = get_settings()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pair", default="BTC/USDT")
     parser.add_argument("--timeframe", default="1h")
     parser.add_argument("--exchange", default=None)
     parser.add_argument("--csv", type=Path, default=None)
-    parser.add_argument("--capital", type=float, default=100_000.0)
-    parser.add_argument("--fee-pct", type=float, default=0.1)
-    parser.add_argument("--slippage-pct", type=float, default=0.05)
-    parser.add_argument("--splits", type=int, default=5)
-    parser.add_argument("--train-ratio", type=float, default=0.6)
+    parser.add_argument("--capital", type=float, default=base.BACKTEST_INITIAL_CAPITAL)
+    parser.add_argument("--fee-pct", type=float, default=base.BACKTEST_FEE_PCT)
+    parser.add_argument(
+        "--slippage-pct", type=float, default=base.BACKTEST_SLIPPAGE_PCT
+    )
+    parser.add_argument("--splits", type=int, default=base.BACKTEST_WALK_FORWARD_SPLITS)
+    parser.add_argument(
+        "--train-ratio", type=float, default=base.BACKTEST_WALK_FORWARD_TRAIN_RATIO
+    )
     parser.add_argument("--html", action="store_true", help="quantstats report")
     parser.add_argument(
         "--max-risk-pct", type=float, default=None, help="MAX_RISK_PER_TRADE_PCT"
@@ -71,7 +77,7 @@ def main() -> None:
         overrides["MAX_RISK_PER_TRADE_PCT"] = args.max_risk_pct
     if args.max_position_pct is not None:
         overrides["MAX_POSITION_PCT"] = args.max_position_pct
-    settings = get_settings().model_copy(update=overrides)
+    settings = base.model_copy(update=overrides)
 
     ohlcv = _load(args)
     print(

@@ -63,6 +63,7 @@ def build_live_selector(
     trend_kw = {k: v for k, v in strategy_params.items() if k in TREND_PARAMS}
     rev_kw = {k: v for k, v in strategy_params.items() if k in REVERSION_PARAMS}
     trend = TrendFollowing(pair=pair, feature_engine=feature_engine, **trend_kw)
+    rev_kw.setdefault("enable_entries", s.MEAN_REVERSION_ENTRIES)
     reversion = MeanReversion(pair=pair, feature_engine=feature_engine, **rev_kw)
     detector = RegimeDetector(
         adx_trending_threshold=s.REGIME_ADX_TRENDING,

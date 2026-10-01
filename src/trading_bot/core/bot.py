@@ -287,7 +287,11 @@ class TradingOrchestrator:
         self._strategy_selectors = {}
         for pair in s.TRADING_PAIRS:
             trend = TrendFollowing(pair=pair, feature_engine=self._feature_engine)
-            reversion = MeanReversion(pair=pair, feature_engine=self._feature_engine)
+            reversion = MeanReversion(
+                pair=pair,
+                feature_engine=self._feature_engine,
+                enable_entries=s.MEAN_REVERSION_ENTRIES,
+            )
             self._strategy_selectors[pair] = StrategySelector(
                 trend,
                 reversion,

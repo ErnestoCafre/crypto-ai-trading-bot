@@ -8,9 +8,12 @@ Implementado:
 
 - Trading de criptomonedas **spot** (long-only): entra solo sin posición,
   CLOSE/SHORT venden la posición completa
-- Estrategias técnicas por régimen de mercado (trend following / mean reversion)
+- Estrategias técnicas por régimen de mercado: trend following; las entradas
+  de mean reversion existen pero están apagadas por defecto (ver Estrategias)
 - Análisis de sentimiento con CryptoBERT (extra `sentiment`)
-- Predicción de dirección con LightGBM (un modelo por par)
+- Filtro ML por *meta-labeling* (LightGBM): estima si una entrada técnica
+  terminará con retorno neto positivo; ningún modelo pasa hoy el gate de
+  publicación, así que no se usa (ver Entrenamiento)
 - Agente LLM multi-agente (Claude/GPT) como analista de mercado
 - Backtesting del mismo pipeline que corre en vivo, sin lookahead, con
   walk-forward out-of-sample, slippage y comisiones
@@ -112,6 +115,31 @@ RISK_RESET=true uv run trading-bot   # una sola vez; re-baselinea al balance act
 # o bien: detener el bot y borrar var/state/risk_state_<modo>.json
 ```
 
+## Estrategias
+
+`StrategySelector` elige por régimen: TRENDING y VOLATILE → trend following,
+RANGING → mean reversion. Las dos estrategias usan la misma escala de
+confianza (`graded_confidence`, `core/strategies/base.py`): 0,5 = condiciones
+de entrada recién cumplidas, 1,0 = lectura fuerte (ADX, RSI y distancia en
+ATR más allá de cada umbral). Así una señal técnica válida supera sola
+`MIN_CONFIDENCE_THRESHOLD=0.5` y las fuentes de IA deciden si se mantiene.
+
+Antes, la confianza de mean reversion era `(30 − RSI) / 30` (necesitaba
+RSI ≤ 15 para llegar a 0,5), así que nunca operaba, y la de trend following
+valía siempre 1,0. Con la escala común, las entradas de mean reversion
+empeoran el backtest (Binance 1h, 2024-01 → 2026-09, riesgo 0,20 % / 25 %):
+
+| Par | Trades | Retorno | Max DD | Sharpe |
+|---|---|---|---|---|
+| BTC/USDT sin / con MR | 259 / 334 | +0,10 / −5,27 % | 9,84 / 12,96 % | −1,17 / −1,74 |
+| ETH/USDT sin / con MR | 236 / 301 | +1,94 / −0,33 % | 5,28 / 7,28 % | −0,93 / −1,15 |
+| SOL/USDT sin / con MR | 252 / 315 | −0,98 / −4,02 % | 7,09 / 9,74 % | −1,42 / −1,77 |
+
+Por eso `MEAN_REVERSION_ENTRIES=false` por defecto: en RANGING el bot no
+abre posiciones, pero los CLOSE/SHORT de mean reversion siguen cerrando las
+abiertas (sin cambios respecto del comportamiento previo). Reactivarlas exige
+rediseñar la estrategia (salidas, stop) y validarla en el backtest.
+
 ## Señales de IA y datos de mercado
 
 - **Velas**: señales, stops y ML usan solo velas cerradas; la vela en
@@ -150,10 +178,11 @@ RISK_RESET=true uv run trading-bot   # una sola vez; re-baselinea al balance act
   supera a un filtro aleatorio y a la estrategia sin filtro en el backtest
   real, sin aumentar el drawdown. El artefacto (`task: "meta_label"`) se
   carga con la misma ruta canónica; fuera de una entrada LONG su predicción
-  no se usa. Contrato `--contract scaled` (por defecto): la confianza es la
-  distancia al umbral, y con los pesos actuales del combiner eso casi solo
-  achica posiciones. `--contract binary`: confianza 1,0, así que "down"
-  bloquea la entrada (filtro duro). El reporte hace el backtest de ambos.
+  no se usa. Contrato `--contract binary` (por defecto): confianza 1,0, así
+  que "down" bloquea la entrada (filtro duro) y "up" la deja con tamaño
+  completo. `--contract scaled`: la confianza es la distancia al umbral, y con
+  los pesos actuales del combiner eso casi solo achica posiciones. El reporte
+  hace el backtest de ambos.
 
   ```bash
   uv run python scripts/train_models.py --pairs BTC/USDT ETH/USDT SOL/USDT --publish

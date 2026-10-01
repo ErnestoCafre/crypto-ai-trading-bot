@@ -8,15 +8,22 @@ import pandas as pd
 
 from trading_bot.ai.prediction.feature_engine import FeatureEngine
 from trading_bot.core.models import AISignals, Signal, SignalType
-from trading_bot.core.strategies.base import BaseStrategy
+from trading_bot.core.strategies.base import BaseStrategy, graded_confidence
 
 
 class TrendFollowing(BaseStrategy):
     """LONG when EMAs are stacked, momentum is up and the trend is strong.
 
     Thresholds are constructor parameters so they can be optimized; the
-    defaults are the production values.
+    defaults are the production values. LONG confidence is graded (see
+    :func:`graded_confidence`): ADX at twice ``adx_min``, RSI 20 points past
+    ``rsi_entry_min`` and a fast/slow EMA spread of 3 ATR each count as a
+    strong reading.
     """
+
+    # Margin scales: how far past each threshold counts as a strong reading.
+    RSI_STRONG_POINTS = 20.0
+    EMA_SPREAD_STRONG_ATR = 3.0
 
     def __init__(
         self,
@@ -85,6 +92,7 @@ class TrendFollowing(BaseStrategy):
         macd = float(last[FeatureEngine.MACD_12_26_9])
         macd_signal = float(last[FeatureEngine.MACDs_12_26_9])
         adx = float(last[FeatureEngine.ADX_14])
+        atr = float(last.get(FeatureEngine.ATR_14, float("nan")))
 
         # --- CLOSE conditions (any) ---
         close_conds = [ema9 < ema21, rsi < self._rsi_exit_below]
@@ -108,10 +116,16 @@ class TrendFollowing(BaseStrategy):
             adx > self._adx_min,
         ]
         if all(long_subs):
+            margins = [
+                (adx - self._adx_min) / self._adx_min if self._adx_min > 0 else 1.0,
+                (rsi - self._rsi_entry_min) / self.RSI_STRONG_POINTS,
+            ]
+            if atr > 0:
+                margins.append((ema9 - ema50) / atr / self.EMA_SPREAD_STRONG_ATR)
             return Signal(
                 type=SignalType.LONG,
                 pair=self._pair,
-                confidence=sum(long_subs) / len(long_subs),
+                confidence=graded_confidence(margins),
                 strength=min(adx / 50.0, 1.0),
                 source=self.name,
                 metadata={"reason": "trend_long"},
