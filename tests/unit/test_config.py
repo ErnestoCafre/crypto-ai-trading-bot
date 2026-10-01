@@ -42,10 +42,8 @@ class TestSettings:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("TRADING_PAIRS", '["BTC/USDT", "ETH/USDT"]')
-        monkeypatch.setenv("ENSEMBLE_MODELS", "lightgbm,gru")
         s = Settings(_env_file=None)  # type: ignore[call-arg]
         assert s.TRADING_PAIRS == ["BTC/USDT", "ETH/USDT"]
-        assert s.ENSEMBLE_MODELS == ["lightgbm", "gru"]
 
     def test_ai_flags_default_disabled(self) -> None:
         s = Settings()
@@ -56,7 +54,8 @@ class TestSettings:
 
     def test_risk_defaults(self) -> None:
         s = Settings()
-        assert s.MAX_RISK_PER_TRADE_PCT == 1.0
+        assert s.MAX_RISK_PER_TRADE_PCT == 0.20
+        assert s.MAX_POSITION_PCT == 25.0
         assert s.MAX_DRAWDOWN_PCT == 15.0
         assert s.MAX_DAILY_LOSS_PCT == 3.0
 

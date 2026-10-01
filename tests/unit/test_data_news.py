@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -191,3 +191,155 @@ class TestRSSFeedFetcher:
 
         articles = RSSFeedFetcher._parse_feed("not xml at all", "https://bad.com")
         assert articles == []
+
+
+# ---------------------------------------------------------------------------
+# CoinDeskNews (Data API, /news/v1/article/list)
+# ---------------------------------------------------------------------------
+
+
+def _coindesk_item(
+    i: int, categories: list[str], published_on: int | None = None
+) -> dict:  # type: ignore[type-arg]
+    """Item shaped as the NEWS_ARTICLES schema of the Data API OpenAPI spec."""
+    return {
+        "TYPE": "121",
+        "ID": 1000 + i,
+        "GUID": f"guid-{i}",
+        "PUBLISHED_ON": published_on
+        if published_on is not None
+        else int(datetime.now(UTC).timestamp()) - i * 60,
+        "TITLE": f"Headline {i}",
+        "BODY": f"Body {i}",
+        "URL": f"https://example.com/{i}",
+        "SOURCE_DATA": {"NAME": "CoinDesk", "SOURCE_KEY": "coindesk"},
+        "CATEGORY_DATA": [
+            {"TYPE": "122", "ID": j, "NAME": c, "CATEGORY": c}
+            for j, c in enumerate(categories)
+        ],
+    }
+
+
+class TestCoinDeskNews:
+    def _fetcher(self, handler):  # type: ignore[no-untyped-def]
+        import httpx
+
+        from trading_bot.data.news.coindesk import CoinDeskNews
+
+        return CoinDeskNews(api_key="k", transport=httpx.MockTransport(handler))
+
+    def test_parse_article(self) -> None:
+        from trading_bot.data.news.coindesk import CoinDeskNews
+
+        item = _coindesk_item(1, ["BTC", "MARKET"], published_on=1704067200)
+        item["BODY"] = "x" * 5000
+        article = CoinDeskNews._parse_article(item)
+
+        assert article.article_id == "1001"
+        assert article.title == "Headline 1"
+        assert article.source == "CoinDesk"
+        assert article.categories == ["BTC", "MARKET"]
+        assert article.related_pairs == ["BTC/USDT"]  # MARKET is no pair
+        assert article.published_at == datetime(2024, 1, 1, tzinfo=UTC)
+        assert len(article.body) == 2000
+
+    @pytest.mark.asyncio
+    async def test_one_request_for_all_pairs(self) -> None:
+        import httpx
+
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "Data": [
+                        _coindesk_item(0, ["BTC"]),
+                        _coindesk_item(1, ["ETH", "BTC"]),
+                        _coindesk_item(2, ["SOL"]),
+                        _coindesk_item(3, ["BTC"], published_on=1),  # too old
+                    ],
+                    "Err": {},
+                },
+            )
+
+        fetcher = self._fetcher(handler)
+        since = datetime.now(UTC) - timedelta(hours=24)
+        by_pair = await fetcher.fetch_for_pairs(
+            ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"], since=since
+        )
+        await fetcher.close()
+
+        assert len(requests) == 1
+        req = requests[0]
+        assert req.url.path == "/news/v1/article/list"
+        assert req.url.params["categories"] == "BTC,DOGE,ETH,SOL"
+        assert req.url.params["limit"] == "100"
+        assert req.url.params["lang"] == "EN"
+        assert req.headers["Authorization"] == "Apikey k"
+        assert [a.title for a in by_pair["BTC/USDT"]] == ["Headline 0", "Headline 1"]
+        assert [a.title for a in by_pair["ETH/USDT"]] == ["Headline 1"]
+        assert [a.title for a in by_pair["SOL/USDT"]] == ["Headline 2"]
+        assert by_pair["DOGE/USDT"] == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_by_pair_keeps_interface(self) -> None:
+        import httpx
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"Data": [_coindesk_item(0, ["ETH"])]})
+
+        fetcher = self._fetcher(handler)
+        articles = await fetcher.fetch_by_pair(
+            "ETH/USDT", since=datetime.now(UTC) - timedelta(hours=1), limit=5
+        )
+        await fetcher.close()
+        assert [a.article_id for a in articles] == ["1000"]
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_is_not_retried(self) -> None:
+        import httpx
+
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                401, json={"Data": {}, "Err": {"message": "API key required"}}
+            )
+
+        fetcher = self._fetcher(handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetcher.fetch_latest()
+        await fetcher.close()
+        assert calls == 1
+
+
+class TestCryptoCompareForPairs:
+    @pytest.mark.asyncio
+    async def test_cryptocompare_single_request(self) -> None:
+        from trading_bot.data.news.cryptocompare import CryptoCompareNews
+
+        now = int(datetime.now(UTC).timestamp())
+        fetcher = CryptoCompareNews()
+        fetcher._fetch_page = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "Data": [
+                    {
+                        "id": "7",
+                        "title": "ETH news",
+                        "body": "b",
+                        "published_on": now,
+                        "categories": "ETH|Trading",
+                    }
+                ]
+            }
+        )
+        by_pair = await fetcher.fetch_for_pairs(
+            ["BTC/USDT", "ETH/USDT"], since=datetime.now(UTC) - timedelta(hours=1)
+        )
+        fetcher._fetch_page.assert_awaited_once_with(categories="BTC,ETH")
+        assert by_pair["BTC/USDT"] == []
+        assert by_pair["ETH/USDT"][0].article_id == "7"

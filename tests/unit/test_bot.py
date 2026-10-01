@@ -65,7 +65,6 @@ def _make_settings(**overrides):
         "USE_LLM_AGENT": False,
         "USE_DL_PREDICTION": False,
         "USE_RL_AGENT": False,
-        "USE_ENSEMBLE": False,
         "USE_REGIME_DETECTION": True,
         "REGIME_ADX_TRENDING": 25.0,
         "REGIME_VOLATILITY_HIGH_PCT": 80.0,
@@ -75,11 +74,16 @@ def _make_settings(**overrides):
         "SENTIMENT_WEIGHT": 0.2,
         "LLM_WEIGHT": 0.2,
         "DL_WEIGHT": 0.2,
+        "NEWS_PROVIDER": "coindesk",
+        "SENTIMENT_PROVIDER": "cryptobert",
+        "DB_PERSISTENCE": False,
+        "DB_TIMEOUT_S": 5.0,
+        "DATABASE_URL": "sqlite+aiosqlite:///:memory:",
+        "COINDESK_API_KEY": "",
         "CRYPTOCOMPARE_API_KEY": "",
         "TECHNICAL_WEIGHT": 0.4,
         "MIN_CONFIDENCE_THRESHOLD": 0.5,
         "AI_SIZING_FLOOR": 0.25,
-        "ENSEMBLE_MODELS": ["lightgbm"],
         "RISK_STATE_PATH": _RISK_STATE_PATH,
         "RISK_RESET": False,
         "LLM_ANALYSIS_INTERVAL_MIN": 15,
@@ -457,14 +461,16 @@ class TestSentimentCycle:
         from trading_bot.core.models import NewsArticle, SentimentResult
 
         mock_analyzer = MagicMock()
-        mock_analyzer.analyze = MagicMock(
-            return_value=SentimentResult(
-                score=0.5,
-                confidence=0.8,
-                label="positive",
-                model_used="CryptoBERT",
-                analyzed_text="test",
-            )
+        mock_analyzer.analyze_batch = MagicMock(
+            return_value=[
+                SentimentResult(
+                    score=0.5,
+                    confidence=0.8,
+                    label="positive",
+                    model_used="CryptoBERT",
+                    analyzed_text="test",
+                )
+            ]
         )
 
         orch._sentiment_analyzer = mock_analyzer
@@ -483,16 +489,18 @@ class TestSentimentCycle:
         )
 
         mock_news = AsyncMock()
-        mock_news.fetch_by_pair = AsyncMock(
-            return_value=[
-                NewsArticle(
-                    title="BTC pumps",
-                    body="Bitcoin pumps hard",
-                    source="test",
-                    url="http://test.com",
-                    published_at=datetime.now(UTC),
-                )
-            ]
+        mock_news.fetch_for_pairs = AsyncMock(
+            return_value={
+                "BTC/USDT": [
+                    NewsArticle(
+                        title="BTC pumps",
+                        body="Bitcoin pumps hard",
+                        source="test",
+                        url="http://test.com",
+                        published_at=datetime.now(UTC),
+                    )
+                ]
+            }
         )
         orch._news_fetcher = mock_news
 
@@ -1604,17 +1612,19 @@ class TestSentimentAndCaches:
         orch._sentiment_analyzer = analyzer
         orch._sentiment_aggregator = MagicMock()
         orch._news_fetcher = AsyncMock()
-        orch._news_fetcher.fetch_by_pair = AsyncMock(
-            return_value=[
-                NewsArticle(
-                    title=f"t{i}",
-                    body="b",
-                    source="s",
-                    url="u",
-                    published_at=datetime.now(UTC),
-                )
-                for i in range(3)
-            ]
+        orch._news_fetcher.fetch_for_pairs = AsyncMock(
+            return_value={
+                "BTC/USDT": [
+                    NewsArticle(
+                        title=f"t{i}",
+                        body="b",
+                        source="s",
+                        url="u",
+                        published_at=datetime.now(UTC),
+                    )
+                    for i in range(3)
+                ]
+            }
         )
         orch._fear_greed = None
 
@@ -1691,3 +1701,430 @@ class TestSentimentAndCaches:
         context = await orch._build_llm_context("BTC/USDT")
 
         assert context["sentiment_score"] == 0.0
+
+
+# ===========================================================================
+# Group 12: Sentiment cycle — independent sources, per-article cache
+# ===========================================================================
+
+
+def _news(title: str, article_id: str = "") -> object:
+    from trading_bot.core.models import NewsArticle
+
+    return NewsArticle(
+        title=title,
+        body="b",
+        source="s",
+        url="u",
+        published_at=datetime.now(UTC) - timedelta(minutes=5),
+        article_id=article_id,
+    )
+
+
+def _scoring_analyzer(score: float = 0.5) -> MagicMock:
+    from trading_bot.core.models import SentimentResult
+
+    analyzer = MagicMock()
+    analyzer.analyze_batch = MagicMock(
+        side_effect=lambda texts: [
+            SentimentResult(
+                score=score,
+                confidence=0.9,
+                label="bullish",
+                model_used="cryptobert",
+                analyzed_text=t,
+            )
+            for t in texts
+        ]
+    )
+    return analyzer
+
+
+def _sentiment_orch(news_by_pair=None, fg=75, **overrides) -> TradingOrchestrator:
+    from trading_bot.ai.sentiment.aggregator import SentimentAggregator
+
+    orch = _setup_orchestrator(USE_SENTIMENT=True, **overrides)
+    _wire_mocks(orch)
+    orch._sentiment_analyzer = _scoring_analyzer()
+    orch._sentiment_aggregator = SentimentAggregator()
+    orch._news_fetcher = AsyncMock()
+    orch._news_fetcher.fetch_for_pairs = AsyncMock(return_value=news_by_pair or {})
+    orch._fear_greed = AsyncMock()
+    orch._fear_greed.fetch_latest = AsyncMock(
+        return_value={"value": fg, "classification": "Greed"}
+    )
+    return orch
+
+
+class TestSentimentSources:
+    @pytest.mark.asyncio
+    async def test_news_401_keeps_fear_greed(self):
+        import httpx
+
+        orch = _sentiment_orch()
+        request = httpx.Request("GET", "https://data-api.coindesk.com/x")
+        orch._news_fetcher.fetch_for_pairs = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "401", request=request, response=httpx.Response(401, request=request)
+            )
+        )
+
+        await orch._run_sentiment_cycle()
+
+        for pair in orch._settings.TRADING_PAIRS:
+            sentiment = orch._latest_sentiment[pair]
+            assert sentiment.fear_greed_score == pytest.approx(0.5)
+            assert sentiment.num_sources_analyzed == 1
+
+    @pytest.mark.asyncio
+    async def test_fear_greed_failure_keeps_news(self):
+        orch = _sentiment_orch({"BTC/USDT": [_news("up", "1")]})
+        orch._fear_greed.fetch_latest = AsyncMock(side_effect=RuntimeError("down"))
+
+        await orch._run_sentiment_cycle()
+
+        sentiment = orch._latest_sentiment["BTC/USDT"]
+        assert sentiment.news_score == pytest.approx(0.5)
+        assert sentiment.num_sources_analyzed == 1
+        assert "ETH/USDT" not in orch._latest_sentiment  # no source at all
+
+    @pytest.mark.asyncio
+    async def test_fear_greed_and_news_fetched_once_per_cycle(self):
+        orch = _sentiment_orch(
+            {"BTC/USDT": [_news("a", "1")]},
+            TRADING_PAIRS=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+        )
+
+        await orch._run_sentiment_cycle()
+
+        orch._fear_greed.fetch_latest.assert_awaited_once()
+        orch._news_fetcher.fetch_for_pairs.assert_awaited_once()
+        assert set(orch._latest_sentiment) == set(orch._settings.TRADING_PAIRS)
+
+    @pytest.mark.asyncio
+    async def test_articles_scored_once_across_cycles(self):
+        shared = _news("shared", "1")
+        orch = _sentiment_orch(
+            {"BTC/USDT": [shared], "ETH/USDT": [shared, _news("eth", "2")]}
+        )
+
+        await orch._run_sentiment_cycle()
+        await orch._run_sentiment_cycle()
+
+        analyzer = orch._sentiment_analyzer
+        assert analyzer.analyze_batch.call_count == 1
+        assert len(analyzer.analyze_batch.call_args.args[0]) == 2
+        assert orch._latest_sentiment["ETH/USDT"].num_sources_analyzed == 3
+
+        # A new article is the only text scored on the next cycle.
+        orch._news_fetcher.fetch_for_pairs.return_value = {
+            "BTC/USDT": [shared, _news("fresh", "3")]
+        }
+        await orch._run_sentiment_cycle()
+        assert analyzer.analyze_batch.call_count == 2
+        assert len(analyzer.analyze_batch.call_args.args[0]) == 1
+        assert set(orch._latest_headlines["BTC/USDT"]) == {"shared", "fresh"}
+
+    @pytest.mark.asyncio
+    async def test_news_outage_reuses_cached_scores(self):
+        orch = _sentiment_orch({"BTC/USDT": [_news("a", "1")]}, fg=50)
+        await orch._run_sentiment_cycle()
+
+        orch._news_fetcher.fetch_for_pairs = AsyncMock(side_effect=RuntimeError())
+        await orch._run_sentiment_cycle()
+
+        assert orch._latest_sentiment["BTC/USDT"].news_score == pytest.approx(0.5)
+
+
+class TestNewsProviderSetup:
+    def test_missing_key_disables_only_news(self):
+        from loguru import logger
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            orch = _setup_orchestrator(USE_SENTIMENT=True, COINDESK_API_KEY="")
+            assert orch._build_news_fetcher() is None
+        finally:
+            logger.remove(sink)
+        assert any("COINDESK_API_KEY is empty" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_provider_selects_client(self):
+        from trading_bot.data.news.coindesk import CoinDeskNews
+        from trading_bot.data.news.cryptocompare import CryptoCompareNews
+
+        orch = _setup_orchestrator(COINDESK_API_KEY="k")
+        fetcher = orch._build_news_fetcher()
+        assert isinstance(fetcher, CoinDeskNews)
+        await fetcher.close()
+
+        orch = _setup_orchestrator(
+            NEWS_PROVIDER="cryptocompare", CRYPTOCOMPARE_API_KEY="k"
+        )
+        fetcher = orch._build_news_fetcher()
+        assert isinstance(fetcher, CryptoCompareNews)
+        await fetcher.close()
+
+
+# ===========================================================================
+# Group 13: DB persistence (TradeJournal on aiosqlite)
+# ===========================================================================
+
+
+@pytest.fixture
+async def journal_db():
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from trading_bot.core.trade_journal import TradeJournal
+    from trading_bot.db.base import Base
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield TradeJournal(factory, exchange="binance"), factory
+    await engine.dispose()
+
+
+async def _db_rows(factory):
+    from sqlalchemy import select
+
+    from trading_bot.db.models import Order, PortfolioSnapshot, Trade
+
+    async with factory() as session:
+        trades = list((await session.execute(select(Trade))).scalars())
+        orders = list((await session.execute(select(Order))).scalars())
+        snaps = list(
+            (
+                await session.execute(
+                    select(PortfolioSnapshot).order_by(PortfolioSnapshot.id)
+                )
+            ).scalars()
+        )
+    return trades, orders, snaps
+
+
+class TestPersistence:
+    @pytest.mark.asyncio
+    async def test_entry_exit_and_snapshots_are_recorded(self, journal_db):
+        journal, factory = journal_db
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch, ohlcv=_flat_ohlcv())
+        orch._executor = _paper_executor()
+        orch._journal = journal
+
+        _set_signal(orch, SignalType.LONG)
+        await orch.run_trading_cycle()
+        trades, orders, snaps = await _db_rows(factory)
+        assert [(t.status, t.strategy) for t in trades] == [("open", "trend_following")]
+        assert [o.side for o in orders] == ["buy"]
+        assert orders[0].trade_id == trades[0].id
+        assert snaps[-1].open_positions_count == 1
+        assert snaps[-1].snapshot_trigger == "cycle"
+
+        _set_signal(orch, SignalType.CLOSE)
+        await orch.run_trading_cycle()
+        trades, orders, snaps = await _db_rows(factory)
+        assert [(t.status, t.exit_reason) for t in trades] == [("closed", "signal")]
+        assert [o.side for o in orders] == ["buy", "sell"]
+        assert len(snaps) == 2
+        assert snaps[-1].open_positions_count == 0
+
+    @pytest.mark.asyncio
+    async def test_bot_side_stop_closes_trade(self, journal_db):
+        journal, factory = journal_db
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch)
+        orch._executor = _paper_executor()
+        orch._journal = journal
+        result = await orch._execute_order("BTC/USDT", "buy", 0.5, 50_000.0)
+        await journal.record_entry(result, strategy="trend_following")
+
+        await orch._execute_stop("BTC/USDT", 48_000.0)
+
+        trades, orders, _ = await _db_rows(factory)
+        assert trades[0].exit_reason == "stop_loss"
+        assert float(trades[0].exit_price) == pytest.approx(48_000.0)
+        assert [o.strategy for o in orders] == ["trend_following", "stop_loss"]
+
+    @pytest.mark.asyncio
+    async def test_exchange_stop_fill_closes_trade(self, journal_db):
+        journal, factory = journal_db
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch)
+        orch._journal = journal
+        await journal.record_entry(_make_order_result(), strategy="trend_following")
+        orch._stop_tracker.register("BTC/USDT", 49_000.0, 0.01, "ex-1", None)
+        orch._executor.get_order = AsyncMock(
+            return_value={
+                "status": "closed",
+                "average": 48_900.0,
+                "filled": 0.01,
+                "fee": {"cost": 0.4, "currency": "USDT"},
+            }
+        )
+
+        await orch._check_exchange_stop("BTC/USDT", "ex-1")
+
+        trades, orders, _ = await _db_rows(factory)
+        assert trades[0].exit_reason == "stop_loss"
+        assert orders[-1].exchange_order_id == "ex-1"
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_liquidation_is_recorded(self, journal_db):
+        from trading_bot.risk.drawdown import DrawdownMonitor
+
+        journal, factory = journal_db
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch, ohlcv=_flat_ohlcv(price=30_000.0))
+        paper = _paper_executor()
+        entry = await paper.place_order("BTC/USDT", "buy", "market", 1.5, 50_000.0)
+        await journal.record_entry(entry, strategy="trend_following")
+        orch._executor = paper
+        orch._journal = journal
+        orch._drawdown_monitor = DrawdownMonitor(initial_value=100_000.0)
+
+        await orch.run_trading_cycle()
+
+        trades, _, snaps = await _db_rows(factory)
+        assert [(t.status, t.exit_reason) for t in trades] == [
+            ("closed", "kill_switch")
+        ]
+        assert float(trades[0].pnl) < 0
+        assert snaps[-1].snapshot_trigger == "halted"
+        assert float(snaps[-1].realized_pnl_day) == pytest.approx(float(trades[0].pnl))
+
+    @pytest.mark.asyncio
+    async def test_db_failures_never_stop_trading(self):
+        from trading_bot.core.trade_journal import TradeJournal
+
+        def broken_factory():
+            raise ConnectionError("db down")
+
+        orch = _setup_orchestrator(TRADING_PAIRS=["BTC/USDT"])
+        _wire_mocks(orch, ohlcv=_flat_ohlcv())
+        orch._executor = _paper_executor()
+        orch._journal = TradeJournal(broken_factory, exchange="binance")  # type: ignore[arg-type]
+
+        _set_signal(orch, SignalType.LONG)
+        await orch.run_trading_cycle()
+        assert await orch._executor.get_position("BTC/USDT") > 0
+        _set_signal(orch, SignalType.CLOSE)
+        await orch.run_trading_cycle()
+        assert await orch._executor.get_position("BTC/USDT") == 0.0
+
+    @pytest.mark.asyncio
+    async def test_unreachable_db_at_startup_disables_persistence(self, tmp_path):
+        from trading_bot.core.trade_journal import TradeJournal
+
+        url = f"sqlite+aiosqlite:///{tmp_path}/missing/dir/bot.db"
+        assert await TradeJournal.connect(url, exchange="binance") is None
+
+    @pytest.mark.asyncio
+    async def test_open_trades_restored_after_restart(self, journal_db):
+        from trading_bot.core.trade_journal import TradeJournal
+
+        journal, factory = journal_db
+        await journal.record_entry(_make_order_result(), strategy="trend_following")
+
+        restarted = TradeJournal(factory, exchange="binance")
+        await restarted.restore()
+        sell = _make_order_result(side="sell")
+        await restarted.record_exit(sell, strategy="signal_combiner", reason="signal")
+
+        trades, _, _ = await _db_rows(factory)
+        assert [(t.status, t.exit_reason) for t in trades] == [("closed", "signal")]
+
+
+# ===========================================================================
+# Group 14: SENTIMENT_PROVIDER=llm
+# ===========================================================================
+
+
+class TestLLMSentimentProvider:
+    def test_llm_provider_shares_the_agents_budget(self, tmp_path):
+        from trading_bot.ai.sentiment.llm_news import AsyncLLMSentimentAnalyzer
+
+        orch = _setup_orchestrator(
+            SENTIMENT_PROVIDER="llm",
+            LLM_PROVIDER="anthropic",
+            LLM_MODEL="claude-haiku-4-5",
+            ANTHROPIC_API_KEY="k",
+            LLM_MAX_DAILY_COST_USD=5.0,
+            LLM_COST_STATE_PATH=str(tmp_path / "cost_{mode}.json"),
+        )
+        analyzer = orch._build_sentiment_analyzer()
+        assert isinstance(analyzer, AsyncLLMSentimentAnalyzer)
+        assert analyzer._tracker is orch._shared_llm_cost_tracker()
+
+    def test_llm_provider_without_key_falls_back_to_cryptobert(self, monkeypatch):
+        import trading_bot.ai.sentiment.cryptobert as cryptobert
+
+        monkeypatch.setattr(cryptobert, "_require_backend", lambda: None)
+        orch = _setup_orchestrator(
+            SENTIMENT_PROVIDER="llm", LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY=""
+        )
+        assert isinstance(
+            orch._build_sentiment_analyzer(), cryptobert.CryptoBERTAnalyzer
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_llm_scores_are_retried_next_cycle(self, tmp_path):
+        from trading_bot.ai.sentiment.cost_tracker import SentimentCostTracker
+        from trading_bot.ai.sentiment.llm_news import AsyncLLMSentimentAnalyzer
+        from trading_bot.core.models import SentimentResult
+
+        orch = _sentiment_orch(
+            {"BTC/USDT": [_news("a", "1"), _news("b", "2")]},
+            TRADING_PAIRS=["BTC/USDT"],
+        )
+        analyzer = AsyncLLMSentimentAnalyzer(SentimentCostTracker(5.0), api_key="k")
+        ok = SentimentResult(
+            score=0.4, confidence=0.9, label="bullish", model_used="m", analyzed_text=""
+        )
+        analyzer.analyze_batch_async = AsyncMock(return_value=[ok, None])
+        orch._sentiment_analyzer = analyzer
+
+        await orch._run_sentiment_cycle()
+        assert len(orch._news_cache) == 1
+
+        analyzer.analyze_batch_async = AsyncMock(return_value=[ok])
+        await orch._run_sentiment_cycle()
+        assert analyzer.analyze_batch_async.await_args.args[0] == ["b. b"]
+        assert len(orch._news_cache) == 2
+
+
+class TestJournalReconcile:
+    @pytest.mark.asyncio
+    async def test_flat_pairs_abandon_stale_open_trades(self, journal_db):
+        from trading_bot.core.trade_journal import TradeJournal
+
+        journal, factory = journal_db
+        await journal.record_entry(_make_order_result(), strategy="trend_following")
+        await journal.record_entry(
+            _make_order_result(pair="ETH/USDT"), strategy="trend_following"
+        )
+
+        # Paper restart: the simulated account is flat again.
+        restarted = TradeJournal(factory, exchange="binance")
+        await restarted.restore()
+        await restarted.reconcile({"BTC/USDT": 0.0, "ETH/USDT": 0.01})
+
+        trades, _, _ = await _db_rows(factory)
+        status = {t.pair: (t.status, t.exit_reason) for t in trades}
+        assert status == {
+            "BTC/USDT": ("abandoned", "no_position"),
+            "ETH/USDT": ("open", None),
+        }
+        assert restarted.open_trade_id("BTC/USDT") is None
+        assert restarted.open_trade_id("ETH/USDT") is not None
+
+    @pytest.mark.asyncio
+    async def test_new_entry_abandons_unclosed_previous_trade(self, journal_db):
+        journal, factory = journal_db
+        await journal.record_entry(_make_order_result(), strategy="trend_following")
+        await journal.record_entry(_make_order_result(), strategy="mean_reversion")
+
+        trades, _, _ = await _db_rows(factory)
+        assert sorted(t.status for t in trades) == ["abandoned", "open"]

@@ -24,6 +24,10 @@ class BacktestTrade:
     fees: float
     slippage: float
     exit_reason: str  # "signal", "stop_loss", "take_profit", "timeout"
+    # Sizing diagnostics: loss at the initial stop as % of equity at entry,
+    # and whether MAX_POSITION_PCT (not the risk budget) set the quantity.
+    entry_risk_pct: float = 0.0
+    size_capped: bool = False
 
 
 @dataclass

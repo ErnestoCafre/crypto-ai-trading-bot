@@ -17,7 +17,7 @@ from trading_bot.config import get_settings
 from trading_bot.config.logging import setup_logging
 from trading_bot.data.market.candles import split_closed_candles
 from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
-from trading_bot.data.news.cryptocompare import CryptoCompareNews
+from trading_bot.data.news import build_news_fetcher
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
 from trading_bot.data.storage import OHLCVRepository
 from trading_bot.db.base import get_session_factory
@@ -74,9 +74,11 @@ async def download_ohlcv(
         return rows
 
 
-async def download_news(api_key: str = "") -> int:
-    """Download last 48h of crypto news."""
-    news_fetcher = CryptoCompareNews(api_key=api_key)
+async def download_news() -> int:
+    """Download the latest crypto news (one request, NEWS_PROVIDER)."""
+    news_fetcher = build_news_fetcher(get_settings())
+    if news_fetcher is None:
+        return 0
     try:
         articles = await news_fetcher.fetch_latest(limit=100)
         logger.info("Downloaded {} news articles", len(articles))
@@ -147,7 +149,7 @@ async def main() -> None:
 
     # Download news and Fear & Greed in parallel
     news_count, fgi_count = await asyncio.gather(
-        download_news(api_key=settings.CRYPTOCOMPARE_API_KEY),
+        download_news(),
         download_fear_greed(),
     )
 

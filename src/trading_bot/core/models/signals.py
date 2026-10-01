@@ -129,6 +129,8 @@ class PositionSize:
     stop_loss_pct: float
     # Risk multiplier from the market regime (VOLATILE < 1.0)
     regime_adjustment: float = 1.0
+    # True when MAX_POSITION_PCT, not the risk budget, set the quantity
+    capped: bool = False
 
 
 @dataclass
@@ -154,3 +156,5 @@ class NewsArticle:
     published_at: datetime
     categories: list[str] = field(default_factory=list)
     related_pairs: list[str] = field(default_factory=list)
+    # Provider id; "" when the source has none (see news_cache.article_key).
+    article_id: str = ""

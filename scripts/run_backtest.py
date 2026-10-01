@@ -7,6 +7,7 @@ Data comes from the parquet cache written by ``scripts/download_historical.py``
 Usage:
     uv run python scripts/run_backtest.py --pair BTC/USDT --timeframe 1h
     uv run python scripts/run_backtest.py --pair ETH/USDT --splits 5 --html
+    uv run python scripts/run_backtest.py --max-risk-pct 0.25 --max-position-pct 25
 """
 
 from __future__ import annotations
@@ -57,7 +58,20 @@ def main() -> None:
     parser.add_argument("--splits", type=int, default=5)
     parser.add_argument("--train-ratio", type=float, default=0.6)
     parser.add_argument("--html", action="store_true", help="quantstats report")
+    parser.add_argument(
+        "--max-risk-pct", type=float, default=None, help="MAX_RISK_PER_TRADE_PCT"
+    )
+    parser.add_argument(
+        "--max-position-pct", type=float, default=None, help="MAX_POSITION_PCT"
+    )
     args = parser.parse_args()
+
+    overrides: dict[str, float] = {}
+    if args.max_risk_pct is not None:
+        overrides["MAX_RISK_PER_TRADE_PCT"] = args.max_risk_pct
+    if args.max_position_pct is not None:
+        overrides["MAX_POSITION_PCT"] = args.max_position_pct
+    settings = get_settings().model_copy(update=overrides)
 
     ohlcv = _load(args)
     print(
@@ -71,11 +85,22 @@ def main() -> None:
         initial_capital=args.capital,
         fee_pct=args.fee_pct,
         slippage_pct=args.slippage_pct,
+        settings=settings,
+    )
+    print(
+        f"Sizing: MAX_RISK_PER_TRADE_PCT={settings.MAX_RISK_PER_TRADE_PCT}% "
+        f"MAX_POSITION_PCT={settings.MAX_POSITION_PCT}%"
     )
 
     full = engine.run(ohlcv, args.pair)
     print("\nFull period (default parameters — not tuned on this data):")
     BacktestReporter.print_summary(full)
+    cap_hit = full.metrics.get("cap_hit_pct", 0.0)
+    if cap_hit > 50:
+        print(
+            f"WARNING: MAX_POSITION_PCT set the size of {cap_hit:.0f}% of the "
+            "trades; sizing is not following the risk budget / ATR stop."
+        )
 
     wf = WalkForwardValidator(n_splits=args.splits, train_ratio=args.train_ratio)
     result = wf.run(engine, ohlcv, args.pair)
@@ -87,7 +112,8 @@ def main() -> None:
             f"return {m.get('total_return_pct', 0):7.2f}%  "
             f"sharpe {m.get('sharpe_ratio', 0):6.2f}  "
             f"maxDD {m.get('max_drawdown_pct', 0):6.2f}%  "
-            f"trades {int(m.get('total_trades', 0))}"
+            f"trades {int(m.get('total_trades', 0))}  "
+            f"cap {m.get('cap_hit_pct', 0):5.1f}%"
         )
     agg = result.aggregate_metrics
     print(

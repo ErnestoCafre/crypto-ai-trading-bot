@@ -60,7 +60,7 @@ class TestPositionSizer:
             side="buy",
         )
         assert result.quantity > 0
-        assert result.value_usd <= 100_000 * 0.10  # MAX_POSITION_PCT default=10%
+        assert result.value_usd <= 100_000 * 0.25  # MAX_POSITION_PCT default=25%
 
     def test_max_position_cap(self) -> None:
         # Tiny ATR multiplier → tiny stop distance → huge quantity → gets capped
@@ -73,7 +73,7 @@ class TestPositionSizer:
             entry_price=50000.0,
             side="buy",
         )
-        assert result.value_usd <= 100_000 * 0.10 + 1  # small tolerance
+        assert result.value_usd <= 100_000 * 0.25 + 1  # small tolerance
 
     def test_ai_confidence_reduces_risk(self) -> None:
         sl = StopLossManager()
@@ -135,6 +135,64 @@ class TestPositionSizer:
             entry_price=50000.0,
         )
         assert result.quantity >= 0.0
+
+
+class TestPositionCapCalibration:
+    """The risk budget should size entries; MAX_POSITION_PCT is a backstop."""
+
+    def test_capped_flag(self) -> None:
+        tight = PositionSizer(stop_loss_mgr=StopLossManager(atr_multiplier=0.001))
+        wide = PositionSizer(
+            stop_loss_mgr=StopLossManager(),
+            settings=Settings(_env_file=None, MAX_POSITION_PCT=100.0),  # type: ignore[call-arg]
+        )
+        kwargs = dict(
+            pair="BTC/USDT",
+            signal_confidence=0.8,
+            portfolio_value=100_000,
+            entry_price=50_000.0,
+        )
+        assert tight.calculate(**kwargs).capped is True
+        assert wide.calculate(**kwargs).capped is False
+
+    @pytest.mark.parametrize("stop_pct", [1.0, 2.0, 3.0, 4.0, 6.0])
+    def test_default_cap_rarely_binds_for_typical_1h_stops(
+        self, stop_pct: float
+    ) -> None:
+        """Defaults: a 2xATR stop at >=1% of price is sized by risk, not the cap.
+
+        If this fails after changing MAX_RISK_PER_TRADE_PCT / MAX_POSITION_PCT
+        the cap would set most entries (validate with scripts/run_backtest.py:
+        "Cap binding" should stay well under 50%).
+        """
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        ps = PositionSizer(stop_loss_mgr=StopLossManager(), settings=settings)
+        entry = 50_000.0
+        atr = entry * stop_pct / 100 / 2
+        result = ps._sl.calculate_stop("BTC/USDT", "buy", entry, atr_value=atr)
+        assert result == pytest.approx(entry * (1 - stop_pct / 100))
+        risk_qty = 100_000 * settings.MAX_RISK_PER_TRADE_PCT / 100 / (entry - result)
+        cap_qty = 100_000 * settings.MAX_POSITION_PCT / 100 / entry
+        assert risk_qty <= cap_qty
+
+    def test_warns_when_cap_sets_most_entries(self) -> None:
+        from loguru import logger
+
+        ps = PositionSizer(stop_loss_mgr=StopLossManager(atr_multiplier=0.001))
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            for _ in range(12):
+                ps.calculate(
+                    pair="BTC/USDT",
+                    signal_confidence=0.8,
+                    portfolio_value=100_000,
+                    entry_price=50_000.0,
+                )
+        finally:
+            logger.remove(sink)
+        assert ps.cap_hit_rate == 1.0
+        assert sum("MAX_POSITION_PCT" in m for m in messages) == 1  # once
 
 
 # ---------- DrawdownMonitor ----------

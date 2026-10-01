@@ -79,6 +79,32 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
 - `RISK_RESET=true` actúa en **cada** arranque mientras esté puesto: quitarlo
   después de usarlo, o el HALT dejaría de sobrevivir a los reinicios.
 
+### Tamaño de posición
+
+Cantidad = `min(riesgo / distancia al stop, tope)`: el riesgo
+(`MAX_RISK_PER_TRADE_PCT`, pérdida si salta el stop ATR x2) fija el tamaño y
+`MAX_POSITION_PCT` es solo un tope de seguridad. Los multiplicadores de IA y
+régimen reducen el riesgo, nunca lo suben.
+
+- **Fase 1 (actual): 0.20 % / 25 %.** Con los valores anteriores (1 % / 10 %)
+  el tope fijaba ~100 % de las entradas en 1h (backtest BTC/ETH/SOL
+  2024-01 → 2026-09): posición fija del 10 %, riesgo real ~0.184 % y sin ajuste
+  por volatilidad. Con 0.20 % / 25 % el riesgo real queda en ~0.170 % (casi el
+  de antes) y el tope actúa solo en el 18 % (BTC), 5 % (ETH) y 0 % (SOL) de los
+  trades.
+- **Fase 2 (siguiente paso, no activado): 0.25 % / 30 %.** No 0.25 % / 25 %:
+  con esa relación riesgo/tope el tope vuelve a actuar en ~32 % de los trades
+  de BTC; con 30 % baja a ~21 % (BTC), 6 % (ETH) y 0 % (SOL).
+- **Advertencia**: el Sharpe fue negativo en todas las configuraciones
+  probadas (2024-2026, retorno ≈ 0). La calibración ajusta el riesgo, no la
+  rentabilidad: no operar en real hasta tener una estrategia con ventaja
+  demostrada.
+- Validar cualquier cambio con
+  `scripts/run_backtest.py --max-risk-pct X --max-position-pct Y`: la línea
+  "Cap binding" debe quedar muy por debajo del 50 % (el script avisa si no).
+  En vivo, `PositionSizer` deja un warning si el tope fija la mayoría de las
+  últimas 20 entradas.
+
 Reset manual de un `HALTED`:
 
 ```bash
@@ -95,7 +121,17 @@ RISK_RESET=true uv run trading-bot   # una sola vez; re-baselinea al balance act
 - **Fetcher**: reintentos acotados (`OHLCV_FETCH_MAX_RETRIES`) con backoff
   exponencial + jitter y timeout total (`OHLCV_FETCH_TIMEOUT_S`); los datos se
   piden al mismo exchange de ejecución (`EXCHANGE_ID`).
-- **Sentimiento**: `ElKulako/cryptobert` por defecto (ver ADR-003).
+- **Sentimiento**: `ElKulako/cryptobert` por defecto (ver ADR-003);
+  `SENTIMENT_PROVIDER=llm` usa `LLM_PROVIDER`/`LLM_MODEL` con el mismo
+  presupuesto diario que los agentes (`LLM_MAX_DAILY_COST_USD`). Cada noticia
+  se puntúa una sola vez (caché de 24 h por artículo). Noticias:
+  `NEWS_PROVIDER=coindesk` (CoinDesk Data API, requiere `COINDESK_API_KEY`;
+  una petición por ciclo para todos los pares). Sin key, solo Fear & Greed.
+- **Persistencia**: fills, trades (entradas, salidas, stops, liquidación del
+  kill-switch) y un snapshot por ciclo van a `DATABASE_URL` (lo lee el
+  dashboard). Es best effort: si la DB no responde al arrancar, warning y el
+  bot sigue sin persistencia; un fallo posterior solo se registra en el log.
+  `DB_PERSISTENCE=false` la desactiva.
 - **Predicción ML**: un modelo LightGBM por par, cargado al arrancar desde
   `{ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl` (lo publica `ModelTrainer`). Sin
   archivo, ese par opera sin predicción. Los `.pkl` usan pickle: cargar solo

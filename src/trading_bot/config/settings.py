@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # --- Database ---
     DATABASE_URL: str = "postgresql://user:password@localhost:5432/trading_bot"
     DATABASE_ECHO: bool = False
+    # Persist fills, trades and per-cycle snapshots (read by the dashboard).
+    # Best effort: an unreachable DB only logs a warning; trading continues.
+    DB_PERSISTENCE: bool = True
+    DB_TIMEOUT_S: float = 5.0
 
     # --- Exchange ---
     EXCHANGE_ID: str = "binance"
@@ -51,8 +55,12 @@ class Settings(BaseSettings):
     PAPER_FEE_PCT: float = 0.1
 
     # --- Risk Management ---
-    MAX_RISK_PER_TRADE_PCT: float = 1.0
-    MAX_POSITION_PCT: float = 10.0
+    # Sizing: quantity = min(risk budget / stop distance, position cap). The
+    # risk budget should set the size and the cap only act as a backstop:
+    # with 1 % / 10 % the cap set ~100 % of backtested 1h entries (real risk
+    # ~0.18 %, no volatility adjustment). See README "Tamaño de posición".
+    MAX_RISK_PER_TRADE_PCT: float = 0.20
+    MAX_POSITION_PCT: float = 25.0
     MAX_DRAWDOWN_PCT: float = 15.0
     MAX_DAILY_LOSS_PCT: float = 3.0
     # Persisted drawdown latch + stops. "{mode}" is replaced by BOT_MODE so a
@@ -72,6 +80,10 @@ class Settings(BaseSettings):
     USE_RL_AGENT: bool = False
 
     # --- Sentiment ---
+    # "cryptobert": local transformer (SENTIMENT_MODEL). "llm": LLM_PROVIDER /
+    # LLM_MODEL, asynchronous, charged to LLM_MAX_DAILY_COST_USD (shared with
+    # the LLM agents); each article is scored once (per-article cache).
+    SENTIMENT_PROVIDER: Literal["cryptobert", "llm"] = "cryptobert"
     SENTIMENT_MODEL: str = "ElKulako/cryptobert"
     SENTIMENT_WEIGHT: float = Field(default=0.2, ge=0.0)
     SENTIMENT_INTERVAL_MIN: int = 15
@@ -112,6 +124,11 @@ class Settings(BaseSettings):
 
     # --- Data APIs ---
     COINGECKO_API_KEY: str = ""
+    # News for sentiment. "coindesk": CoinDesk Data API (COINDESK_API_KEY);
+    # "cryptocompare": legacy min-api (CRYPTOCOMPARE_API_KEY). Both require a
+    # key; without one only the news source is disabled (Fear & Greed stays).
+    NEWS_PROVIDER: Literal["coindesk", "cryptocompare"] = "coindesk"
+    COINDESK_API_KEY: str = ""
     CRYPTOCOMPARE_API_KEY: str = ""
 
     # --- Social APIs ---
@@ -136,11 +153,7 @@ class Settings(BaseSettings):
     BACKTEST_WALK_FORWARD_TRAIN_RATIO: float = 0.8
     OPTUNA_N_TRIALS: int = 100
 
-    # --- Ensemble ML ---
-    # Not wired into live trading yet: enabling it only logs a warning and
-    # the per-pair LightGBM models are used (see TradingOrchestrator).
-    USE_ENSEMBLE: bool = False
-    ENSEMBLE_MODELS: Annotated[list[str], NoDecode] = Field(default=["lightgbm"])
+    # --- ML prediction ---
     # Per-pair models: {ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl
     ML_MODEL_DIR: str = "var/models/prediction"
     ML_LABEL_HORIZON: int = 1
@@ -158,7 +171,7 @@ class Settings(BaseSettings):
             raise ValueError("TECHNICAL_WEIGHT must be > 0")
         return self
 
-    @field_validator("TRADING_PAIRS", "ENSEMBLE_MODELS", mode="before")
+    @field_validator("TRADING_PAIRS", mode="before")
     @classmethod
     def parse_str_list(cls, v: str | list[str]) -> list[str]:
         """Accept a comma-separated string or a JSON array for list settings."""

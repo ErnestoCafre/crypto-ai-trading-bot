@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 import pandas as pd
+from loguru import logger
 
 from trading_bot.config.settings import Settings, get_settings
 from trading_bot.core.models import CombinedSignal, PositionSize
 from trading_bot.risk.stop_loss import StopLossManager
+
+# Cap-binding check: warn when MAX_POSITION_PCT sizes most recent entries,
+# i.e. the risk budget no longer adapts to volatility (see README, sizing).
+CAP_WARN_WINDOW = 20
+CAP_WARN_MIN_SAMPLES = 10
+CAP_WARN_RATE = 0.5
 
 
 def _unit(multiplier: float | None) -> float:
@@ -26,6 +35,34 @@ class PositionSizer:
         self._max_position_pct = s.MAX_POSITION_PCT
         self._min_confidence = s.MIN_CONFIDENCE_THRESHOLD
         self._ai_floor = s.AI_SIZING_FLOOR
+        self._recent_capped: deque[bool] = deque(maxlen=CAP_WARN_WINDOW)
+        self._cap_warned = False
+
+    @property
+    def cap_hit_rate(self) -> float | None:
+        """Share of the last sized entries set by the position cap."""
+        if not self._recent_capped:
+            return None
+        return sum(self._recent_capped) / len(self._recent_capped)
+
+    def _track_cap(self, capped: bool) -> None:
+        self._recent_capped.append(capped)
+        rate = self.cap_hit_rate
+        if len(self._recent_capped) < CAP_WARN_MIN_SAMPLES or rate is None:
+            return
+        if rate > CAP_WARN_RATE and not self._cap_warned:
+            self._cap_warned = True
+            logger.warning(
+                "MAX_POSITION_PCT={}% capped {:.0%} of the last {} entries: "
+                "sizing no longer follows MAX_RISK_PER_TRADE_PCT={}% and the "
+                "ATR stop. Lower the risk per trade or raise the cap.",
+                self._max_position_pct,
+                rate,
+                len(self._recent_capped),
+                self._max_risk_pct,
+            )
+        elif rate <= CAP_WARN_RATE:
+            self._cap_warned = False
 
     def ai_size_multiplier(self, signal: CombinedSignal) -> float | None:
         """Risk multiplier in [AI_SIZING_FLOOR, 1] from the combined confidence.
@@ -86,8 +123,12 @@ class PositionSizer:
             quantity = adjusted_risk / ep
 
         # Cap to max position
+        capped = False
         if entry_price and entry_price > 0 and quantity * entry_price > max_position:
             quantity = max_position / entry_price
+            capped = True
+        if entry_price and entry_price > 0 and adjusted_risk > 0:
+            self._track_cap(capped)
 
         quantity = max(0.0, quantity)
         value_usd = quantity * (entry_price if entry_price and entry_price > 0 else 0.0)
@@ -102,4 +143,5 @@ class PositionSizer:
             regime_adjustment=regime_adj,
             stop_loss_price=stop_price,
             stop_loss_pct=stop_pct,
+            capped=capped,
         )

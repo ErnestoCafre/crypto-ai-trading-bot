@@ -17,6 +17,8 @@ from trading_bot.ai.prediction.feature_engine import FeatureEngine
 from trading_bot.ai.sentiment.aggregator import SentimentAggregator
 from trading_bot.ai.sentiment.base import BaseSentimentAnalyzer
 from trading_bot.ai.sentiment.cost_tracker import EXHAUSTED, SentimentCostTracker
+from trading_bot.ai.sentiment.llm_news import AsyncLLMSentimentAnalyzer
+from trading_bot.ai.sentiment.news_cache import NewsSentimentCache
 from trading_bot.config.settings import Settings, get_settings
 from trading_bot.core.models import (
     AggregatedSentiment,
@@ -32,12 +34,13 @@ from trading_bot.core.signal_combiner import SignalCombiner
 from trading_bot.core.strategies.mean_reversion import MeanReversion
 from trading_bot.core.strategies.trend_following import TrendFollowing
 from trading_bot.core.strategy_selector import StrategySelector
+from trading_bot.core.trade_journal import TradeJournal
 from trading_bot.data.market.candles import (
     split_closed_candles,
     timeframe_to_timedelta,
 )
 from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
-from trading_bot.data.news.cryptocompare import CryptoCompareNews
+from trading_bot.data.news.base import BaseNewsFetcher
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
 from trading_bot.execution.base import BaseExecutor
 from trading_bot.execution.paper_executor import PaperExecutor
@@ -48,6 +51,10 @@ from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.risk.risk_state import RiskStateStore
 from trading_bot.risk.stop_loss import StopLossManager
 from trading_bot.risk.stop_tracker import StopTracker
+
+# News window scored for sentiment, and articles kept per pair per fetch.
+NEWS_WINDOW = timedelta(hours=24)
+NEWS_PER_PAIR = 10
 
 
 def _regime_size_factor(signal: Signal | None) -> float | None:
@@ -79,11 +86,13 @@ class TradingOrchestrator:
         self._risk_store: RiskStateStore | None = None
         self._ai_confidence_filter: AIConfidenceFilter | None = None
         self._notifier: BaseNotifier | None = None
+        self._journal: TradeJournal | None = None
 
         # AI components — optional, feature-flagged
         self._sentiment_analyzer: BaseSentimentAnalyzer | None = None
         self._sentiment_aggregator: SentimentAggregator | None = None
-        self._news_fetcher: CryptoCompareNews | None = None
+        self._news_fetcher: BaseNewsFetcher | None = None
+        self._news_cache = NewsSentimentCache(ttl=NEWS_WINDOW)
         self._fear_greed: FearGreedIndex | None = None
         self._predictors: dict[str, BasePredictor] = {}
 
@@ -194,6 +203,9 @@ class TradingOrchestrator:
         if self._executor is not None:
             await self._executor.close()
 
+        if self._journal is not None:
+            await self._journal.close()
+
     async def run_trading_cycle(self) -> None:
         """One complete trading cycle: price, check drawdown, process each pair."""
         assert self._executor is not None
@@ -239,6 +251,7 @@ class TradingOrchestrator:
         if triggered is not None:
             await self._handle_risk_trigger(triggered)
             self._save_risk_state()
+            await self._record_snapshot(prices, trigger=triggered.value.lower())
             return
 
         for pair, ohlcv in market_data.items():
@@ -249,6 +262,8 @@ class TradingOrchestrator:
             except Exception:
                 logger.exception("Error processing {}", pair)
                 continue
+
+        await self._record_snapshot(prices)
 
     # ------------------------------------------------------------------
     # Private — initialisation
@@ -329,6 +344,21 @@ class TradingOrchestrator:
         initial_balance = await self._executor.get_balance()
         await self._load_risk_state(initial_balance["total"])
 
+        if s.DB_PERSISTENCE:
+            self._journal = await TradeJournal.connect(
+                s.DATABASE_URL, exchange=s.EXCHANGE_ID, timeout_s=s.DB_TIMEOUT_S
+            )
+            if self._journal is not None:
+                try:
+                    held = {
+                        pair: await self._executor.get_position(pair)
+                        for pair in s.TRADING_PAIRS
+                    }
+                except Exception:
+                    logger.exception("Could not read positions to reconcile trades")
+                else:
+                    await self._journal.reconcile(held)
+
         # Data fetcher
         # Same exchange as execution: valuation and stops must see its prices.
         self._fetcher = CCXTFetcher(
@@ -353,13 +383,9 @@ class TradingOrchestrator:
 
         if s.USE_SENTIMENT:
             try:
-                from trading_bot.ai.sentiment.cryptobert import CryptoBERTAnalyzer
-
-                self._sentiment_analyzer = CryptoBERTAnalyzer(
-                    model_name=s.SENTIMENT_MODEL,
-                )
+                self._sentiment_analyzer = self._build_sentiment_analyzer()
                 self._sentiment_aggregator = SentimentAggregator()
-                self._news_fetcher = CryptoCompareNews(api_key=s.CRYPTOCOMPARE_API_KEY)
+                self._news_fetcher = self._build_news_fetcher()
                 self._fear_greed = FearGreedIndex()
                 logger.info("Sentiment components initialised")
             except Exception:
@@ -376,37 +402,71 @@ class TradingOrchestrator:
                     TechnicalAnalystAgent,
                 )
 
-                api_key = (
-                    s.ANTHROPIC_API_KEY
-                    if s.LLM_PROVIDER == "anthropic"
-                    else s.OPENAI_API_KEY
-                )
+                api_key = self._llm_api_key()
                 agents = [
                     TechnicalAnalystAgent(s.LLM_PROVIDER, s.LLM_MODEL, api_key),
                     SentimentAnalystAgent(s.LLM_PROVIDER, s.LLM_MODEL, api_key),
                     RiskEvaluatorAgent(s.LLM_PROVIDER, s.LLM_MODEL, api_key),
                 ]
-                self._llm_cost_tracker = SentimentCostTracker(
-                    s.LLM_MAX_DAILY_COST_USD,
-                    state_path=self._mode_path(s.LLM_COST_STATE_PATH),
-                )
                 self._llm_orchestrator = Orchestrator(
-                    agents, self._llm_cost_tracker, s.LLM_PROVIDER, s.LLM_MODEL
+                    agents, self._shared_llm_cost_tracker(), s.LLM_PROVIDER, s.LLM_MODEL
                 )
                 logger.info("LLM multi-agent orchestrator initialised")
             except Exception:
                 logger.exception("Failed to init LLM agents — continuing without LLM")
                 self._llm_orchestrator = None
 
-        if s.USE_ENSEMBLE:
-            logger.warning(
-                "USE_ENSEMBLE/ENSEMBLE_MODELS={} are not wired into live trading "
-                "(no trained ensemble artifacts); using the per-pair LightGBM "
-                "models instead",
-                s.ENSEMBLE_MODELS,
-            )
-        if s.USE_DL_PREDICTION or s.USE_ENSEMBLE:
+        if s.USE_DL_PREDICTION:
             self._init_predictors()
+
+    def _llm_api_key(self) -> str:
+        s = self._settings
+        return (
+            s.ANTHROPIC_API_KEY if s.LLM_PROVIDER == "anthropic" else s.OPENAI_API_KEY
+        )
+
+    def _shared_llm_cost_tracker(self) -> SentimentCostTracker:
+        """One daily LLM budget for the agents and LLM news sentiment."""
+        if self._llm_cost_tracker is None:
+            s = self._settings
+            self._llm_cost_tracker = SentimentCostTracker(
+                s.LLM_MAX_DAILY_COST_USD,
+                state_path=self._mode_path(s.LLM_COST_STATE_PATH),
+            )
+        return self._llm_cost_tracker
+
+    def _build_sentiment_analyzer(self) -> BaseSentimentAnalyzer:
+        """News scorer for SENTIMENT_PROVIDER (CryptoBERT unless "llm")."""
+        s = self._settings
+        if str(s.SENTIMENT_PROVIDER).lower() == "llm":
+            api_key = self._llm_api_key()
+            if api_key:
+                logger.info(
+                    "News sentiment via LLM {}/{} (budget ${:.2f}/day, shared)",
+                    s.LLM_PROVIDER,
+                    s.LLM_MODEL,
+                    s.LLM_MAX_DAILY_COST_USD,
+                )
+                return AsyncLLMSentimentAnalyzer(
+                    self._shared_llm_cost_tracker(),
+                    provider=s.LLM_PROVIDER,
+                    model=s.LLM_MODEL,
+                    api_key=api_key,
+                )
+            logger.warning(
+                "SENTIMENT_PROVIDER=llm but no API key for LLM_PROVIDER={} — "
+                "falling back to CryptoBERT",
+                s.LLM_PROVIDER,
+            )
+        from trading_bot.ai.sentiment.cryptobert import CryptoBERTAnalyzer
+
+        return CryptoBERTAnalyzer(model_name=s.SENTIMENT_MODEL)
+
+    def _build_news_fetcher(self) -> BaseNewsFetcher | None:
+        """News client for NEWS_PROVIDER; None (news off) without an API key."""
+        from trading_bot.data.news import build_news_fetcher
+
+        return build_news_fetcher(self._settings)
 
     def _init_predictors(self) -> None:
         """Load one trained model per pair; pairs without one get no ML."""
@@ -538,6 +598,12 @@ class TradingOrchestrator:
         )
         if not await self._report_fill(result, "signal_combiner"):
             return
+        if self._journal is not None:
+            await self._journal.record_entry(
+                result,
+                strategy=signal.source if signal is not None else "signal_combiner",
+                confidence=combined.combined_confidence,
+            )
         await self._register_stop(pair, position_size.stop_loss_price, ohlcv)
 
     async def _fetch_ohlcv(self, pair: str) -> pd.DataFrame:
@@ -770,66 +836,110 @@ class TradingOrchestrator:
         return count
 
     async def _run_sentiment_cycle(self) -> None:
-        """Separate job: fetch news/fear-greed, analyse, cache results."""
+        """Separate job: fetch news/fear-greed, analyse, cache results.
+
+        News and Fear & Greed fail independently. Fear & Greed is global, so
+        it is fetched once per cycle; news comes in one request for all pairs
+        and only articles not seen before are scored (NewsSentimentCache).
+        """
         if self._sentiment_analyzer is None or self._sentiment_aggregator is None:
             return
 
         logger.debug("Sentiment cycle starting…")
+        pairs = list(self._settings.TRADING_PAIRS)
+        now = datetime.now(UTC)
 
-        for pair in self._settings.TRADING_PAIRS:
+        fear_greed = await self._fetch_fear_greed()
+        await self._update_news_sentiment(pairs, now)
+
+        for pair in pairs:
             try:
-                sentiment_results = []
-                headlines: list[str] = []
-
-                # News sentiment
-                if self._news_fetcher is not None:
-                    since = datetime.now(UTC) - timedelta(hours=24)
-                    articles = await self._news_fetcher.fetch_by_pair(
-                        pair, since=since, limit=10
-                    )
-                    texts = [f"{a.title}. {a.body}" for a in articles]
-                    headlines = [a.title for a in articles if a.title]
-                    if texts:
-                        # Transformer inference is CPU-bound and synchronous:
-                        # keep it off the event loop (trading cycle, stops).
-                        sentiment_results.extend(
-                            await asyncio.to_thread(
-                                self._sentiment_analyzer.analyze_batch, texts
-                            )
-                        )
-
-                # Fear & Greed
-                if self._fear_greed is not None:
-                    fg_data = await self._fear_greed.fetch_latest()
-                    if fg_data:
-                        fg_value = int(str(fg_data.get("value", 50)))
-                        # Normalise 0-100 to [-1, 1]
-                        normalised = (fg_value - 50) / 50
-                        sentiment_results.append(
-                            SentimentResult(
-                                score=normalised,
-                                confidence=0.7,
-                                label="fear_greed",
-                                model_used="fear_greed_index",
-                                analyzed_text=f"Fear & Greed: {fg_value}",
-                            )
-                        )
-
-                # Aggregate
-                if sentiment_results:
-                    aggregated = self._sentiment_aggregator.aggregate(
-                        sentiment_results, pair=pair
-                    )
-                    self._latest_sentiment[pair] = aggregated
-                    self._latest_headlines[pair] = headlines
-                    logger.debug(
-                        "{}: sentiment score={:.2f} ({} sources)",
-                        pair,
-                        aggregated.overall_score,
-                        aggregated.num_sources_analyzed,
-                    )
+                sentiment_results = self._news_cache.results_for(pair, now)
+                if fear_greed is not None:
+                    sentiment_results.append(fear_greed)
+                if not sentiment_results:
+                    continue
+                aggregated = self._sentiment_aggregator.aggregate(
+                    sentiment_results, pair=pair
+                )
+                self._latest_sentiment[pair] = aggregated
+                self._latest_headlines[pair] = self._news_cache.headlines_for(
+                    pair, limit=NEWS_PER_PAIR, now=now
+                )
+                logger.debug(
+                    "{}: sentiment score={:.2f} ({} sources)",
+                    pair,
+                    aggregated.overall_score,
+                    aggregated.num_sources_analyzed,
+                )
             except Exception:
-                logger.exception("Sentiment cycle failed for {}", pair)
+                logger.exception("Sentiment aggregation failed for {}", pair)
+
+    async def _fetch_fear_greed(self) -> SentimentResult | None:
+        """Global Fear & Greed as a sentiment result in [-1, 1]; None on failure."""
+        if self._fear_greed is None:
+            return None
+        try:
+            fg_data = await self._fear_greed.fetch_latest()
+        except Exception:
+            logger.exception("Fear & Greed fetch failed")
+            return None
+        if not fg_data:
+            return None
+        fg_value = int(str(fg_data.get("value", 50)))
+        return SentimentResult(
+            score=(fg_value - 50) / 50,
+            confidence=0.7,
+            label="fear_greed",
+            model_used="fear_greed_index",
+            analyzed_text=f"Fear & Greed: {fg_value}",
+        )
+
+    async def _update_news_sentiment(self, pairs: list[str], now: datetime) -> None:
+        """Fetch news once for all pairs and score only unseen articles."""
+        assert self._sentiment_analyzer is not None
+        self._news_cache.purge(now)
+        if self._news_fetcher is None:
+            return
+        try:
+            by_pair = await self._news_fetcher.fetch_for_pairs(
+                pairs, since=now - NEWS_WINDOW, limit_per_pair=NEWS_PER_PAIR
+            )
+        except Exception:
+            # Cached scores stay valid until they expire.
+            logger.exception("News fetch failed — using cached news sentiment")
+            return
+
+        self._news_cache.tag(by_pair)
+        pending = self._news_cache.missing(by_pair)
+        if not pending:
+            return
+        keys = list(pending)
+        texts = [f"{pending[k][0].title}. {pending[k][0].body}" for k in keys]
+        analyzer = self._sentiment_analyzer
+        results: list[SentimentResult | None]
+        try:
+            if isinstance(analyzer, AsyncLLMSentimentAnalyzer):
+                results = await analyzer.analyze_batch_async(texts)
+            else:
+                # Transformer inference is CPU-bound and synchronous: keep it
+                # off the event loop (trading cycle, stops).
+                results = list(await asyncio.to_thread(analyzer.analyze_batch, texts))
+        except Exception:
+            logger.exception("News sentiment analysis failed")
+            return
+        finally:
+            await self._notify_llm_budget()
+        for key, result in zip(keys, results, strict=False):
+            if result is None:  # failed or over budget: retried next cycle
+                continue
+            article, article_pairs = pending[key]
+            self._news_cache.store(key, article, result, article_pairs)
+        logger.debug(
+            "News sentiment: {} new articles scored, {} cached",
+            len(keys),
+            len(self._news_cache),
+        )
 
     async def _execute_order(
         self, pair: str, side: str, quantity: float, price: float
@@ -876,6 +986,36 @@ class TradingOrchestrator:
                 }
             )
         return True
+
+    async def _record_snapshot(
+        self, prices: dict[str, float], trigger: str = "cycle"
+    ) -> None:
+        """One portfolio snapshot per cycle; skipped without a journal."""
+        if self._journal is None or self._executor is None:
+            return
+        try:
+            balance = await self._executor.get_balance()
+            held = {
+                pair: await self._executor.get_position(pair)
+                for pair in self._settings.TRADING_PAIRS
+            }
+        except Exception:
+            logger.exception("Could not value portfolio for the snapshot")
+            return
+        positions_value = balance.get("positions_value")
+        if positions_value is None:
+            positions_value = sum(
+                qty * prices.get(pair, 0.0) for pair, qty in held.items() if qty > 0
+            )
+        dd = self._drawdown_monitor
+        await self._journal.record_snapshot(
+            total_value=balance["total"],
+            positions_value=float(positions_value),
+            prices=prices,
+            drawdown_pct=dd.current_drawdown_pct if dd else 0.0,
+            open_positions=sum(1 for qty in held.values() if qty > 0),
+            trigger=trigger,
+        )
 
     # ------------------------------------------------------------------
     # Private — stops
@@ -940,6 +1080,26 @@ class TradingOrchestrator:
             self._stop_tracker.remove(pair)
             price = float(order.get("average") or order.get("price") or 0.0)
             qty = float(order.get("filled") or 0.0)
+            if self._journal is not None:
+                fee = order.get("fee")
+                await self._journal.record_exit(
+                    OrderResult(
+                        order_id=order_id,
+                        exchange_order_id=order_id,
+                        pair=pair,
+                        side="sell",
+                        filled_price=price,
+                        filled_quantity=qty,
+                        fee=float(fee.get("cost") or 0.0)
+                        if isinstance(fee, dict)
+                        else 0.0,
+                        slippage_pct=0.0,
+                        status="closed",
+                        timestamp=datetime.now(UTC),
+                    ),
+                    strategy="stop_loss",
+                    reason="stop_loss",
+                )
             await self._notify_stop(pair, qty, price)
             return
         # Canceled/expired/rejected outside the bot: keep protecting it.
@@ -966,6 +1126,10 @@ class TradingOrchestrator:
         result = await self._execute_order(pair, "sell", quantity, fill_price)
         if not await self._report_fill(result, "stop_loss"):
             return
+        if self._journal is not None:
+            await self._journal.record_exit(
+                result, strategy="stop_loss", reason="stop_loss"
+            )
         self._stop_tracker.remove(pair)
         await self._notify_stop(pair, result.filled_quantity, result.filled_price)
 
@@ -1002,6 +1166,10 @@ class TradingOrchestrator:
 
         if await self._report_fill(result, "signal_combiner"):
             self._stop_tracker.remove(pair)
+            if self._journal is not None:
+                await self._journal.record_exit(
+                    result, strategy="signal_combiner", reason="signal"
+                )
         elif cancelled_native and stop is not None:
             stop.order_id = None
         self._save_risk_state()
@@ -1046,9 +1214,18 @@ class TradingOrchestrator:
         if self._notifier is not None:
             await self._notifier.send_alert(message, level="kill_switch")
         try:
-            await self._executor.close_all_positions()
+            results = await self._executor.close_all_positions()
         finally:
             await self._reconcile_stops(native_orders_cancelled=True)
+        if self._journal is not None:
+            reason = (
+                "kill_switch" if state == TradingState.HALTED else "daily_loss_limit"
+            )
+            for result in results:
+                if result.filled_quantity > 0:
+                    await self._journal.record_exit(
+                        result, strategy="risk_manager", reason=reason
+                    )
 
     def _mode_path(self, template: str) -> Path:
         """State file path; "{mode}" keeps paper and live state apart."""

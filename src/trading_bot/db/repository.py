@@ -1,13 +1,10 @@
 """Runtime persistence: orders, trades and portfolio snapshots.
 
-Intended hook points in ``core.bot.TradingOrchestrator`` (not wired yet):
-
-* after every fill (``_report_fill``) → :meth:`TradingRepository.record_order`
-* after an entry fill → :meth:`TradingRepository.open_trade`
-* after an exit / stop fill → :meth:`TradingRepository.close_trade`
-* at the end of each trading cycle → :meth:`TradingRepository.record_snapshot`
-
-The dashboard reads trades and snapshots through this class.
+Written by ``core.trade_journal.TradeJournal`` from the trading loop: every
+fill (:meth:`record_order`), entries (:meth:`open_trade`), exits, stops and
+kill-switch liquidations (:meth:`close_trade`) and one snapshot per trading
+cycle (:meth:`record_snapshot`). The dashboard reads trades and snapshots
+through this class.
 """
 
 from __future__ import annotations
@@ -16,7 +13,7 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trading_bot.db.models import Order, PortfolioSnapshot, Trade
@@ -143,6 +140,17 @@ class TradingRepository:
         await self._session.commit()
         return trade
 
+    async def abandon_trade(self, trade_id: uuid.UUID, reason: str) -> None:
+        """Mark an open trade whose position no longer exists (no exit fill
+        known, e.g. the paper account was reset); it leaves open/closed views
+        without a fabricated exit price or PnL."""
+        trade = await self._session.get(Trade, trade_id)
+        if trade is None or trade.status != "open":
+            return
+        trade.status = "abandoned"
+        trade.exit_reason = reason
+        await self._session.commit()
+
     async def record_snapshot(
         self,
         *,
@@ -189,6 +197,23 @@ class TradingRepository:
             .limit(limit)
         )
         return list(result.scalars())
+
+    async def realized_pnl_since(self, since: datetime) -> float:
+        """Net PnL of trades closed at or after ``since``."""
+        result = await self._session.execute(
+            select(func.coalesce(func.sum(Trade.pnl), 0)).where(
+                Trade.status == "closed", Trade.exit_time >= since
+            )
+        )
+        return float(result.scalar_one() or 0)
+
+    async def latest_snapshot(self) -> PortfolioSnapshot | None:
+        result = await self._session.execute(
+            select(PortfolioSnapshot)
+            .order_by(PortfolioSnapshot.timestamp.desc())
+            .limit(1)
+        )
+        return result.scalars().first()
 
     async def snapshots(self, limit: int = 1000) -> list[PortfolioSnapshot]:
         """Most recent snapshots, oldest first."""

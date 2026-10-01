@@ -1,4 +1,8 @@
-"""CryptoCompare news fetcher."""
+"""CryptoCompare news fetcher (legacy min-api).
+
+min-api is frozen since CryptoCompare became CoinDesk; prefer
+``CoinDeskNews`` (NEWS_PROVIDER=coindesk). Both need an API key.
+"""
 
 from __future__ import annotations
 
@@ -8,26 +12,17 @@ from loguru import logger
 
 from trading_bot.core.models import NewsArticle
 from trading_bot.data._http import create_http_client, retry_with_backoff
-from trading_bot.data.news.base import BaseNewsFetcher
+from trading_bot.data.news.base import (
+    CATEGORY_TO_PAIR,
+    BaseNewsFetcher,
+    pair_category,
+    split_by_pair,
+)
 
 BASE_URL = "https://min-api.cryptocompare.com/data/v2/news/"
 
-# Map CryptoCompare categories to trading pairs
-_CATEGORY_TO_PAIR: dict[str, str] = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "BNB": "BNB/USDT",
-    "XRP": "XRP/USDT",
-    "ADA": "ADA/USDT",
-    "DOGE": "DOGE/USDT",
-    "AVAX": "AVAX/USDT",
-    "DOT": "DOT/USDT",
-    "LINK": "LINK/USDT",
-}
-
 _PAIR_TO_CATEGORIES: dict[str, list[str]] = {
-    v: [k] for k, v in _CATEGORY_TO_PAIR.items()
+    v: [k] for k, v in CATEGORY_TO_PAIR.items()
 }
 
 
@@ -87,6 +82,18 @@ class CryptoCompareNews(BaseNewsFetcher):
         logger.debug("CryptoCompare: fetched {} articles", len(articles))
         return articles
 
+    async def fetch_for_pairs(
+        self,
+        pairs: list[str],
+        since: datetime,
+        limit_per_pair: int = 20,
+    ) -> dict[str, list[NewsArticle]]:
+        """One request for all pairs, split by category in memory."""
+        categories = ",".join(sorted({pair_category(p) for p in pairs}))
+        data = await self._fetch_page(categories=categories)
+        articles = [self._parse_article(item) for item in data.get("Data", [])]
+        return split_by_pair(articles, pairs, since, limit_per_pair)
+
     async def fetch_by_pair(
         self,
         pair: str,
@@ -113,7 +120,7 @@ class CryptoCompareNews(BaseNewsFetcher):
 
         related_pairs: list[str] = []
         for cat in categories:
-            pair = _CATEGORY_TO_PAIR.get(cat)
+            pair = CATEGORY_TO_PAIR.get(cat)
             if pair:
                 related_pairs.append(pair)
 
@@ -129,4 +136,5 @@ class CryptoCompareNews(BaseNewsFetcher):
             published_at=datetime.fromtimestamp(item.get("published_on", 0), tz=UTC),
             categories=categories,
             related_pairs=related_pairs,
+            article_id=str(item.get("id") or ""),
         )

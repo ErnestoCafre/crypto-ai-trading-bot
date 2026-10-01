@@ -32,6 +32,8 @@ class BacktestReporter:
         print(f"  Total Trades:    {int(m.get('total_trades', 0))}")
         print(f"  Max DD Duration: {m.get('max_drawdown_duration_days', 0):.1f} days")
         print(f"  Expectancy:      {m.get('expectancy', 0):.2f}")
+        print(f"  Risk at entry:   {m.get('avg_entry_risk_pct', 0):.3f}% (avg)")
+        print(f"  Cap binding:     {m.get('cap_hit_pct', 0):.1f}% of trades")
         print(f"{'=' * 60}\n")
 
     @staticmethod

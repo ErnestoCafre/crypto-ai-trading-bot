@@ -29,6 +29,8 @@ class _Position:
     entry_slippage: float
     stop_price: float | None
     regime: str | None
+    entry_risk_pct: float = 0.0
+    size_capped: bool = False
 
 
 class BacktestEngine:
@@ -264,7 +266,7 @@ class BacktestEngine:
         if fill <= 0:
             return None, 0.0
 
-        qty, stop = self._size(
+        qty, stop, capped = self._size(
             side,
             fill,
             equity,
@@ -281,6 +283,11 @@ class BacktestEngine:
             return None, 0.0
 
         fee = fill * qty * fee_rate
+        risk_pct = (
+            abs(fill - stop) * qty / equity * 100
+            if stop is not None and equity > 0
+            else 0.0
+        )
         position = _Position(
             side=side,
             quantity=qty,
@@ -290,6 +297,8 @@ class BacktestEngine:
             entry_slippage=slip * qty,
             stop_price=stop,
             regime=None,
+            entry_risk_pct=risk_pct,
+            size_capped=capped,
         )
         return position, fill * qty + fee
 
@@ -329,6 +338,8 @@ class BacktestEngine:
             fees=pos.entry_fee + exit_fee,
             slippage=pos.entry_slippage + slip * pos.quantity,
             exit_reason=reason,
+            entry_risk_pct=pos.entry_risk_pct,
+            size_capped=pos.size_capped,
         )
         return trade, notional + gross - exit_fee
 
@@ -342,8 +353,8 @@ class BacktestEngine:
         pair: str,
         ai_multiplier: float | None,
         regime_multiplier: float | None,
-    ) -> tuple[float, float | None]:
-        """Quantity and stop price (external sizer, else 10% of equity).
+    ) -> tuple[float, float | None, bool]:
+        """Quantity, stop price and cap flag (external sizer, else 10% equity).
 
         The multipliers only shrink the risk budget, as in the live bot.
         """
@@ -361,14 +372,14 @@ class BacktestEngine:
             stop = float(ps.stop_loss_price) if ps.stop_loss_price else None
             if stop is None:
                 stop = self._calculate_stop(price, side, window, pair)
-            return float(ps.quantity), stop
+            return float(ps.quantity), stop, bool(getattr(ps, "capped", False))
 
         scale = min(1.0, max(0.0, ai_multiplier if ai_multiplier is not None else 1.0))
         scale *= min(
             1.0, max(0.0, regime_multiplier if regime_multiplier is not None else 1.0)
         )
         qty = equity * 0.1 * scale / price
-        return qty, self._calculate_stop(price, side, window, pair)
+        return qty, self._calculate_stop(price, side, window, pair), False
 
     def _ai_multiplier(self, combined: Any) -> float | None:
         """Live AI sizing (``PositionSizer.ai_size_multiplier``), if available."""

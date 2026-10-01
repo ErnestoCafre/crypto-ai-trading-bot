@@ -60,6 +60,12 @@ class MetricsCalculator:
         ]
         metrics["avg_trade_duration_hours"] = float(np.mean(durations_h))
 
+        # Sizing: realised risk at entry and how often the position cap bound
+        metrics["avg_entry_risk_pct"] = float(
+            np.mean([t.entry_risk_pct for t in trades])
+        )
+        metrics["cap_hit_pct"] = 100.0 * sum(t.size_capped for t in trades) / n_trades
+
         # Trades per month over the backtest span (trade span as fallback)
         span_years = _span_years(equity_curve.index)
         if span_years is not None:
@@ -158,6 +164,8 @@ def _empty_metrics(metrics: dict[str, float]) -> dict[str, float]:
         "profit_factor",
         "expectancy",
         "avg_trade_duration_hours",
+        "avg_entry_risk_pct",
+        "cap_hit_pct",
         "trades_per_month",
         "total_return_pct",
         "sharpe_ratio",
