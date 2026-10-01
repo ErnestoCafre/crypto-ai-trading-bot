@@ -117,3 +117,23 @@ async def test_send_notification_network_failure(
     ):
         result = await configured_notifier.send_alert("Test alert")
         assert result is False
+
+
+@pytest.mark.asyncio
+async def test_dynamic_text_is_html_escaped(
+    configured_notifier: TelegramNotifier,
+) -> None:
+    """parse_mode=HTML: a raw < or & would make Telegram reject the message."""
+    mock_resp = AsyncMock(spec=httpx.Response)
+    mock_resp.status_code = 200
+    with patch(
+        "httpx.AsyncClient.post", new_callable=AsyncMock, return_value=mock_resp
+    ) as mock_post:
+        await configured_notifier.send_alert("drawdown <15% & <class 'X'>")
+        await configured_notifier.send_ai_report(
+            {"pair": "BTC/USDT", "reasoning": "RSI < 30 & <b>bold</b>"}
+        )
+    alert, report = (c[1]["json"]["text"] for c in mock_post.call_args_list)
+    assert "drawdown &lt;15% &amp; &lt;class 'X'&gt;" in alert
+    assert alert.startswith("<b>")  # the notifier's own markup is kept
+    assert "RSI &lt; 30 &amp; &lt;b&gt;bold&lt;/b&gt;" in report

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 from typing import Any
 
@@ -74,8 +75,8 @@ class TelegramNotifier(BaseNotifier):
             "success": "✅",
         }
         icon = icon_map.get(level.lower(), "📢")
-        header = f"<b>{icon} Trading Bot Alert [{level.upper()}]</b>"
-        text = f"{header}\n\n{message}"
+        header = f"<b>{icon} Trading Bot Alert [{_esc(level.upper())}]</b>"
+        text = f"{header}\n\n{_esc(message)}"
         return await self._send_raw_message(text)
 
     async def send_trade_notification(self, trade: dict[str, Any]) -> bool:
@@ -90,11 +91,11 @@ class TelegramNotifier(BaseNotifier):
         icon = "🟢" if side == "BUY" else "🔴"
         price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else str(price)
         text = (
-            f"<b>{icon} Trade Executed: {side} {pair}</b>\n\n"
-            f"• <b>Status:</b> {status}\n"
-            f"• <b>Quantity:</b> {qty}\n"
-            f"• <b>Price:</b> {price_str}\n"
-            f"• <b>Strategy:</b> {strategy}"
+            f"<b>{icon} Trade Executed: {_esc(side)} {_esc(pair)}</b>\n\n"
+            f"• <b>Status:</b> {_esc(status)}\n"
+            f"• <b>Quantity:</b> {_esc(qty)}\n"
+            f"• <b>Price:</b> {_esc(price_str)}\n"
+            f"• <b>Strategy:</b> {_esc(strategy)}"
         )
         return await self._send_raw_message(text)
 
@@ -111,9 +112,15 @@ class TelegramNotifier(BaseNotifier):
             else str(confidence)
         )
         text = (
-            f"<b>🤖 AI Market Analysis: {pair}</b>\n\n"
-            f"• <b>Recommendation:</b> {recommendation}\n"
-            f"• <b>Confidence:</b> {conf_str}\n"
-            f"• <b>Reasoning:</b> {reasoning}"
+            f"<b>🤖 AI Market Analysis: {_esc(pair)}</b>\n\n"
+            f"• <b>Recommendation:</b> {_esc(recommendation)}\n"
+            f"• <b>Confidence:</b> {_esc(conf_str)}\n"
+            f"• <b>Reasoning:</b> {_esc(reasoning)}"
         )
         return await self._send_raw_message(text)
+
+
+def _esc(value: object) -> str:
+    """Escape for parse_mode=HTML: a stray < or & (exception text, LLM output)
+    makes Telegram reject the whole message with 400."""
+    return html.escape(str(value), quote=False)
