@@ -21,7 +21,16 @@ def captured(tmp_path, monkeypatch) -> Iterator[list[str]]:
     monkeypatch.chdir(tmp_path)
     root = logging.getLogger()
     saved_handlers, saved_level = root.handlers[:], root.level
-    names = ("httpx", "httpcore", "ccxt", "anthropic", "openai", "trading_bot")
+    names = (
+        "httpx",
+        "httpcore",
+        "httpx2",
+        "httpcore2",
+        "ccxt",
+        "anthropic",
+        "openai",
+        "trading_bot",
+    )
     quiet = {n: logging.getLogger(n).level for n in names}
 
     setup_logging()
@@ -53,9 +62,12 @@ def test_stdlib_exception_keeps_traceback(captured: list[str]) -> None:
     assert "RuntimeError: boom" in joined
 
 
-def test_httpx_request_urls_are_not_logged(captured: list[str]) -> None:
-    logging.getLogger("httpx").info('HTTP Request: POST %s "HTTP/1.1 200 OK"', _URL)
-    assert not any(_TOKEN in line for line in captured)
+@pytest.mark.parametrize("name", ["httpx", "httpx2"])
+def test_httpx_request_urls_are_not_logged(captured: list[str], name: str) -> None:
+    logging.getLogger(name).info('HTTP Request: POST %s "HTTP/1.1 200 OK"', _URL)
+    # The token is also redacted downstream; the pinned level must drop the
+    # record itself.
+    assert not any("HTTP Request" in line for line in captured)
 
 
 def test_exchange_request_headers_are_not_logged(captured: list[str]) -> None:

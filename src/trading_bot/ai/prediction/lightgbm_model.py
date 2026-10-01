@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import pickle
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from trading_bot.ai.prediction.base import BasePredictor, PredictionUnavailableError
+from trading_bot.ai.prediction.base import (
+    BasePredictor,
+    PredictionUnavailableError,
+    read_artifact,
+    write_artifact,
+)
 from trading_bot.core.models import Prediction
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,8 @@ class LightGBMPredictor(BasePredictor):
         self._params: dict[str, Any] = {**self.DEFAULT_PARAMS, **(params or {})}
         self._model: Any = None
         self._feature_names: list[str] = []
+        # Set by load() for meta-label artifacts.
+        self._delegate: Any = None
 
     def predict(
         self,
@@ -56,6 +60,8 @@ class LightGBMPredictor(BasePredictor):
         dropped, order restored). Raises PredictionUnavailableError when a
         training column is missing or the latest row has NaN.
         """
+        if self._delegate is not None:
+            return self._delegate.predict(ohlcv, features)  # type: ignore[no-any-return]
         if self._model is None:
             raise RuntimeError("Model not trained. Call train() or load() first.")
         if not self._feature_names:
@@ -91,6 +97,19 @@ class LightGBMPredictor(BasePredictor):
             timestamp=datetime.now(UTC),
         )
 
+    def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
+        """Probability of the "up" class for every row of *features*."""
+        if self._delegate is not None:
+            raise RuntimeError("meta-label artifacts are served through predict()")
+        if self._model is None:
+            raise RuntimeError("Model not trained. Call train() or load() first.")
+        proba = self._model.predict_proba(features[self._feature_names])
+        return np.asarray(proba)[:, 1]
+
+    @property
+    def feature_names(self) -> list[str]:
+        return list(self._feature_names)
+
     def train(
         self,
         train_data: pd.DataFrame,
@@ -102,6 +121,8 @@ class LightGBMPredictor(BasePredictor):
         Last column of *train_data* / *val_data* is the label.
         """
         import lightgbm as lgb
+
+        self._delegate = None  # a fresh direction model replaces a loaded one
 
         params = {**self._params, **(hyperparameters or {})}
 
@@ -151,43 +172,42 @@ class LightGBMPredictor(BasePredictor):
         return metrics
 
     def load(self, model_path: str) -> None:
-        """Load a trained model from disk.
+        """Load a trained model from disk (see ``base.read_artifact``).
 
-        Trust boundary: pickle executes code on load, so only load files this
-        project produced (save()/ModelTrainer) from the local model dir,
-        never downloaded or user-supplied ones. When a ``.sha256`` sidecar
-        exists the file must match it (guards against corrupt/partial files).
+        The artifact's ``task`` field selects the model: ``"meta_label"``
+        artifacts are served by :class:`MetaLabelPredictor`, which this
+        instance then delegates ``predict`` to — the bot builds a
+        LightGBMPredictor for every canonical ``{pair}_{tf}.pkl``. Artifacts
+        without ``task`` predate it and are direction models.
         """
-        path = Path(model_path)
-        payload = path.read_bytes()
-        sidecar = _checksum_path(path)
-        if sidecar.exists():
-            expected = sidecar.read_text(encoding="utf-8").split()[0]
-            actual = hashlib.sha256(payload).hexdigest()
-            if actual != expected:
-                raise ValueError(f"Checksum mismatch for {path}")
-        else:
-            logger.warning("No checksum sidecar for %s; loading unverified", path)
-        data = pickle.loads(payload)  # noqa: S301 — trusted local artifact
+        data = read_artifact(model_path)
+        task = data.get("task", "direction")
+        if task == "meta_label":
+            from trading_bot.ai.prediction.meta_label import MetaLabelPredictor
+
+            self._delegate = MetaLabelPredictor.from_artifact(
+                data, pair=self._pair, timeframe=self._timeframe
+            )
+            self._model = self._delegate
+            self._feature_names = list(self._delegate.feature_names)
+            return
+        if task != "direction":
+            raise ValueError(f"Unknown model task {task!r} in {model_path}")
+        self._delegate = None
         self._model = data["model"]
         self._feature_names = list(data.get("feature_names", []))
 
     def save(self, model_path: str) -> None:
         """Save the trained model to disk."""
-        if self._model is None:
-            raise RuntimeError("No trained model to save.")
-
-        path = Path(model_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = pickle.dumps(
+        if self._model is None or self._delegate is not None:
+            raise RuntimeError("No trained direction model to save.")
+        write_artifact(
+            model_path,
             {
+                "task": "direction",
                 "model": self._model,
                 "feature_names": self._feature_names,
-            }
-        )
-        path.write_bytes(payload)
-        _checksum_path(path).write_text(
-            f"{hashlib.sha256(payload).hexdigest()}  {path.name}\n", encoding="utf-8"
+            },
         )
 
     def is_loaded(self) -> bool:
@@ -197,6 +217,8 @@ class LightGBMPredictor(BasePredictor):
     @property
     def feature_importance(self) -> dict[str, float]:
         """Return feature importance scores."""
+        if self._delegate is not None:
+            return self._delegate.feature_importance  # type: ignore[no-any-return]
         if self._model is None:
             return {}
         importances = self._model.feature_importances_
@@ -207,7 +229,3 @@ class LightGBMPredictor(BasePredictor):
                 strict=False,
             )
         )
-
-
-def _checksum_path(path: Path) -> Path:
-    return path.with_name(path.name + ".sha256")

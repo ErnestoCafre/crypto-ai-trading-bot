@@ -92,7 +92,8 @@ class LLMSentimentAnalyzer(BaseSentimentAnalyzer):
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": text[:2000]}],
         )
-        return response.content[0].text  # type: ignore[no-any-return]
+        # Newer models may lead with a thinking block: join the text blocks.
+        return "".join(block.text for block in response.content if block.type == "text")
 
     def _call_openai(self, text: str) -> str:
         import openai

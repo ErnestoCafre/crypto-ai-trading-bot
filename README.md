@@ -132,11 +132,40 @@ RISK_RESET=true uv run trading-bot   # una sola vez; re-baselinea al balance act
   dashboard). Es best effort: si la DB no responde al arrancar, warning y el
   bot sigue sin persistencia; un fallo posterior solo se registra en el log.
   `DB_PERSISTENCE=false` la desactiva.
-- **Predicción ML**: un modelo LightGBM por par, cargado al arrancar desde
-  `{ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl` (lo publica `ModelTrainer`). Sin
-  archivo, ese par opera sin predicción. Los `.pkl` usan pickle: cargar solo
+- **Predicción ML**: un artefacto LightGBM por par, cargado al arrancar desde
+  `{ML_MODEL_DIR}/{BTC_USDT}_{timeframe}.pkl` (lo publica
+  `scripts/train_models.py`). El meta-label es un único modelo compartido,
+  publicado en la ruta de cada par que pasa el gate. Sin archivo, ese par
+  opera sin predicción. Los `.pkl` usan pickle: cargar solo
   archivos generados por este proyecto; si existe el sidecar `.sha256` se
   verifica.
+- **Entrenamiento** (`scripts/train_models.py`, `--task meta_label` por
+  defecto): *meta-labeling* sobre las entradas LONG del pipeline técnico. La
+  estrategia decide el lado; el modelo estima si **esa** entrada termina con
+  retorno neto positivo. La etiqueta es el trade real: entrada al open
+  siguiente, stop 2×ATR y salida por CLOSE de la estrategia, con fees y
+  slippage. Se entrena un solo modelo para todos los pares (features
+  scale-free) con el historial completo. La validación es walk-forward + CPCV
+  purgados por el fin de cada trade. Un par se publica solo si el filtro
+  supera a un filtro aleatorio y a la estrategia sin filtro en el backtest
+  real, sin aumentar el drawdown. El artefacto (`task: "meta_label"`) se
+  carga con la misma ruta canónica; fuera de una entrada LONG su predicción
+  no se usa. Contrato `--contract scaled` (por defecto): la confianza es la
+  distancia al umbral, y con los pesos actuales del combiner eso casi solo
+  achica posiciones. `--contract binary`: confianza 1,0, así que "down"
+  bloquea la entrada (filtro duro). El reporte hace el backtest de ambos.
+
+  ```bash
+  uv run python scripts/train_models.py --pairs BTC/USDT ETH/USDT SOL/USDT --publish
+  ```
+
+  La predicción de dirección de la próxima vela (`--task direction`) se
+  descartó. Fuera de muestra (BTC/ETH/SOL 1h, 2026-04 a 2026-09) acertó
+  49,9 / 50,3 / 49,4 % de las direcciones: azar, frente a un baseline trivial
+  de 50,3 / 50,3 / 50,9 %. Además, su etiqueta
+  (retorno > `ML_LABEL_THRESHOLD` = 0,1 %) no coincide con la lectura
+  p > 0,5 = "up" del bot: el modelo de BTC decía "up" en el 1,2 % de las
+  barras, cuando subió el 50,3 %.
 - Sentimiento y decisiones LLM cacheadas vencen a 2x el intervalo de su job.
 
 ## Backtest

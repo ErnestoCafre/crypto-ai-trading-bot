@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pandas as pd
 
 from trading_bot.ai.prediction.feature_engine import FeatureEngine
@@ -24,16 +26,26 @@ class MLDataPipeline:
         ohlcv: pd.DataFrame,
         label_horizon: int = 1,
         label_threshold: float = 0.0,
+        feature_columns: Sequence[str] | None = None,
     ) -> tuple[pd.DataFrame, pd.Series]:
         """Build features and labels, drop NaN rows, return aligned pair.
+
+        ``feature_columns`` keeps only those columns *before* dropping NaN
+        rows, so an unused sparse column cannot discard training rows.
+        The last ``label_horizon`` bars have no forward return and are
+        dropped rather than labelled.
 
         Returns:
             (features DataFrame, labels Series) — same index, no NaN.
         """
         features = self._fe.build_features(ohlcv)
+        if feature_columns is not None:
+            features = features[list(feature_columns)]
 
         forward_ret = self._lg.forward_return(ohlcv, horizon=label_horizon)
+        # direction_label maps NaN to 0: mask it so those rows are dropped.
         labels = self._lg.direction_label(forward_ret, threshold=label_threshold)
+        labels = labels.where(forward_ret.notna())
 
         # Align and drop NaN
         combined = features.copy()

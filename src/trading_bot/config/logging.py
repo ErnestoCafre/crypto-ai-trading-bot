@@ -26,10 +26,13 @@ _TELEGRAM_TOKEN = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
 # options (prompts). Only trading_bot logs at DEBUG.
 _THIRD_PARTY_LEVEL = logging.INFO
 # Pinned per library so lowering the root level can never expose them:
-# httpx/httpcore log full request URLs (Telegram token) at INFO.
+# httpx/httpcore log full request URLs (Telegram token) at INFO; the
+# anthropic SDK (1.x) sends through the httpx2/httpcore2 fork.
 _LIBRARY_LEVELS = {
     "httpx": logging.WARNING,
     "httpcore": logging.WARNING,
+    "httpx2": logging.WARNING,
+    "httpcore2": logging.WARNING,
     "ccxt": logging.INFO,
     "anthropic": logging.INFO,
     "openai": logging.INFO,
