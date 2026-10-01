@@ -256,6 +256,13 @@ class TestThresholdAndContract:
         assert choose_threshold(p, ret) == 0.0  # per event: +0.30 - 0.06
         assert choose_threshold(p, ret, t0, t1) > 0.2  # per trade: 0.01 - 0.06
 
+    def test_binary_is_the_default_contract(self) -> None:
+        assert prediction_fields(0.6, 0.5) == prediction_fields(0.6, 0.5, "binary")
+        names = [*PRICE_FEATURES, *SIGNAL_FEATURES, "pair_code"]
+        model = MetaModel(_ConstantClassifier(0.6, len(names)), (1.0, 0.0), 0.5, names)
+        predictor = MetaLabelPredictor("BTC/USDT", "1h", model, {"BTC/USDT": 0})
+        assert predictor._contract == "binary"
+
     @pytest.mark.parametrize(
         ("p", "thr", "direction", "conf"),
         [(0.8, 0.4, "up", 2 / 3), (0.4, 0.4, "up", 0.0), (0.1, 0.4, "down", 0.75)],
@@ -263,7 +270,7 @@ class TestThresholdAndContract:
     def test_prediction_fields(
         self, p: float, thr: float, direction: str, conf: float
     ) -> None:
-        d, c, r = prediction_fields(p, thr)
+        d, c, r = prediction_fields(p, thr, "scaled")
         assert d == direction and c == pytest.approx(conf)
         assert r == pytest.approx(p - thr)
 
@@ -278,11 +285,13 @@ class _ConstantClassifier:
 
 
 def _predictor(
-    p: float, threshold: float, pair: str = "BTC/USDT"
+    p: float, threshold: float, pair: str = "BTC/USDT", contract: str = "scaled"
 ) -> MetaLabelPredictor:
     names = [*PRICE_FEATURES, *SIGNAL_FEATURES, "pair_code"]
     model = MetaModel(_ConstantClassifier(p, len(names)), (1.0, 0.0), threshold, names)
-    return MetaLabelPredictor(pair, "1h", model, {"BTC/USDT": 0, "ETH/USDT": 1})
+    return MetaLabelPredictor(
+        pair, "1h", model, {"BTC/USDT": 0, "ETH/USDT": 1}, contract=contract
+    )
 
 
 class TestArtifact:
@@ -542,7 +551,7 @@ class TestEndToEnd:
         assert run.final_model is not None
         for rep in run.primary.pairs:
             assert set(rep.backtests) == {"scaled", "binary"}
-            assert rep.backtest is rep.backtests["scaled"]
+            assert rep.backtest is rep.backtests["binary"]  # the default contract
             assert rep.backtest.trades_base > 0
             assert rep.gate is not None
 

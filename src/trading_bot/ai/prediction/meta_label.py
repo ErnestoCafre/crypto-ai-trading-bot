@@ -50,6 +50,7 @@ PRIMARY_SETTINGS = (
     "REGIME_VOLATILITY_HIGH_PCT",
     "REGIME_VOLATILE_SIZING_FACTOR",
     "MIN_CONFIDENCE_THRESHOLD",
+    "MEAN_REVERSION_ENTRIES",
 )
 DEFAULT_PARAMS: dict[str, Any] = {
     # Few hundred to few thousand overlapping events: keep trees small.
@@ -222,7 +223,7 @@ CONTRACTS = ("scaled", "binary")
 
 
 def prediction_fields(
-    p: float, threshold: float, contract: str = "scaled"
+    p: float, threshold: float, contract: str = "binary"
 ) -> tuple[str, float, float]:
     """(direction, confidence, predicted_return) for a calibrated ``p``.
 
@@ -254,7 +255,7 @@ class MetaLabelPredictor(BasePredictor):
         pair_codes: dict[str, int],
         training_settings: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
-        contract: str = "scaled",
+        contract: str = "binary",
     ) -> None:
         if contract not in CONTRACTS:
             raise ValueError(f"Unknown contract {contract!r}")
@@ -303,6 +304,7 @@ class MetaLabelPredictor(BasePredictor):
             data["pair_codes"],
             data.get("training_settings"),
             data.get("metadata"),
+            # Artifacts without the field predate the "binary" default.
             data.get("contract", "scaled"),
         )
         predictor._warn_on_settings_drift()

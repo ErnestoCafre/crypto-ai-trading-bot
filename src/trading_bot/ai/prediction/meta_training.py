@@ -60,8 +60,9 @@ class MetaConfig:
     weight_mode: str = "clipped"
     # Evaluated on events + CPCV only (the backtest runs for weight_mode).
     compare_weight_modes: tuple[str, ...] = ("raw",)
-    # Prediction contract published; every contract is backtested.
-    contract: str = "scaled"
+    # Prediction contract published; every contract is backtested. "binary"
+    # is the default: with the combiner weights "scaled" only shrinks size.
+    contract: str = "binary"
     min_trades: int = 30
     serving_window: int = 250
     parity_samples: int = 25
@@ -317,7 +318,7 @@ def build_predictor(
     pair: str,
     timeframe: str,
     metadata: dict[str, Any],
-    contract: str = "scaled",
+    contract: str = "binary",
 ) -> MetaLabelPredictor:
     if run.final_model is None:
         raise ValueError("run has no final model")

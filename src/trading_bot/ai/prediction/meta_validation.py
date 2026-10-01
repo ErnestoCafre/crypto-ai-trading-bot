@@ -407,7 +407,7 @@ def _random_filter_mean(
 def candidate_signals(
     data: PairData,
     preds_by_window: Sequence[tuple[pd.Timestamp, pd.Timestamp, MetaModel]],
-    contract: str = "scaled",
+    contract: str = "binary",
 ) -> pd.Series:
     """AISignals (ML prediction only) for every entry bar in the test windows.
 

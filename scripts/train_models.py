@@ -148,7 +148,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--contract",
         choices=("scaled", "binary"),
-        default="scaled",
+        default="binary",
         help="meta_label prediction contract published (both are backtested)",
     )
     p.add_argument(
@@ -448,7 +448,7 @@ async def run_meta(args: argparse.Namespace) -> MetaRun:
 
 
 def format_meta_table(
-    result: MetaRun, published: dict[str, str], contract: str = "scaled"
+    result: MetaRun, published: dict[str, str], contract: str = "binary"
 ) -> str:
     lines = []
     for mode in result.modes:
