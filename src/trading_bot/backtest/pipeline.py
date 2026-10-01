@@ -9,6 +9,9 @@ regime / AI size multipliers (a VOLATILE regime shrinks the position via
 routes to trend following). All components share one
 :class:`PrecomputedFeatureEngine`, so indicators are computed once per run.
 
+``STRATEGY_MODE=donchian_ensemble`` is a different simulation (portfolio
+target exposure, partial rebalancing): :func:`build_target_engine`.
+
 Not simulated: AI signals (sentiment / ML / LLM — pass
 ``ai_signals_series`` to ``BacktestEngine.run`` if you have point-in-time
 history), the drawdown kill-switch and exchange-side stop orders. Live
@@ -23,6 +26,7 @@ from typing import Any
 
 from trading_bot.ai.prediction.feature_engine import PrecomputedFeatureEngine
 from trading_bot.backtest.engine import BacktestEngine
+from trading_bot.backtest.target_engine import Execution, TargetExposureEngine
 from trading_bot.config.settings import Settings, get_settings
 from trading_bot.core.regime import RegimeDetector
 from trading_bot.core.signal_combiner import SignalCombiner
@@ -106,4 +110,39 @@ def build_live_engine(
         ai_confidence_filter=AIConfidenceFilter(settings=s),
         feature_engine=fe,
         allow_short=False,
+    )
+
+
+def build_target_engine(
+    initial_capital: float = 100_000.0,
+    fee_pct: float = 0.1,
+    slippage_pct: float = 0.05,
+    settings: Settings | None = None,
+    allocation: float | None = None,
+    rebalance_threshold: float | None = None,
+    execution: Execution = "next_open",
+    min_history: int | None = None,
+) -> TargetExposureEngine:
+    """TargetExposureEngine configured like the donchian_ensemble bot.
+
+    ``allocation`` defaults to MAX_POSITION_PCT (each pair's share of the
+    portfolio); pass 1.0 to backtest one pair as a full sleeve.
+    ``min_history=None`` keeps the live warm-up (longest channel + vol window).
+    """
+    s = settings or get_settings()
+    return TargetExposureEngine(
+        lookbacks=s.DONCHIAN_LOOKBACKS,
+        vol_target=s.DONCHIAN_VOL_TARGET,
+        vol_window=s.DONCHIAN_VOL_WINDOW,
+        allocation=s.MAX_POSITION_PCT / 100 if allocation is None else allocation,
+        rebalance_threshold=(
+            s.REBALANCE_THRESHOLD
+            if rebalance_threshold is None
+            else rebalance_threshold
+        ),
+        initial_capital=initial_capital,
+        fee_pct=fee_pct,
+        slippage_pct=slippage_pct,
+        execution=execution,
+        min_history=min_history,
     )

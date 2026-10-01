@@ -77,7 +77,25 @@ class MetricsCalculator:
         months = span_days / (365 / 12)
         metrics["trades_per_month"] = n_trades / months if months > 0 else 0.0
 
-        # --- Equity-curve metrics ---
+        metrics.update(
+            MetricsCalculator.equity_metrics(
+                equity_curve, risk_free_rate, periods_per_year
+            )
+        )
+        return metrics
+
+    @staticmethod
+    def equity_metrics(
+        equity_curve: pd.Series,
+        risk_free_rate: float = 0.04,
+        periods_per_year: float | None = None,
+    ) -> dict[str, float]:
+        """Return, risk and drawdown metrics of an equity curve alone.
+
+        Used by :meth:`calculate` and by strategies whose P&L is not a list
+        of round trips (target-exposure rebalancing).
+        """
+        metrics: dict[str, float] = {}
         if len(equity_curve) < 2:
             metrics["total_return_pct"] = 0.0
             metrics["sharpe_ratio"] = 0.0
