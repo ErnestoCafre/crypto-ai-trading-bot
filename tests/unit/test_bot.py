@@ -1298,6 +1298,12 @@ class TestKillSwitchLatch:
         assert len(kill_alerts) == 1
 
 
+def _drop_paper_account(path) -> None:
+    state = json.loads(path.read_text(encoding="utf-8"))
+    del state["paper_account"]
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
 class TestRiskStatePersistence:
     @pytest.mark.asyncio
     async def test_state_survives_orchestrator_restart(self, tmp_path):
@@ -1328,6 +1334,7 @@ class TestRiskStatePersistence:
         await orch1._load_risk_state(100_000.0)
         orch1._stop_tracker.register("BTC/USDT", 48_000.0, 1.0, None, None)
         orch1._save_risk_state()
+        _drop_paper_account(path)
 
         orch2 = _setup_orchestrator(RISK_STATE_PATH=str(path))
         orch2._executor = _paper_executor()  # no BTC held
@@ -1361,6 +1368,8 @@ class TestRiskStatePersistence:
         await orch1._load_risk_state(100_000.0)
         orch1._drawdown_monitor.update(80_000.0)
         orch1._save_risk_state()
+        # The 80k is simulated: the saved paper account would say 100k.
+        _drop_paper_account(path)
 
         orch2 = _setup_orchestrator(RISK_STATE_PATH=str(path), RISK_RESET=True)
         orch2._executor = _paper_executor()
@@ -1381,6 +1390,7 @@ class TestRiskStatePersistence:
         orch1._drawdown_monitor.update(120_000.0)  # profitable session
         orch1._drawdown_monitor.update(119_000.0)
         orch1._save_risk_state()
+        _drop_paper_account(path)  # file written before the account was saved
 
         # Paper account restarts at INITIAL_BALANCE (100k): not a drawdown.
         orch2 = _setup_orchestrator(RISK_STATE_PATH=str(path))
@@ -1389,6 +1399,45 @@ class TestRiskStatePersistence:
 
         assert orch2._drawdown_monitor.update(100_000.0) is None
         assert orch2._drawdown_monitor.state == TradingState.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_paper_restart_restores_account_and_peak(self, tmp_path):
+        path = tmp_path / "risk.json"
+        orch1 = _setup_orchestrator(RISK_STATE_PATH=str(path))
+        orch1._executor = await _paper_with_btc(qty=1.0, price=50_000.0)
+        await orch1._load_risk_state(100_000.0)
+        orch1._executor.update_prices({"BTC/USDT": 70_000.0})
+        orch1._drawdown_monitor.update(120_000.0)
+        orch1._stop_tracker.register("BTC/USDT", 48_000.0, 1.0, None, None)
+        orch1._save_risk_state()
+
+        orch2 = _setup_orchestrator(RISK_STATE_PATH=str(path))
+        orch2._executor = _paper_executor()  # fresh process: 100k cash
+        await orch2._load_risk_state(100_000.0)
+
+        assert await orch2._executor.get_position("BTC/USDT") == 1.0
+        balance = await orch2._executor.get_balance()
+        assert balance["cash"] == pytest.approx(50_000.0)
+        assert balance["total"] == pytest.approx(120_000.0)  # saved mark
+        assert orch2._drawdown_monitor.to_dict()["peak_value"] == 120_000.0
+        assert orch2._stop_tracker.get("BTC/USDT") is not None
+
+    @pytest.mark.asyncio
+    async def test_invalid_paper_account_starts_at_initial_balance(self, tmp_path):
+        path = tmp_path / "risk.json"
+        orch1 = _setup_orchestrator(RISK_STATE_PATH=str(path))
+        orch1._executor = await _paper_with_btc()
+        await orch1._load_risk_state(100_000.0)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["paper_account"]["cash"] = "nan"
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+        orch2 = _setup_orchestrator(RISK_STATE_PATH=str(path))
+        orch2._executor = _paper_executor()
+        await orch2._load_risk_state(100_000.0)
+
+        assert await orch2._executor.get_position("BTC/USDT") == 0.0
+        assert (await orch2._executor.get_balance())["total"] == 100_000.0
 
     @pytest.mark.asyncio
     async def test_paper_restart_keeps_halt(self, tmp_path):

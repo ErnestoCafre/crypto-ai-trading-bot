@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -393,14 +394,35 @@ class TestRebalanceMarkOnRestart:
             await second.run_trading_cycle()
         target.assert_not_called()
 
-    async def test_paper_restart_forgets_the_mark(self, tmp_path):
+    async def test_paper_restart_restores_account_and_mark(self, tmp_path):
+        ohlcv = _daily()
+        first = _orchestrator(tmp_path, ohlcv)
+        await first._load_risk_state(100_000.0)
+        await first.run_trading_cycle()
+        held = await first._executor.get_position(PAIR)
+        assert held > 0 and first._rebalanced
+
+        # New process, new executor at INITIAL_BALANCE: the saved account wins.
+        second = _orchestrator(tmp_path, ohlcv)
+        await second._load_risk_state(100_000.0)
+        assert await second._executor.get_position(PAIR) == pytest.approx(held)
+        assert second._rebalanced == first._rebalanced
+        with patch.object(bot_module, "target_exposure") as target:
+            await second.run_trading_cycle()
+        target.assert_not_called()
+
+    async def test_paper_state_without_account_forgets_the_mark(self, tmp_path):
         ohlcv = _daily()
         first = _orchestrator(tmp_path, ohlcv)
         await first._load_risk_state(100_000.0)
         await first.run_trading_cycle()
         assert first._rebalanced
+        path = first._risk_state_path()
+        state = json.loads(path.read_text(encoding="utf-8"))
+        del state["paper_account"]  # file written before the account was saved
+        path.write_text(json.dumps(state), encoding="utf-8")
 
-        # A paper restart starts from cash again: rebuy the same candle.
+        # The account starts from cash again: rebuy the same candle.
         second = _orchestrator(tmp_path, ohlcv)
         await second._load_risk_state(100_000.0)
         assert second._rebalanced == {}

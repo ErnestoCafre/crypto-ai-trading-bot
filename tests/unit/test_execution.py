@@ -19,6 +19,35 @@ def executor() -> PaperExecutor:
 
 class TestPaperExecutor:
     @pytest.mark.asyncio()
+    async def test_snapshot_round_trip(self, executor: PaperExecutor) -> None:
+        await executor.place_order("BTC/USDT", "buy", "market", 0.5, price=40_000.0)
+        executor.update_prices({"BTC/USDT": 42_000.0})
+
+        restored = PaperExecutor(initial_balance=1.0)
+        restored.restore(executor.to_dict())
+
+        assert await restored.get_balance() == await executor.get_balance()
+        assert await restored.get_position("BTC/USDT") == 0.5
+
+    @pytest.mark.parametrize(
+        "snapshot",
+        [
+            {},
+            {"cash": "inf", "positions": {}},
+            {"cash": 1.0, "positions": {"BTC/USDT": {"qty": 1.0}}},
+            {"cash": 1.0, "positions": {"BTC/USDT": {"qty": 1.0, "avg_price": 0}}},
+            {"cash": 1.0, "positions": []},
+        ],
+    )
+    @pytest.mark.asyncio()
+    async def test_restore_rejects_malformed_snapshot(
+        self, executor: PaperExecutor, snapshot: dict[str, Any]
+    ) -> None:
+        with pytest.raises((KeyError, TypeError, ValueError, AttributeError)):
+            executor.restore(snapshot)
+        assert (await executor.get_balance())["total"] == 100_000.0
+
+    @pytest.mark.asyncio()
     async def test_fill_price_does_not_override_market_mark(
         self, executor: PaperExecutor
     ) -> None:

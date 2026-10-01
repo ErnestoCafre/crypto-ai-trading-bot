@@ -81,9 +81,13 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   `botstate` (`/app/var/state`), así sobrevive a recrear el contenedor.
 - En live, **un retiro de fondos cuenta como pérdida** para el drawdown: tras
   retirar, reiniciar una vez con `RISK_RESET=true`.
-- En paper la cuenta simulada se reinicia en `INITIAL_BALANCE` en cada arranque:
-  se conserva el estado (pausa/HALT) pero pico e inicio de día se re-anclan al
-  balance nuevo.
+- En paper la cuenta simulada (efectivo, posiciones y último precio) se
+  guarda en el mismo archivo, en la misma escritura atómica que los stops, así
+  que un reinicio sigue desde donde estaba: posiciones, pico y drawdown
+  incluidos. Para empezar de nuevo en `INITIAL_BALANCE`, borrar el archivo. Si
+  el archivo no trae la cuenta (versiones anteriores) o la trae inválida, la
+  cuenta arranca en `INITIAL_BALANCE`: se conserva el estado (pausa/HALT) pero
+  pico e inicio de día se re-anclan al balance nuevo.
 - `RISK_RESET=true` actúa en **cada** arranque mientras esté puesto: quitarlo
   después de usarlo, o el HALT dejaría de sobrevivir a los reinicios.
 
@@ -176,9 +180,10 @@ default sigue siendo `regime_selector`.
   se guarda en el risk_state, y los demás ciclos del día no hacen nada. Las
   ventas van antes que las compras, y una compra usa como máximo el 99 % del
   efectivo libre (el backtest usa todo el efectivo: solo difiere cuando la
-  caja es la que limita). En paper, un reinicio vacía la cuenta y también
-  borra la marca, así que vuelve a comprar en el mismo día. En live se respetan `amount_to_precision` y los mínimos
-  del mercado.
+  caja es la que limita). En paper la cuenta y la marca se restauran juntas
+  tras un reinicio; solo si la cuenta no se pudo restaurar se borra la marca
+  y vuelve a comprar en el mismo día. En live se respetan
+  `amount_to_precision` y los mínimos del mercado.
 - **Asignación**: en este modo `MAX_POSITION_PCT` es la asignación de cada
   par. Con 25 % y 3 pares, la exposición total máxima es 75 % y la cartera
   rinde ~¾ de la 1/N testeada (mismo Sharpe, menos CAGR y menos drawdown).

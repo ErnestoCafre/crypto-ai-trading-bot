@@ -311,6 +311,7 @@ class TradingOrchestrator:
                 logger.exception("Error processing {}", pair)
                 continue
 
+        self._save_risk_state()
         await self._record_snapshot(prices)
 
     # ------------------------------------------------------------------
@@ -1486,6 +1487,12 @@ class TradingOrchestrator:
         self._risk_store = RiskStateStore(self._risk_state_path())
         data = self._risk_store.load()
 
+        paper_restored = False
+        if data is not None and isinstance(self._executor, PaperExecutor):
+            paper_restored = self._restore_paper_account(data.get("paper_account"))
+            if paper_restored:
+                portfolio_value = (await self._executor.get_balance())["total"]
+
         monitor: DrawdownMonitor | None = None
         tracker = StopTracker()
         if data is not None:
@@ -1517,9 +1524,10 @@ class TradingOrchestrator:
                 monitor.state.value,
                 len(tracker),
             )
-            if self._settings.BOT_MODE != "live":
-                # The paper account restarts at INITIAL_BALANCE: an old peak
-                # would read as a drawdown. Keep the latch, re-anchor values.
+            if self._settings.BOT_MODE != "live" and not paper_restored:
+                # A state without its paper account (older file) restarts the
+                # account at INITIAL_BALANCE: an old peak would read as a
+                # drawdown. Keep the latch, re-anchor values.
                 monitor.rebaseline(portfolio_value)
                 # Its positions are gone too: rebalance today's candle again.
                 self._rebalanced = {}
@@ -1538,20 +1546,48 @@ class TradingOrchestrator:
         await self._reconcile_stops(native_orders_cancelled=False)
         self._save_risk_state()
 
+    def _restore_paper_account(self, snapshot: object) -> bool:
+        """Restore the simulated account saved with the risk state."""
+        assert isinstance(self._executor, PaperExecutor)
+        if snapshot is None:
+            logger.info("No saved paper account — starting at INITIAL_BALANCE")
+            return False
+        try:
+            if not isinstance(snapshot, dict):
+                raise TypeError("paper_account is not an object")
+            self._executor.restore(snapshot)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            logger.warning(
+                "Saved paper account in {} is invalid — starting at INITIAL_BALANCE",
+                self._risk_state_path(),
+            )
+            return False
+        logger.info(
+            "Paper account restored from {} — cash ${:,.2f}, positions {}. "
+            "Delete the file to restart it at INITIAL_BALANCE.",
+            self._risk_state_path(),
+            snapshot["cash"],
+            sorted(snapshot["positions"]),
+        )
+        return True
+
     def _save_risk_state(self) -> None:
         if self._risk_store is None or self._drawdown_monitor is None:
             return
+        state: dict[str, object] = {
+            "version": 1,
+            "mode": str(self._settings.BOT_MODE),
+            "saved_at": datetime.now(UTC).isoformat(),
+            "drawdown": self._drawdown_monitor.to_dict(),
+            "stops": self._stop_tracker.to_dict(),
+            "rebalanced": dict(self._rebalanced),
+        }
+        # One file, one atomic write: the paper account never disagrees with
+        # the stops and rebalanced candles saved next to it.
+        if isinstance(self._executor, PaperExecutor):
+            state["paper_account"] = self._executor.to_dict()
         try:
-            self._risk_store.save(
-                {
-                    "version": 1,
-                    "mode": str(self._settings.BOT_MODE),
-                    "saved_at": datetime.now(UTC).isoformat(),
-                    "drawdown": self._drawdown_monitor.to_dict(),
-                    "stops": self._stop_tracker.to_dict(),
-                    "rebalanced": dict(self._rebalanced),
-                }
-            )
+            self._risk_store.save(state)
         except Exception:
             logger.exception("Failed to persist risk state")
 

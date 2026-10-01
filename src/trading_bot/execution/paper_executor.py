@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import Any
 
 from trading_bot.core.models import OrderResult
 from trading_bot.execution.base import BaseExecutor
@@ -28,6 +31,37 @@ class PaperExecutor(BaseExecutor):
         self._last_prices: dict[str, float] = {}
         self._slippage_pct = slippage_pct
         self._fee_pct = fee_pct
+
+    def to_dict(self) -> dict[str, Any]:
+        """Account snapshot (cash, positions, marks) for :meth:`restore`."""
+        return {
+            "cash": self._cash,
+            "positions": {pair: dict(pos) for pair, pos in self._positions.items()},
+            "last_prices": dict(self._last_prices),
+        }
+
+    def restore(self, data: Mapping[str, Any]) -> None:
+        """Replace the account with a :meth:`to_dict` snapshot.
+
+        Raises ValueError (TypeError, KeyError) on a malformed snapshot and
+        leaves the account unchanged.
+        """
+        cash = float(data["cash"])
+        if not math.isfinite(cash):
+            raise ValueError(f"invalid paper cash: {cash}")
+        positions: dict[str, dict[str, float]] = {}
+        for pair, pos in data["positions"].items():
+            qty, avg_price = float(pos["qty"]), float(pos["avg_price"])
+            if not (math.isfinite(qty) and math.isfinite(avg_price) and avg_price > 0):
+                raise ValueError(f"invalid paper position for {pair}: {pos}")
+            if qty > _QTY_EPSILON:
+                positions[str(pair)] = {"qty": qty, "avg_price": avg_price}
+        prices: dict[str, float] = {}
+        for pair, price in (data.get("last_prices") or {}).items():
+            value = float(price)
+            if math.isfinite(value) and value > 0:
+                prices[str(pair)] = value
+        self._cash, self._positions, self._last_prices = cash, positions, prices
 
     def update_prices(self, prices: dict[str, float]) -> None:
         """Record the latest market price per pair for mark-to-market."""
