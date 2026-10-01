@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
 
 from trading_bot.core.models import OrderResult
 from trading_bot.db.base import build_url
+from trading_bot.db.models import Trade
 from trading_bot.db.repository import TradingRepository
 
 T = TypeVar("T")
@@ -196,6 +197,63 @@ class TradeJournal:
         if open_trade is None:
             logger.debug("{}: exit with no journaled trade", result.pair)
         await self._run(f"record exit on {result.pair}", op)
+
+    async def record_rebalance(
+        self,
+        result: OrderResult,
+        strategy: str,
+        position_after: float,
+        confidence: float | None = None,
+    ) -> None:
+        """A target-exposure fill: open, scale in, partially or fully close.
+
+        A buy from flat opens a trade and a buy while holding averages into
+        it. A sell that leaves the pair flat closes the trade; a partial sell
+        is closed as its own trade (pro-rata entry fees) so realised P&L is
+        recorded on every reduction.
+        """
+        open_trade = self._open.get(result.pair)
+        if result.side == "buy" and open_trade is None:
+            await self.record_entry(result, strategy=strategy, confidence=confidence)
+            return
+        if result.side == "sell" and (open_trade is None or position_after <= 0):
+            await self.record_exit(result, strategy=strategy, reason="rebalance_exit")
+            return
+        assert open_trade is not None
+        trade_id = open_trade.trade_id
+
+        if result.side == "buy":
+
+            async def op(repo: TradingRepository) -> Trade:
+                await self._add_order(repo, result, strategy, trade_id)
+                return await repo.scale_in_trade(
+                    trade_id,
+                    price=result.filled_price,
+                    quantity=result.filled_quantity,
+                    fees=result.fee,
+                )
+
+        else:
+
+            async def op(repo: TradingRepository) -> Trade:
+                await self._add_order(repo, result, strategy, trade_id)
+                await repo.close_partial_trade(
+                    trade_id,
+                    quantity=result.filled_quantity,
+                    exit_price=result.filled_price,
+                    exit_reason="rebalance",
+                    exit_fees=result.fee,
+                    exit_time=result.timestamp,
+                )
+                remaining = await repo.get_trade(trade_id)
+                assert remaining is not None
+                return remaining
+
+        # In-memory view follows the database only after a successful write.
+        trade = await self._run(f"record rebalance on {result.pair}", op)
+        if trade is not None:
+            open_trade.entry_price = float(trade.entry_price)
+            open_trade.quantity = float(trade.quantity)
 
     async def _add_order(
         self,

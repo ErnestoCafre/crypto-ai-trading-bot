@@ -140,6 +140,79 @@ class TradingRepository:
         await self._session.commit()
         return trade
 
+    async def scale_in_trade(
+        self,
+        trade_id: uuid.UUID,
+        *,
+        price: float,
+        quantity: float,
+        fees: float = 0.0,
+    ) -> Trade:
+        """Add a fill to an open trade: average entry price, sum qty and fees."""
+        trade = await self._session.get(Trade, trade_id)
+        if trade is None:
+            raise LookupError(f"trade {trade_id} not found")
+        qty = float(trade.quantity)
+        total = qty + quantity
+        if total > 0:
+            trade.entry_price = Decimal(
+                str((float(trade.entry_price) * qty + price * quantity) / total)
+            )
+        trade.quantity = Decimal(str(total))
+        trade.total_fees = _dec(float(trade.total_fees or 0) + fees)
+        await self._session.commit()
+        return trade
+
+    async def close_partial_trade(
+        self,
+        trade_id: uuid.UUID,
+        *,
+        quantity: float,
+        exit_price: float,
+        exit_reason: str,
+        exit_fees: float = 0.0,
+        exit_time: datetime | None = None,
+    ) -> Trade:
+        """Close ``quantity`` of an open trade as its own closed trade.
+
+        The slice keeps the open trade's entry price, entry time and a
+        pro-rata share of its entry fees; the open trade keeps the rest, so
+        every closed row carries its realised P&L.
+        """
+        trade = await self._session.get(Trade, trade_id)
+        if trade is None:
+            raise LookupError(f"trade {trade_id} not found")
+        held = float(trade.quantity)
+        share = min(1.0, quantity / held) if held > 0 else 1.0
+        entry_fees = float(trade.total_fees or 0) * share
+        piece = Trade(
+            exchange=trade.exchange,
+            pair=trade.pair,
+            side=trade.side,
+            strategy=trade.strategy,
+            entry_price=trade.entry_price,
+            entry_time=trade.entry_time,
+            quantity=_dec(quantity),
+            total_fees=_dec(entry_fees),
+            ai_combined_confidence=trade.ai_combined_confidence,
+            status="open",
+            created_at=datetime.now(UTC),
+        )
+        trade.quantity = Decimal(str(max(0.0, held - quantity)))
+        trade.total_fees = _dec(float(trade.total_fees or 0) - entry_fees)
+        self._session.add(piece)
+        await self._session.commit()
+        return await self.close_trade(
+            piece.id,
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            exit_fees=exit_fees,
+            exit_time=exit_time,
+        )
+
+    async def get_trade(self, trade_id: uuid.UUID) -> Trade | None:
+        return await self._session.get(Trade, trade_id)
+
     async def abandon_trade(self, trade_id: uuid.UUID, reason: str) -> None:
         """Mark an open trade whose position no longer exists (no exit fill
         known, e.g. the paper account was reset); it leaves open/closed views

@@ -138,3 +138,15 @@ class TestApp:
         assert "5.00%" in values
         assert "50.0%" in values
         assert "ACTIVE" in values
+
+    def test_donchian_mode_shows_its_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("STRATEGY_MODE", "donchian_ensemble")
+        monkeypatch.setenv("TRADING_TIMEFRAME", "1h")
+        at = self._run(monkeypatch, risk=None, db=None, ohlcv=None)
+        assert at.sidebar.selectbox[1].value == "1d"
+        sidebar = " ".join(str(t.value) for t in at.sidebar.text)
+        assert "Asignación por par" in sidebar
+        assert "Riesgo máx./trade" not in sidebar
+        assert "REBALANCE_THRESHOLD" in str(at.json[0].value)

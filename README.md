@@ -10,6 +10,9 @@ Implementado:
   CLOSE/SHORT venden la posición completa
 - Estrategias técnicas por régimen de mercado: trend following; las entradas
   de mean reversion existen pero están apagadas por defecto (ver Estrategias)
+- Modo alternativo `STRATEGY_MODE=donchian_ensemble`: ensemble de canales
+  Donchian en velas diarias con volatilidad objetivo, operado por exposición
+  objetivo (ver Estrategias). Pendiente de validar en paper
 - Análisis de sentimiento con CryptoBERT (extra `sentiment`)
 - Filtro ML por *meta-labeling* (LightGBM): estima si una entrada técnica
   terminará con retorno neto positivo; ningún modelo pasa hoy el gate de
@@ -65,6 +68,8 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   no la soporta o la orden es rechazada, el bot vigila el stop con las velas
   cerradas. En paper siempre se vigila por velas: si el `low` toca el stop se
   vende al precio del stop, o al `open` si la vela abrió por debajo (gap).
+  En `STRATEGY_MODE=donchian_ensemble` no hay stop por trade: la salida es el
+  stop de cada canal al cierre diario (ver Modo donchian_ensemble).
 - **Pérdida diaria** (`MAX_DAILY_LOSS_PCT`): liquida y notifica una vez; las
   entradas nuevas quedan bloqueadas hasta el siguiente día UTC (se levanta sola).
 - **Drawdown máximo** (`MAX_DRAWDOWN_PCT`): liquida y notifica una vez y deja el
@@ -87,7 +92,9 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
 Cantidad = `min(riesgo / distancia al stop, tope)`: el riesgo
 (`MAX_RISK_PER_TRADE_PCT`, pérdida si salta el stop ATR x2) fija el tamaño y
 `MAX_POSITION_PCT` es solo un tope de seguridad. Los multiplicadores de IA y
-régimen reducen el riesgo, nunca lo suben.
+régimen reducen el riesgo, nunca lo suben. Esto vale para `regime_selector`;
+en `donchian_ensemble`, `MAX_POSITION_PCT` es la asignación por par y
+`MAX_RISK_PER_TRADE_PCT` no se usa.
 
 - **Fase 1 (actual): 0.20 % / 25 %.** Con los valores anteriores (1 % / 10 %)
   el tope fijaba ~100 % de las entradas en 1h (backtest BTC/ETH/SOL
@@ -139,6 +146,98 @@ Por eso `MEAN_REVERSION_ENTRIES=false` por defecto: en RANGING el bot no
 abre posiciones, pero los CLOSE/SHORT de mean reversion siguen cerrando las
 abiertas (sin cambios respecto del comportamiento previo). Reactivarlas exige
 rediseñar la estrategia (salidas, stop) y validarla en el backtest.
+
+### Modo donchian_ensemble
+
+`STRATEGY_MODE=donchian_ensemble` reemplaza el pipeline anterior por el
+ensemble de canales Donchian de Zarattini, Pagani y Barbon (2025, *Catching
+Crypto Trends*, SSRN 5209907), con las reglas del paper y de su réplica
+pre-registrada, sin ajustar (`core/strategies/donchian_ensemble.py`). El
+default sigue siendo `regime_selector`.
+
+- **Señal**: velas diarias cerradas. Para cada N de `DONCHIAN_LOOKBACKS`
+  (5, 10, 20, 30, 60, 90, 150, 250, 360): entra cuando el close supera el
+  máximo de los N closes anteriores; stop móvil = máx(stop previo, punto medio
+  del canal de N closes) y sale si el close cae debajo. Exposición cruda =
+  promedio de las 9 posiciones; `w = cruda × min(1, DONCHIAN_VOL_TARGET /
+  vol)`, con la vol anualizada (√365) de `DONCHIAN_VOL_WINDOW` días. Sin
+  apalancamiento.
+- **Estado**: se reconstruye en cada ciclo recorriendo el OHLCV (el bot pide
+  al menos 1000 velas diarias, o 360 + 90 + la ventana más larga si se
+  configuran ventanas mayores), así que no se persiste y un reinicio da la
+  misma exposición. Con menos de 360 + 90 velas la exposición es 0. En BTC/ETH/SOL
+  2017-2026, una ventana de 720 velas ya reproducía el estado de la historia
+  completa en todos los días probados (450 no). Si algún canal no tiene en la
+  ventana un close debajo de su punto medio, el bot avisa con un warning.
+- **Ejecución**: por par, valor objetivo = equity × `MAX_POSITION_PCT` × w.
+  Se opera la diferencia con lo que se tiene (compras y ventas parciales)
+  solo si supera `REBALANCE_THRESHOLD` (0,05 de la asignación). Un objetivo 0
+  siempre cierra. Hay un solo rebalanceo por vela diaria: la vela ya operada
+  se guarda en el risk_state, y los demás ciclos del día no hacen nada. Las
+  ventas van antes que las compras, y una compra usa como máximo el 99 % del
+  efectivo libre (el backtest usa todo el efectivo: solo difiere cuando la
+  caja es la que limita). En paper, un reinicio vacía la cuenta y también
+  borra la marca, así que vuelve a comprar en el mismo día. En live se respetan `amount_to_precision` y los mínimos
+  del mercado.
+- **Asignación**: en este modo `MAX_POSITION_PCT` es la asignación de cada
+  par. Con 25 % y 3 pares, la exposición total máxima es 75 % y la cartera
+  rinde ~¾ de la 1/N testeada (mismo Sharpe, menos CAGR y menos drawdown).
+  `MAX_POSITION_PCT=33.33` reproduce la cartera 1/N del estudio.
+- **Stops**: la salida es el stop del canal, evaluado al cierre diario. No se
+  usan el stop ATR ni `place_stop_loss`, y al arrancar se cancelan los stops
+  que hubiera dejado el otro modo. No hay stop de catástrofe en el exchange:
+  el backtest no lo simula, y uno intradía cambiaría la estrategia validada.
+- **Riesgo**: el kill-switch (HALTED / DAILY_PAUSED), el límite diario, el
+  risk_state y el journal siguen igual. Con el kill-switch activo la
+  exposición solo puede bajar. En el journal, cada venta parcial queda como
+  un trade cerrado con su P&L.
+- **IA**: solo puede reducir w. Sentimiento negativo y LLM SHORT/CLOSE dan
+  un multiplicador entre `AI_SIZING_FLOOR` y 1; las lecturas alcistas no
+  suben nada. Un consenso SHORT del LLM impide aumentar la exposición. Sin
+  fuentes de IA, el multiplicador es 1. El meta-label ML se entrenó para
+  entradas discretas en `TRADING_TIMEFRAME`, así que no aplica a este modo
+  y no se carga.
+
+**Evidencia** (Binance spot, costos 0,15 % por lado, desarrollo 2018-2023,
+holdout 2024-01 → 2026-09 abierto una sola vez para todos los candidatos,
+reglas fijadas antes de ver resultados). Sharpe con retornos diarios:
+
+| | 1h actual | 4h actual | Diario actual | Donchian | Buy&hold |
+|---|---|---|---|---|---|
+| Desarrollo BTC/ETH/SOL | 0,45/0,56/0,56 | 1,18/1,08/1,41 | 1,12/0,57/1,28 | 1,21/1,18/2,12 | 0,63/0,67/1,42 |
+| Holdout BTC/ETH/SOL | 0,01/0,16/−0,11 | 0,31/1,08/−0,27 | 0,56/0,36/−0,42 | 0,70/0,59/0,47 | 0,76/0,42/0,46 |
+
+Cartera Donchian 1/N: Sharpe 1,69, CAGR 18,9 % y MaxDD −12,5 % en
+desarrollo (buy&hold: 0,90 y −88 %); 0,69, 7,0 % y −12,4 % en holdout
+(buy&hold: 0,56 y −64 %). Exposición media del 11-16 %.
+
+`backtest/target_engine.py` reproduce el script del estudio: con ejecución
+al cierre, umbral 0 y sin costos, el retorno diario coincide a 1e-15; con
+costos, las métricas coinciden a 2 decimales. Con lo que hace el bot
+(ejecución al open siguiente, umbral 0,05, fee 0,1 % + slippage 0,05 %):
+
+| Sharpe / CAGR / MaxDD | Desarrollo | Holdout |
+|---|---|---|
+| BTC/USDT | 1,19 / 16,8 % / −20,3 % | 0,76 / 10,2 % / −15,3 % |
+| ETH/USDT | 1,12 / 15,2 % / −17,5 % | 0,79 / 9,2 % / −13,8 % |
+| SOL/USDT | 2,11 / 31,9 % / −11,6 % | 0,52 / 5,5 % / −18,2 % |
+| Cartera 1/3 por par | 1,65 / 16,6 % / −12,5 % | 0,83 / 8,7 % / −12,4 % |
+| Cartera 25 % por par | 1,66 / 12,4 % / −9,6 % | 0,83 / 6,6 % / −9,4 % |
+
+Sensibilidad de la cartera 1/3 al umbral (Sharpe en desarrollo / holdout,
+días con operación en holdout): 0 → 1,68 / 0,69, 907 días; 0,05 →
+1,65 / 0,83, 328 días; 0,10 → 1,43 / 0,81, 166 días. La rotación con 0,05
+es de 3-5× el capital por año. Esas filas usan el calentamiento del script
+(exposición desde que cada canal tiene datos). Con la regla del bot (450
+velas), el holdout no cambia, pero SOL en desarrollo baja a Sharpe 1,06,
+porque su historia empieza en 2020-08 y se pierde 2021.
+
+Cautelas: con ~2,75 años de holdout, el error estándar del Sharpe es ~0,6.
+La ventaja sobre buy&hold está más en el drawdown (−12 % contra −64 %) que
+en el retorno: en holdout, buy&hold de BTC rindió más. El backtest no
+simula IA, kill-switch ni mínimos del exchange. **No operar en real sin un
+período previo de paper trading** en este modo (`BOT_MODE=paper`,
+`STRATEGY_MODE=donchian_ensemble`), comparando sus fills con el backtest.
 
 ## Señales de IA y datos de mercado
 
@@ -203,7 +302,16 @@ rediseñar la estrategia (salidas, stop) y validarla en el backtest.
 uv run python scripts/download_historical.py     # llena var/cache/<exchange>/<PAIR>/<tf>.parquet
 uv run python scripts/run_backtest.py --pair BTC/USDT --timeframe 1h
 uv run python scripts/run_backtest.py --csv datos.csv --splits 5 --html
+uv run python scripts/run_backtest.py --strategy-mode donchian_ensemble \
+    --pairs BTC/USDT,ETH/USDT,SOL/USDT --holdout-start 2024-01-01
 ```
+
+Con `donchian_ensemble` el script usa velas 1d y `TargetExposureEngine`
+(`build_target_engine()`): imprime cada par como sleeve completo y la cartera
+con `MAX_POSITION_PCT` por par (Sharpe con rf = 0, como el estudio).
+`--rebalance-threshold` y `--execution close` permiten las variantes de
+sensibilidad y de paridad. No hay walk-forward porque no hay parámetros
+ajustados.
 
 `build_live_engine()` (`backtest/pipeline.py`) arma los mismos componentes que el
 bot: `StrategySelector` por régimen (con reducción en régimen volátil), gate de

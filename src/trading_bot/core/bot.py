@@ -31,6 +31,14 @@ from trading_bot.core.models import (
 )
 from trading_bot.core.regime import RegimeDetector
 from trading_bot.core.signal_combiner import SignalCombiner
+from trading_bot.core.strategies.donchian_ensemble import (
+    HISTORY_BARS,
+    EnsembleTarget,
+    ai_exposure_multiplier,
+    rebalance_delta,
+    required_history,
+    target_exposure,
+)
 from trading_bot.core.strategies.mean_reversion import MeanReversion
 from trading_bot.core.strategies.trend_following import TrendFollowing
 from trading_bot.core.strategy_selector import StrategySelector
@@ -55,6 +63,12 @@ from trading_bot.risk.stop_tracker import StopTracker
 # News window scored for sentiment, and articles kept per pair per fetch.
 NEWS_WINDOW = timedelta(hours=24)
 NEWS_PER_PAIR = 10
+
+DONCHIAN_STRATEGY = "donchian_ensemble"
+DONCHIAN_TIMEFRAME = "1d"
+# Share of free quote cash a rebalancing buy may spend: leaves room for the
+# fee and slippage so the exchange does not reject it for insufficient funds.
+BUY_CASH_BUFFER = 0.99
 
 
 def _regime_size_factor(signal: Signal | None) -> float | None:
@@ -105,6 +119,35 @@ class TradingOrchestrator:
         # Headlines behind each cached sentiment; they expire with it.
         self._latest_headlines: dict[str, list[str]] = {}
         self._latest_llm_decision: dict[str, OrchestratorDecision] = {}
+        # donchian_ensemble: last closed daily candle (ISO open time) already
+        # rebalanced per pair. Persisted with the risk state so a restart
+        # does not trade the same candle twice.
+        self._rebalanced: dict[str, str] = {}
+
+    @property
+    def _target_mode(self) -> bool:
+        return self._settings.STRATEGY_MODE == DONCHIAN_STRATEGY
+
+    @property
+    def _timeframe(self) -> str:
+        """Candle timeframe for signals: daily in donchian_ensemble mode."""
+        if self._target_mode:
+            return DONCHIAN_TIMEFRAME
+        return self._settings.TRADING_TIMEFRAME
+
+    @property
+    def _lookback_bars(self) -> int:
+        s = self._settings
+        if not self._target_mode:
+            return s.OHLCV_LOOKBACK_BARS
+        # Warm-up plus one more longest channel, so its state can settle
+        # (README "Modo donchian_ensemble"); HISTORY_BARS covers the defaults.
+        needed = required_history(s.DONCHIAN_LOOKBACKS, s.DONCHIAN_VOL_WINDOW)
+        return max(
+            s.OHLCV_LOOKBACK_BARS,
+            HISTORY_BARS,
+            needed + max(s.DONCHIAN_LOOKBACKS),
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -254,6 +297,11 @@ class TradingOrchestrator:
             await self._record_snapshot(prices, trigger=triggered.value.lower())
             return
 
+        if self._target_mode:
+            await self._rebalance_portfolio(market_data, prices, portfolio_value)
+            await self._record_snapshot(prices)
+            return
+
         for pair, ohlcv in market_data.items():
             if pair not in prices:
                 continue
@@ -347,6 +395,8 @@ class TradingOrchestrator:
         # risk state exists.
         initial_balance = await self._executor.get_balance()
         await self._load_risk_state(initial_balance["total"])
+        if self._target_mode:
+            await self._drop_trade_stops()
 
         if s.DB_PERSISTENCE:
             self._journal = await TradeJournal.connect(
@@ -376,8 +426,10 @@ class TradingOrchestrator:
         await self._fetcher.__aenter__()
 
         logger.info(
-            "Components initialised — mode={}, pairs={}",
+            "Components initialised — mode={}, strategy={}, timeframe={}, pairs={}",
             s.BOT_MODE,
+            s.STRATEGY_MODE,
+            self._timeframe,
             s.TRADING_PAIRS,
         )
 
@@ -421,7 +473,12 @@ class TradingOrchestrator:
                 self._llm_orchestrator = None
 
         if s.USE_DL_PREDICTION:
-            self._init_predictors()
+            if self._target_mode:
+                # The meta-label scores discrete entries on TRADING_TIMEFRAME;
+                # it has no meaning for a daily target exposure.
+                logger.info("USE_DL_PREDICTION ignored in donchian_ensemble mode")
+            else:
+                self._init_predictors()
 
     def _llm_api_key(self) -> str:
         s = self._settings
@@ -613,14 +670,11 @@ class TradingOrchestrator:
     async def _fetch_ohlcv(self, pair: str) -> pd.DataFrame:
         """Fetch the lookback window plus the forming candle (may be partial)."""
         assert self._fetcher is not None
-        s = self._settings
-        bars = s.OHLCV_LOOKBACK_BARS + 1  # +1: the forming candle is dropped
-        since = datetime.now(UTC) - (bars + 1) * timeframe_to_timedelta(
-            s.TRADING_TIMEFRAME
-        )
+        bars = self._lookback_bars + 1  # +1: the forming candle is dropped
+        since = datetime.now(UTC) - (bars + 1) * timeframe_to_timedelta(self._timeframe)
         return await self._fetcher.fetch_ohlcv(
             pair=pair,
-            timeframe=s.TRADING_TIMEFRAME,
+            timeframe=self._timeframe,
             since=since,
             limit=bars,
         )
@@ -628,9 +682,7 @@ class TradingOrchestrator:
     async def _fetch_market(self, pair: str) -> tuple[pd.DataFrame, float | None]:
         """Closed candles for signals and the latest traded price."""
         raw = await self._fetch_ohlcv(pair)
-        return split_closed_candles(
-            raw, self._settings.TRADING_TIMEFRAME, datetime.now(UTC)
-        )
+        return split_closed_candles(raw, self._timeframe, datetime.now(UTC))
 
     def _build_ai_signals(self, pair: str, ohlcv: pd.DataFrame) -> AISignals | None:
         """Build AISignals from cached sentiment + inline ML prediction + LLM."""
@@ -763,7 +815,7 @@ class TradingOrchestrator:
     async def _build_llm_context(self, pair: str) -> dict[str, object]:
         """Build unified context dict for all LLM agents."""
         s = self._settings
-        context: dict[str, object] = {"pair": pair, "timeframe": s.TRADING_TIMEFRAME}
+        context: dict[str, object] = {"pair": pair, "timeframe": self._timeframe}
 
         # Technical indicators
         try:
@@ -1040,7 +1092,7 @@ class TradingOrchestrator:
         # The candle forming at entry (last closed + one bar) is never checked:
         # its low may predate the fill.
         entry_candle = (
-            ohlcv.index[-1] + timeframe_to_timedelta(self._settings.TRADING_TIMEFRAME)
+            ohlcv.index[-1] + timeframe_to_timedelta(self._timeframe)
             if isinstance(ohlcv.index, pd.DatetimeIndex) and len(ohlcv) > 0
             else None
         )
@@ -1196,6 +1248,197 @@ class TradingOrchestrator:
                 stop.order_id = None
 
     # ------------------------------------------------------------------
+    # Private — donchian_ensemble target exposure
+    # ------------------------------------------------------------------
+
+    async def _rebalance_portfolio(
+        self,
+        market_data: dict[str, pd.DataFrame],
+        prices: dict[str, float],
+        equity: float,
+    ) -> None:
+        """Move every pair towards ``equity x allocation x w`` once per day.
+
+        ``w`` is rebuilt from the closed daily candles each cycle, so the
+        decision only changes when a daily candle closes; the pair's last
+        rebalanced candle makes extra cycles that day no-ops (the backtest
+        trades once, at the next open). Sells run before buys so they fund
+        them. While the kill-switch is engaged exposure may only go down.
+        """
+        orders: list[tuple[str, str, float]] = []  # pair, candle, signed value
+        for pair, ohlcv in market_data.items():
+            price = prices.get(pair)
+            if price is None or price <= 0 or ohlcv.empty:
+                continue
+            candle = pd.Timestamp(ohlcv.index[-1]).isoformat()
+            if self._rebalanced.get(pair) == candle:
+                continue
+            try:
+                delta = await self._rebalance_delta(pair, ohlcv, price, equity)
+            except Exception:
+                logger.exception("{}: could not compute rebalance", pair)
+                continue
+            if delta is None:  # increase blocked: retry if trading resumes
+                continue
+            orders.append((pair, candle, delta))
+
+        for pair, candle, delta in sorted(orders, key=lambda o: o[2]):
+            try:
+                if delta < 0:
+                    await self._rebalance_sell(pair, -delta, prices[pair])
+                elif delta > 0:
+                    await self._rebalance_buy(pair, delta, prices[pair])
+            except Exception:
+                logger.exception("{}: rebalance order failed", pair)
+                continue  # not marked: retried next cycle
+            self._rebalanced[pair] = candle
+        self._save_risk_state()
+
+    async def _rebalance_delta(
+        self, pair: str, ohlcv: pd.DataFrame, price: float, equity: float
+    ) -> float | None:
+        """Signed quote value to trade for ``pair``; None if blocked by risk."""
+        assert self._executor is not None
+        assert self._drawdown_monitor is not None
+        s = self._settings
+        allocation = s.MAX_POSITION_PCT / 100
+        target = target_exposure(
+            ohlcv, s.DONCHIAN_LOOKBACKS, s.DONCHIAN_VOL_TARGET, s.DONCHIAN_VOL_WINDOW
+        )
+        self._log_target(pair, target, len(ohlcv))
+
+        held = await self._executor.get_position(pair)
+        held_value = held * price
+        sleeve = equity * allocation
+        current = held_value / sleeve if sleeve > 0 else 0.0
+
+        multiplier, block_increase = ai_exposure_multiplier(
+            self._build_ai_signals(pair, ohlcv),
+            s.AI_SIZING_FLOOR,
+            s.SENTIMENT_WEIGHT,
+            s.LLM_WEIGHT,
+        )
+        wanted = target.exposure * multiplier
+        if block_increase and wanted > current:
+            logger.info("{}: LLM consensus against LONG — exposure not raised", pair)
+            wanted = min(wanted, current)
+
+        delta = rebalance_delta(
+            target_exposure=wanted,
+            held_value=held_value,
+            equity=equity,
+            allocation=allocation,
+            threshold=s.REBALANCE_THRESHOLD,
+        )
+        logger.info(
+            "{}: target w={:.3f} (raw {:.3f} x vol {:.2f} x AI {:.2f}), "
+            "held w={:.3f} -> trade ${:,.2f}",
+            pair,
+            wanted,
+            target.raw_exposure,
+            target.vol_scale,
+            multiplier,
+            current,
+            delta,
+        )
+        if delta > 0 and not self._drawdown_monitor.entries_allowed:
+            logger.info(
+                "{}: exposure increase blocked — risk state {} ({})",
+                pair,
+                self._drawdown_monitor.state.value,
+                self._drawdown_monitor.halt_reason,
+            )
+            return None
+        return delta
+
+    def _log_target(self, pair: str, target: EnsembleTarget, bars: int) -> None:
+        if not target.ready:
+            logger.warning(
+                "{}: {} daily candles, not enough for the Donchian ensemble — "
+                "target exposure 0",
+                pair,
+                bars,
+            )
+            return
+        unsynced = [c.lookback for c in target.channels if not c.synced]
+        if unsynced:
+            logger.warning(
+                "{}: channels {} never closed below their midpoint in the "
+                "fetched history; their state may differ from a longer one",
+                pair,
+                unsynced,
+            )
+        logger.debug(
+            "{}: channels {}",
+            pair,
+            {c.lookback: c.stop for c in target.channels if c.in_position},
+        )
+
+    async def _rebalance_sell(self, pair: str, value: float, price: float) -> None:
+        assert self._executor is not None
+        held = await self._executor.get_position(pair)
+        quantity = held if value >= held * price else value / price
+        quantity = await self._executor.tradable_amount(pair, quantity, price)
+        if quantity <= 0:
+            logger.info("{}: sell of ${:,.2f} below market minimum", pair, value)
+            return
+        await self._fill_rebalance(pair, "sell", quantity, price)
+
+    async def _rebalance_buy(self, pair: str, value: float, price: float) -> None:
+        """Buy up to ``value``, or what the free quote cash affords."""
+        assert self._executor is not None
+        balance = await self._executor.get_balance()
+        free = float(balance.get("free", balance.get("cash", 0.0)))
+        spend = min(value, max(0.0, free) * BUY_CASH_BUFFER)
+        if spend < value:
+            logger.info(
+                "{}: buy reduced from ${:,.2f} to ${:,.2f} (free cash)",
+                pair,
+                value,
+                spend,
+            )
+        quantity = await self._executor.tradable_amount(pair, spend / price, price)
+        if quantity <= 0:
+            logger.info("{}: buy of ${:,.2f} below market minimum", pair, spend)
+            return
+        await self._fill_rebalance(pair, "buy", quantity, price)
+
+    async def _fill_rebalance(
+        self, pair: str, side: str, quantity: float, price: float
+    ) -> None:
+        assert self._executor is not None
+        result = await self._execute_order(pair, side, quantity, price)
+        if not await self._report_fill(result, DONCHIAN_STRATEGY):
+            return
+        if self._journal is not None:
+            await self._journal.record_rebalance(
+                result,
+                strategy=DONCHIAN_STRATEGY,
+                position_after=await self._executor.get_position(pair),
+            )
+
+    async def _drop_trade_stops(self) -> None:
+        """donchian_ensemble exits through its channel stops, not per-trade
+        ATR stops: cancel stops left by regime_selector mode so they cannot
+        sell (or, natively, lock) a position the target still wants."""
+        assert self._executor is not None
+        for pair in self._stop_tracker.pairs():
+            stop = self._stop_tracker.get(pair)
+            if (
+                stop is not None
+                and stop.order_id is not None
+                and not await self._executor.cancel_order(stop.order_id, pair)
+            ):
+                logger.warning(
+                    "{}: could not cancel stop {} — cancel it on the exchange",
+                    pair,
+                    stop.order_id,
+                )
+            self._stop_tracker.remove(pair)
+            logger.info("{}: per-trade stop dropped (donchian_ensemble mode)", pair)
+        self._save_risk_state()
+
+    # ------------------------------------------------------------------
     # Private — kill-switch and persisted risk state
     # ------------------------------------------------------------------
 
@@ -1251,12 +1494,16 @@ class TradingOrchestrator:
                     data["drawdown"], settings=self._settings
                 )
                 tracker = StopTracker.from_dict(data.get("stops") or {})
+                self._rebalanced = {
+                    str(k): str(v) for k, v in (data.get("rebalanced") or {}).items()
+                }
             except (KeyError, TypeError, ValueError, AttributeError):
                 logger.warning(
                     "Risk state at {} is invalid — starting fresh",
                     self._risk_store.path,
                 )
                 monitor, tracker = None, StopTracker()
+                self._rebalanced = {}
 
         if monitor is None:
             monitor = DrawdownMonitor(
@@ -1274,6 +1521,8 @@ class TradingOrchestrator:
                 # The paper account restarts at INITIAL_BALANCE: an old peak
                 # would read as a drawdown. Keep the latch, re-anchor values.
                 monitor.rebaseline(portfolio_value)
+                # Its positions are gone too: rebalance today's candle again.
+                self._rebalanced = {}
 
         if self._settings.RISK_RESET is True:
             logger.warning(
@@ -1300,6 +1549,7 @@ class TradingOrchestrator:
                     "saved_at": datetime.now(UTC).isoformat(),
                     "drawdown": self._drawdown_monitor.to_dict(),
                     "stops": self._stop_tracker.to_dict(),
+                    "rebalanced": dict(self._rebalanced),
                 }
             )
         except Exception:

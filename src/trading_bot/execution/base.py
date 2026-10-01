@@ -44,6 +44,13 @@ class BaseExecutor(ABC):
         themselves. The paper executor uses it for mark-to-market valuation.
         """
 
+    async def tradable_amount(self, pair: str, quantity: float, price: float) -> float:
+        """``quantity`` rounded to what the market accepts; 0.0 if too small.
+
+        Default: unchanged (no precision or minimums, e.g. paper trading).
+        """
+        return quantity if quantity > 0 else 0.0
+
     async def place_stop_loss(
         self, pair: str, quantity: float, stop_price: float
     ) -> str | None:

@@ -71,6 +71,36 @@ async def test_trade_lifecycle(repo: TradingRepository) -> None:
     assert [t.id for t in await repo.recent_trades()] == [trade.id]
 
 
+async def test_scale_in_and_partial_close(repo: TradingRepository) -> None:
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    trade = await repo.open_trade(
+        exchange="binance",
+        pair="BTC/USDT",
+        strategy="donchian_ensemble",
+        entry_price=100.0,
+        quantity=1.0,
+        fees=0.1,
+        entry_time=t0,
+    )
+    await repo.scale_in_trade(trade.id, price=200.0, quantity=1.0, fees=0.2)
+    piece = await repo.close_partial_trade(
+        trade.id,
+        quantity=0.5,
+        exit_price=300.0,
+        exit_reason="rebalance",
+        exit_fees=0.15,
+        exit_time=t0 + timedelta(days=2),
+    )
+    # Slice: avg entry 150, a quarter of the 0.3 entry fees.
+    assert float(piece.entry_price) == pytest.approx(150.0)
+    assert float(piece.pnl) == pytest.approx(150 * 0.5 - 0.075 - 0.15)
+    assert piece.entry_time.replace(tzinfo=UTC) == t0
+    (open_,) = await repo.open_trades()
+    assert open_.id == trade.id
+    assert float(open_.quantity) == pytest.approx(1.5)
+    assert float(open_.total_fees) == pytest.approx(0.225)
+
+
 async def test_snapshots_oldest_first(repo: TradingRepository) -> None:
     t0 = datetime(2026, 1, 1, tzinfo=UTC)
     for h in range(3):
@@ -102,3 +132,14 @@ async def test_record_order(
         filled_price=100.0,
     )
     assert order.id is not None
+
+
+async def test_get_trade(repo: TradingRepository) -> None:
+    trade = await repo.open_trade(
+        exchange="binance",
+        pair="ETH/USDT",
+        strategy="donchian_ensemble",
+        entry_price=10.0,
+        quantity=1.0,
+    )
+    assert (await repo.get_trade(trade.id)) is trade

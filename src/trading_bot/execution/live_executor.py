@@ -241,6 +241,12 @@ class LiveExecutor(BaseExecutor):
     async def get_order(self, order_id: str, pair: str) -> dict[str, Any]:
         return dict(await self._exchange.fetch_order(order_id, pair))
 
+    async def tradable_amount(self, pair: str, quantity: float, price: float) -> float:
+        """Market precision and minimum amount/notional (buys and sells)."""
+        if quantity <= 0:
+            return 0.0
+        return await self._sellable_amount(pair, quantity, price)
+
     async def _sellable_amount(
         self, pair: str, qty: float, price: float | None
     ) -> float:

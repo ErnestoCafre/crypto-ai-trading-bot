@@ -167,16 +167,19 @@ def main() -> None:
         "Par seleccionado", settings.TRADING_PAIRS, index=0
     )
     timeframes = ["15m", "1h", "4h", "1d"]
-    default_tf = (
-        timeframes.index(settings.TRADING_TIMEFRAME)
-        if settings.TRADING_TIMEFRAME in timeframes
-        else 1
-    )
+    donchian = settings.STRATEGY_MODE == "donchian_ensemble"
+    bot_tf = "1d" if donchian else settings.TRADING_TIMEFRAME
+    default_tf = timeframes.index(bot_tf) if bot_tf in timeframes else 1
     timeframe = st.sidebar.selectbox("Timeframe", timeframes, index=default_tf)
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🛡️ Parámetros de riesgo")
-    st.sidebar.text(f"Riesgo máx./trade: {settings.MAX_RISK_PER_TRADE_PCT}%")
+    st.sidebar.markdown(f"**Estrategia:** `{settings.STRATEGY_MODE}`")
+    if donchian:
+        st.sidebar.text(f"Asignación por par: {settings.MAX_POSITION_PCT}%")
+        st.sidebar.text(f"Vol objetivo: {settings.DONCHIAN_VOL_TARGET:.0%}")
+    else:
+        st.sidebar.text(f"Riesgo máx./trade: {settings.MAX_RISK_PER_TRADE_PCT}%")
     st.sidebar.text(f"Drawdown máx.: {settings.MAX_DRAWDOWN_PCT}%")
     st.sidebar.text(f"Pérdida diaria máx.: {settings.MAX_DAILY_LOSS_PCT}%")
     st.sidebar.text(
@@ -257,7 +260,19 @@ def main() -> None:
             {
                 "BOT_MODE": settings.BOT_MODE,
                 "EXCHANGE": settings.EXCHANGE_ID,
-                "TRADING_TIMEFRAME": settings.TRADING_TIMEFRAME,
+                "STRATEGY_MODE": settings.STRATEGY_MODE,
+                "TRADING_TIMEFRAME": bot_tf,
+                **(
+                    {
+                        "DONCHIAN_LOOKBACKS": settings.DONCHIAN_LOOKBACKS,
+                        "DONCHIAN_VOL_TARGET": settings.DONCHIAN_VOL_TARGET,
+                        "DONCHIAN_VOL_WINDOW": settings.DONCHIAN_VOL_WINDOW,
+                        "REBALANCE_THRESHOLD": settings.REBALANCE_THRESHOLD,
+                        "MAX_POSITION_PCT": settings.MAX_POSITION_PCT,
+                    }
+                    if donchian
+                    else {}
+                ),
                 "USE_SENTIMENT": settings.USE_SENTIMENT,
                 "USE_LLM_AGENT": settings.USE_LLM_AGENT,
                 "USE_DL_PREDICTION": settings.USE_DL_PREDICTION,

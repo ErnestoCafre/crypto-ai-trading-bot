@@ -320,6 +320,27 @@ class TestLiveExecutor:
         assert await executor.get_position("BTC/USDT") == 0.0
 
     @pytest.mark.asyncio()
+    async def test_tradable_amount_applies_precision_and_minimums(self) -> None:
+        mock_exchange = _mock_exchange(
+            {"free": {}, "total": {}, "used": {}},
+            limits={"BTC/USDT": {"amount": {"min": 0.00001}, "cost": {"min": 5.0}}},
+        )
+        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        assert await executor.tradable_amount(
+            "BTC/USDT", 0.123456789, 60000.0
+        ) == pytest.approx(0.12345)
+        # 0.00005 BTC x 60000 = 3 USDT < 5 USDT min notional
+        assert await executor.tradable_amount("BTC/USDT", 0.00005, 60000.0) == 0.0
+        assert await executor.tradable_amount("BTC/USDT", 0.0, 60000.0) == 0.0
+
+    @pytest.mark.asyncio()
+    async def test_paper_tradable_amount_is_unchanged(self) -> None:
+        paper = PaperExecutor()
+        assert await paper.tradable_amount("BTC/USDT", 0.123456789, 1.0) == (
+            0.123456789
+        )
+
+    @pytest.mark.asyncio()
     async def test_close_all_positions_spot(self) -> None:
         mock_exchange = _mock_exchange(
             {
