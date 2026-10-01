@@ -36,6 +36,7 @@ def _settings(tmp_path, **overrides):
         "DONCHIAN_VOL_WINDOW": 90,
         "REBALANCE_THRESHOLD": 0.05,
         "RISK_STATE_PATH": str(tmp_path / "risk_state_{mode}.json"),
+        "DONCHIAN_DECISION_LOG_PATH": str(tmp_path / "decisions_{mode}.jsonl"),
     }
     values.update(overrides)
     return _make_settings(**values)
@@ -377,6 +378,50 @@ class TestRebalanceJournal:
             ),
         ]
         assert all(t.status == "closed" for t in trades)
+
+
+class TestDecisionLog:
+    async def test_cycle_logs_decision_matching_the_backtest(self, tmp_path):
+        from trading_bot.backtest.parity import check_parity
+        from trading_bot.core.decision_log import read_decisions
+
+        ohlcv = _daily()
+        orch = _orchestrator(tmp_path, ohlcv)
+        await orch.run_trading_cycle()
+        await orch.run_trading_cycle()  # same candle: no new decision
+
+        records = read_decisions(tmp_path / "decisions_paper.jsonl")
+        assert len(records) == 1
+        record = records[0]
+        assert record["candle"] == ohlcv.index[-2].isoformat()
+        assert record["target"] == pytest.approx(_expected_w(ohlcv))
+        assert record["fill"]["side"] == "buy"
+        assert record["fill"]["quantity"] > 0
+
+        report = check_parity(
+            records, {PAIR: ohlcv}, LOOKBACKS, 0.25, 90, last_closed=ohlcv.index[-2]
+        )
+        assert report.rows[0].target_gap == pytest.approx(0.0, abs=1e-12)
+        assert report.missing == {}
+
+    async def test_blocked_increase_is_logged_without_fill(self, tmp_path):
+        from trading_bot.core.decision_log import read_decisions
+
+        orch = _orchestrator(tmp_path, _daily())
+        orch._drawdown_monitor.update(80_000.0)  # HALTED: no increases
+        await orch.run_trading_cycle()
+
+        (record,) = read_decisions(tmp_path / "decisions_paper.jsonl")
+        assert record["blocked"] is True and record["fill"] is None
+
+    async def test_log_failure_does_not_stop_trading(self, tmp_path):
+        orch = _orchestrator(tmp_path, _daily())
+        with patch.object(
+            bot_module.DecisionLog, "append", side_effect=OSError("disk full")
+        ):
+            await orch.run_trading_cycle()
+        assert await orch._executor.get_position(PAIR) > 0
+        assert orch._rebalanced
 
 
 class TestMarketDataSource:

@@ -249,6 +249,38 @@ simula IA, kill-switch ni mínimos del exchange. **No operar en real sin un
 período previo de paper trading** en este modo (`BOT_MODE=paper`,
 `STRATEGY_MODE=donchian_ensemble`), comparando sus fills con el backtest.
 
+### Verificación contra el backtest (paper o live)
+
+Cada vez que calcula el objetivo diario de un par, el bot agrega una línea a
+`DONCHIAN_DECISION_LOG_PATH` (por defecto
+`var/state/donchian_decisions_{mode}.jsonl`): vela, objetivo de la
+estrategia, ajuste de IA, bloqueos de riesgo, exposición previa y fill. Un
+reintento del mismo día agrega otra línea, y vale la última. Si el log falla,
+el bot sigue operando.
+
+```bash
+uv run python scripts/paper_parity.py            # BOT_MODE de .env
+uv run python scripts/paper_parity.py --mode live --cache
+```
+
+El script descarga la historia diaria completa (endpoints públicos, o el
+caché con `--cache`), recalcula los objetivos con `TargetExposureEngine` y
+termina con código 1 si algo no coincide:
+
+- **Objetivo**: el `w` del bot (antes de la IA) igual al del backtest
+  (tolerancia 1e-6). Una diferencia indica otras velas, una ventana corta
+  (canales `unsynced` en el log) u otros settings.
+- **Ejecución**: slippage adverso de cada fill contra el open de t+1, y fee
+  sobre el nocional. El promedio no debe superar `BACKTEST_SLIPPAGE_PCT` ni
+  `BACKTEST_FEE_PCT`.
+- **Continuidad**: una decisión por par y día desde la primera.
+- **Demora**: decisión a más de 60 minutos del cierre (`--max-lag-min`).
+
+Correrlo cada día después de las 00:10 UTC (antes, la decisión de ayer
+todavía puede faltar). El paper trading no mide si la estrategia gana: en
+pocas semanas hay pocas decisiones. Lo que valida es que el bot ejecute lo
+mismo que se testeó.
+
 ## Señales de IA y datos de mercado
 
 - **Velas**: señales, stops y ML usan solo velas cerradas; la vela en

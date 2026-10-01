@@ -23,6 +23,7 @@ from trading_bot.ai.sentiment.cost_tracker import EXHAUSTED, SentimentCostTracke
 from trading_bot.ai.sentiment.llm_news import AsyncLLMSentimentAnalyzer
 from trading_bot.ai.sentiment.news_cache import NewsSentimentCache
 from trading_bot.config.settings import Settings, get_settings
+from trading_bot.core.decision_log import DecisionLog
 from trading_bot.core.models import (
     AggregatedSentiment,
     AISignals,
@@ -129,6 +130,10 @@ class TradingOrchestrator:
         # rebalanced per pair. Persisted with the risk state so a restart
         # does not trade the same candle twice.
         self._rebalanced: dict[str, str] = {}
+        # donchian_ensemble: this cycle's decision per pair, written to the
+        # decision log once its orders ran.
+        self._cycle_decisions: dict[str, dict[str, object]] = {}
+        self._decision_log: DecisionLog | None = None
 
     @property
     def _target_mode(self) -> bool:
@@ -1303,6 +1308,7 @@ class TradingOrchestrator:
         trades once, at the next open). Sells run before buys so they fund
         them. While the kill-switch is engaged exposure may only go down.
         """
+        self._cycle_decisions = {}
         orders: list[tuple[str, str, float]] = []  # pair, candle, signed value
         for pair, ohlcv in market_data.items():
             price = prices.get(pair)
@@ -1328,9 +1334,25 @@ class TradingOrchestrator:
                     await self._rebalance_buy(pair, delta, prices[pair])
             except Exception:
                 logger.exception("{}: rebalance order failed", pair)
+                if pair in self._cycle_decisions:
+                    self._cycle_decisions[pair]["order_error"] = True
                 continue  # not marked: retried next cycle
             self._rebalanced[pair] = candle
         self._save_risk_state()
+        self._write_decisions()
+
+    def _write_decisions(self) -> None:
+        """Append this cycle's decisions; a logging failure never stops trading."""
+        if self._decision_log is None:
+            self._decision_log = DecisionLog(
+                self._mode_path(self._settings.DONCHIAN_DECISION_LOG_PATH)
+            )
+        for decision in self._cycle_decisions.values():
+            try:
+                self._decision_log.append(decision)
+            except Exception:
+                logger.exception("Could not write to {}", self._decision_log.path)
+                return
 
     async def _rebalance_delta(
         self, pair: str, ohlcv: pd.DataFrame, price: float, equity: float
@@ -1379,7 +1401,31 @@ class TradingOrchestrator:
             current,
             delta,
         )
-        if delta > 0 and not self._drawdown_monitor.entries_allowed:
+        blocked = delta > 0 and not self._drawdown_monitor.entries_allowed
+        self._cycle_decisions[pair] = {
+            "mode": str(s.BOT_MODE),
+            "pair": pair,
+            "candle": pd.Timestamp(ohlcv.index[-1]).isoformat(),
+            "decided_at": datetime.now(UTC).isoformat(),
+            "bars": len(ohlcv),
+            "ready": target.ready,
+            "unsynced": [c.lookback for c in target.channels if not c.synced],
+            "target": target.exposure,
+            "raw": target.raw_exposure,
+            "vol_scale": target.vol_scale,
+            "realized_vol": target.realized_vol,
+            "ai_multiplier": multiplier,
+            "llm_block": block_increase,
+            "wanted": wanted,
+            "held_w": current,
+            "equity": equity,
+            "price": price,
+            "allocation": allocation,
+            "delta": delta,
+            "blocked": blocked,
+            "fill": None,
+        }
+        if blocked:
             logger.info(
                 "{}: exposure increase blocked — risk state {} ({})",
                 pair,
@@ -1446,6 +1492,15 @@ class TradingOrchestrator:
     ) -> None:
         assert self._executor is not None
         result = await self._execute_order(pair, side, quantity, price)
+        if pair in self._cycle_decisions:
+            self._cycle_decisions[pair]["fill"] = {
+                "side": result.side,
+                "status": result.status,
+                "quantity": result.filled_quantity,
+                "price": result.filled_price,
+                "fee": result.fee,
+                "at": result.timestamp.isoformat(),
+            }
         if not await self._report_fill(result, DONCHIAN_STRATEGY):
             return
         if self._journal is not None:

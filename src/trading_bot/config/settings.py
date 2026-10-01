@@ -87,6 +87,8 @@ class Settings(BaseSettings):
     # Persisted drawdown latch + stops. "{mode}" is replaced by BOT_MODE so a
     # paper session never overwrites the live halt state.
     RISK_STATE_PATH: str = "var/state/risk_state_{mode}.json"
+    # donchian_ensemble: one JSON line per daily decision (scripts/paper_parity.py)
+    DONCHIAN_DECISION_LOG_PATH: str = "var/state/donchian_decisions_{mode}.jsonl"
     # Manual reset of a max-drawdown HALT on startup. Remove after use.
     RISK_RESET: bool = False
 

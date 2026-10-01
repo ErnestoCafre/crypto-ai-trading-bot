@@ -30,15 +30,21 @@ from trading_bot.risk.drawdown import TradingState
 
 
 _RISK_STATE_PATH = "unset"
+_DECISION_LOG_PATH = "unset"
 
 
 @pytest.fixture(autouse=True)
 def _isolate_risk_state(tmp_path, monkeypatch):
-    """Keep every orchestrator's risk-state file inside the test's tmp_path."""
+    """Keep every orchestrator's state files inside the test's tmp_path."""
     monkeypatch.setattr(
         sys.modules[__name__],
         "_RISK_STATE_PATH",
         str(tmp_path / "risk_state_{mode}.json"),
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_DECISION_LOG_PATH",
+        str(tmp_path / "donchian_decisions_{mode}.jsonl"),
     )
 
 
@@ -85,6 +91,7 @@ def _make_settings(**overrides):
         "MIN_CONFIDENCE_THRESHOLD": 0.5,
         "AI_SIZING_FLOOR": 0.25,
         "RISK_STATE_PATH": _RISK_STATE_PATH,
+        "DONCHIAN_DECISION_LOG_PATH": _DECISION_LOG_PATH,
         "RISK_RESET": False,
         "LLM_ANALYSIS_INTERVAL_MIN": 15,
         "OHLCV_FETCH_MAX_RETRIES": 5,
