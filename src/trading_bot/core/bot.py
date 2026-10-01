@@ -9,6 +9,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+from apscheduler.triggers.base import BaseTrigger
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 from trading_bot.ai.agents.orchestrator import Orchestrator
@@ -69,6 +72,9 @@ DONCHIAN_TIMEFRAME = "1d"
 # Share of free quote cash a rebalancing buy may spend: leaves room for the
 # fee and slippage so the exchange does not reject it for insufficient funds.
 BUY_CASH_BUFFER = 0.99
+# donchian_ensemble cycles run at this minute of every hour (UTC): a couple of
+# minutes after the daily close, so the exchange has published the candle.
+TARGET_CYCLE_MINUTE = 2
 
 
 def _regime_size_factor(signal: Signal | None) -> float | None:
@@ -156,7 +162,6 @@ class TradingOrchestrator:
     async def start(self) -> None:
         """Initialise all components, start scheduler, run first cycle, then loop."""
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from apscheduler.triggers.interval import IntervalTrigger
 
         logger.info("TradingOrchestrator starting…")
 
@@ -172,11 +177,13 @@ class TradingOrchestrator:
         # Main trading job
         scheduler.add_job(
             self.run_trading_cycle,
-            trigger=IntervalTrigger(
-                minutes=self._settings.TRADING_INTERVAL_MINUTES,
-            ),
+            trigger=self._trading_trigger(),
             id="trading_cycle",
             max_instances=1,
+            # A cycle delayed past its slot still runs (once), e.g. after a
+            # long-running previous cycle.
+            misfire_grace_time=30 * 60,
+            coalesce=True,
         )
 
         # Sentiment job (separate cadence)
@@ -313,6 +320,20 @@ class TradingOrchestrator:
 
         self._save_risk_state()
         await self._record_snapshot(prices)
+
+    def _trading_trigger(self) -> BaseTrigger:
+        """When the trading cycle runs."""
+        if self._target_mode:
+            # Hourly at hh:MM UTC: the first run after 00:00 trades the daily
+            # close near the next open, as the backtest does; the others value
+            # the portfolio, watch the kill-switch and retry a failed rebalance.
+            logger.info(
+                "donchian_ensemble: trading cycle hourly at minute {} UTC "
+                "(TRADING_INTERVAL_MINUTES ignored)",
+                TARGET_CYCLE_MINUTE,
+            )
+            return CronTrigger(minute=TARGET_CYCLE_MINUTE, timezone=UTC)
+        return IntervalTrigger(minutes=self._settings.TRADING_INTERVAL_MINUTES)
 
     # ------------------------------------------------------------------
     # Private — initialisation

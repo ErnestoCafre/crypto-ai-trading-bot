@@ -379,6 +379,27 @@ class TestRebalanceJournal:
         assert all(t.status == "closed" for t in trades)
 
 
+class TestSchedule:
+    def test_cycle_runs_hourly_just_after_the_daily_close(self, tmp_path):
+        from apscheduler.triggers.cron import CronTrigger
+
+        trigger = _orchestrator(tmp_path, _daily())._trading_trigger()
+        assert isinstance(trigger, CronTrigger)
+        after_close = datetime(2026, 10, 1, 0, 0, 30, tzinfo=UTC)
+        fire = trigger.get_next_fire_time(None, after_close)
+        assert fire == datetime(2026, 10, 1, 0, 2, tzinfo=UTC)
+        fire = trigger.get_next_fire_time(fire, fire.replace(minute=3))
+        assert fire == datetime(2026, 10, 1, 1, 2, tzinfo=UTC)
+
+    def test_regime_selector_keeps_the_interval(self, tmp_path):
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        orch = _orchestrator(tmp_path, _daily(), STRATEGY_MODE="regime_selector")
+        trigger = orch._trading_trigger()
+        assert isinstance(trigger, IntervalTrigger)
+        assert trigger.interval.total_seconds() == 60 * 60
+
+
 class TestRebalanceMarkOnRestart:
     async def test_live_restart_skips_the_traded_candle(self, tmp_path):
         ohlcv = _daily()

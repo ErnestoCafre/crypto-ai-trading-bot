@@ -184,6 +184,11 @@ default sigue siendo `regime_selector`.
   tras un reinicio; solo si la cuenta no se pudo restaurar se borra la marca
   y vuelve a comprar en el mismo día. En live se respetan
   `amount_to_precision` y los mínimos del mercado.
+- **Horario**: el ciclo corre cada hora en el minuto 2 UTC
+  (`TRADING_INTERVAL_MINUTES` no se usa en este modo). El de las 00:02 opera
+  el cierre diario cerca del open siguiente, como el backtest; los demás
+  valoran la cartera, vigilan el kill-switch y reintentan un rebalanceo
+  fallido.
 - **Asignación**: en este modo `MAX_POSITION_PCT` es la asignación de cada
   par. Con 25 % y 3 pares, la exposición total máxima es 75 % y la cartera
   rinde ~¾ de la 1/N testeada (mismo Sharpe, menos CAGR y menos drawdown).
