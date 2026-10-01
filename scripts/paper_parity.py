@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -122,14 +122,15 @@ def main() -> None:
         data = _from_cache(args.exchange, pairs)
     else:
         data = asyncio.run(_download(args.exchange, pairs))
-    today = pd.Timestamp(datetime.now(UTC).date(), tz="UTC")
     report = check_parity(
         records,
         data,
         s.DONCHIAN_LOOKBACKS,
         s.DONCHIAN_VOL_TARGET,
         s.DONCHIAN_VOL_WINDOW,
-        last_closed=today - pd.Timedelta(days=1),
+        last_closed=pd.Timestamp(
+            datetime.now(UTC).date() - timedelta(days=1), tz="UTC"
+        ),
     )
     _print(report)
 
