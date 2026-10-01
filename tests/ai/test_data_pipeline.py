@@ -57,3 +57,22 @@ class TestTimeSeriesSplit:
         total = len(features)
         assert len(x_tr) == pytest.approx(total * 0.7, abs=2)
         assert len(x_val) == pytest.approx(total * 0.15, abs=2)
+
+
+class TestLabelHorizon:
+    def test_bars_without_forward_return_are_dropped(
+        self, ohlcv_100: pd.DataFrame
+    ) -> None:
+        # A monotonic rise: every labelled bar must be "up" (1). The last
+        # `horizon` bars have no future close and must not appear as 0.
+        rising = ohlcv_100.copy()
+        rising["close"] = np.linspace(100.0, 400.0, len(rising))
+        horizon = 3
+        _, y = MLDataPipeline().prepare(rising, label_horizon=horizon)
+        assert (y == 1).all()
+        assert y.index[-1] == rising.index[-1 - horizon]
+
+    def test_feature_columns_subset(self, ohlcv_100: pd.DataFrame) -> None:
+        x, y = MLDataPipeline().prepare(ohlcv_100, feature_columns=["RSI_14"])
+        assert list(x.columns) == ["RSI_14"]
+        assert len(x) == len(y)

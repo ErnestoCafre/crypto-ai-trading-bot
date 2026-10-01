@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -13,6 +14,16 @@ from trading_bot.ai.prediction.base import BasePredictor
 from trading_bot.ai.prediction.base import model_path as model_path_for
 
 logger = logging.getLogger(__name__)
+
+
+def suggest_lightgbm_params(trial: Any) -> dict[str, Any]:
+    """LightGBM search space shared by every Optuna tuning loop."""
+    return {
+        "num_leaves": trial.suggest_int("num_leaves", 15, 63),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2),
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+        "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
+    }
 
 
 class ModelTrainer:
@@ -52,13 +63,7 @@ class ModelTrainer:
         def objective(trial: optuna.Trial) -> float:
             nonlocal best_model, best_metrics, best_score
 
-            params = {
-                "num_leaves": trial.suggest_int("num_leaves", 15, 63),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
-            }
-
+            params = suggest_lightgbm_params(trial)
             model = model_class()
             metrics = model.train(train_data, val_data, params)
 
