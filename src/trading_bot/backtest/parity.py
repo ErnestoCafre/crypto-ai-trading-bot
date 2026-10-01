@@ -10,7 +10,8 @@ Compares the bot's decision log (``core/decision_log.py``) with the
   ``BACKTEST_SLIPPAGE_PCT`` and ``BACKTEST_FEE_PCT``; each real fill is
   measured against that open (adverse slippage) and its notional (fee).
 - **Continuity**: every closed candle since the first decision must have one.
-- **Lag**: minutes from the close of t to the decision.
+- **Lag**: minutes from the close of t to the *first* decision for t
+  (hourly retries while risk blocks an increase do not count as late).
 """
 
 from __future__ import annotations
@@ -130,7 +131,13 @@ def check_parity(
         lookbacks=lookbacks, vol_target=vol_target, vol_window=vol_window
     )
     targets = {pair: engine.targets(df) for pair, df in data.items()}
+    records = list(records)
     decisions = latest_decisions(records)
+    first_decided: dict[tuple[str, pd.Timestamp], pd.Timestamp] = {}
+    for record in records:
+        key = (str(record["pair"]), _utc(record["candle"]))
+        decided = _utc(record["decided_at"])
+        first_decided[key] = min(decided, first_decided.get(key, decided))
 
     rows: list[ParityRow] = []
     seen: dict[str, set[pd.Timestamp]] = {}
@@ -140,7 +147,7 @@ def check_parity(
         ref_target = (
             float(ref.loc[candle]) if ref is not None and candle in ref.index else None
         )
-        decided = _utc(record["decided_at"])
+        decided = first_decided[(pair, candle)]
         row = ParityRow(
             pair=pair,
             candle=candle,

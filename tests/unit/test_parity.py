@@ -124,6 +124,20 @@ def test_sell_below_open_is_adverse():
     assert _check(records, ohlcv).fills[0].slippage_pct == pytest.approx(0.1)
 
 
+def test_lag_counts_from_the_first_decision_of_a_candle():
+    ohlcv = _daily()
+    records = _records(ohlcv)
+    retry = {
+        **records[-1],
+        "decided_at": (
+            pd.Timestamp(records[-1]["candle"]) + pd.Timedelta(days=1, hours=5)
+        ).isoformat(),
+    }
+    report = _check([*records, retry], ohlcv)
+    assert report.rows[-1].lag_min == pytest.approx(2)
+    assert report.failures(**LIMITS) == []
+
+
 def test_latest_record_per_candle_wins():
     first = {"pair": PAIR, "candle": "2026-03-01T00:00:00+00:00", "target": 0.1}
     retry = {**first, "target": 0.2}

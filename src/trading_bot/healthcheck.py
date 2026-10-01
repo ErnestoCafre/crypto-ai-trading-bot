@@ -3,7 +3,8 @@
 The bot rewrites its risk state file (``RISK_STATE_PATH``) with a
 ``saved_at`` timestamp at the end of every trading cycle that could value the
 portfolio. The process is healthy while that heartbeat is younger than
-``HEALTH_MAX_CYCLES`` trading intervals (default 3).
+``HEALTH_MAX_CYCLES`` trading intervals (default 3): TRADING_INTERVAL_MINUTES,
+or one hour in donchian_ensemble mode (its cycle runs hourly).
 
 Usage (exit code 0 = healthy, 1 = unhealthy):
     python -m trading_bot.healthcheck
@@ -25,6 +26,14 @@ def risk_state_path(settings: Settings | None = None) -> Path:
     """Resolved risk state file for the configured BOT_MODE (as core.bot)."""
     s = settings or get_settings()
     return Path(str(s.RISK_STATE_PATH).replace("{mode}", str(s.BOT_MODE)))
+
+
+def cycle_interval(settings: Settings | None = None) -> timedelta:
+    """Time between trading cycles (as core.bot schedules them)."""
+    s = settings or get_settings()
+    if s.STRATEGY_MODE == "donchian_ensemble":
+        return timedelta(hours=1)
+    return timedelta(minutes=s.TRADING_INTERVAL_MINUTES)
 
 
 def load_risk_state(settings: Settings | None = None) -> dict[str, Any] | None:
@@ -58,7 +67,7 @@ def check(settings: Settings | None = None, now: datetime | None = None) -> str 
     if age is None:
         return f"no heartbeat in {risk_state_path(s)}"
     cycles = int(os.environ.get("HEALTH_MAX_CYCLES", "3"))
-    limit = timedelta(minutes=s.TRADING_INTERVAL_MINUTES * cycles)
+    limit = cycle_interval(s) * cycles
     if age > limit:
         return f"last completed cycle {age} ago (limit {limit})"
     return None

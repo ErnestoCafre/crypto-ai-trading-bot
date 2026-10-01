@@ -42,8 +42,11 @@ class InstanceLock:
         try:
             _lock(fh)
         except OSError as exc:
-            fh.seek(0)
-            owner = fh.read().strip() or "unknown"
+            try:
+                fh.seek(0)
+                owner = fh.read().strip() or "unknown"
+            except OSError:  # Windows: the locked byte cannot be read
+                owner = "unknown"
             fh.close()
             raise InstanceLockError(
                 f"{self._path} is locked by another bot (pid {owner}); "

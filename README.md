@@ -281,7 +281,12 @@ termina con código 1 si algo no coincide:
   sobre el nocional. El promedio no debe superar `BACKTEST_SLIPPAGE_PCT` ni
   `BACKTEST_FEE_PCT`.
 - **Continuidad**: una decisión por par y día desde la primera.
-- **Demora**: decisión a más de 60 minutos del cierre (`--max-lag-min`).
+- **Demora**: primera decisión de la vela a más de 60 minutos del cierre
+  (`--max-lag-min`). Los reintentos horarios mientras el riesgo bloquea una
+  suba no cuentan como demora.
+
+El día de arranque suele fallar por demora: el bot decide a la hora en que
+se lo arranca. `--since AAAA-MM-DD` ignora las velas anteriores a esa fecha.
 
 Correrlo cada día después de las 00:10 UTC (antes, la decisión de ayer
 todavía puede faltar). El paper trading no mide si la estrategia gana: en
@@ -443,8 +448,11 @@ docker compose build --build-arg EXTRAS="--extra sentiment"   # con CryptoBERT
 - Postgres no publica puertos; el dashboard (sin autenticación) escucha solo en
   `127.0.0.1:8501`.
 - `HEALTHCHECK`: healthy mientras el bot complete ciclos
-  (`python -m trading_bot.healthcheck`, heartbeat en el estado de riesgo).
-- Volúmenes: `botstate` (`var/state`, latch y stops), `botlogs` (`var/logs`),
+  (`python -m trading_bot.healthcheck`, heartbeat en el estado de riesgo):
+  unhealthy tras `HEALTH_MAX_CYCLES` (3) intervalos sin ciclo, con intervalo
+  `TRADING_INTERVAL_MINUTES` o 1 hora en `donchian_ensemble`.
+- Volúmenes: `botstate` (`var/state`: latch, stops, cuenta paper, log de
+  decisiones y lock de instancia), `botlogs` (`var/logs`),
   `pgdata`.
 - **Volumen `pgdata` existente**: Postgres solo aplica `POSTGRES_PASSWORD` al
   inicializar un volumen vacío. Si el volumen se creó con la contraseña anterior

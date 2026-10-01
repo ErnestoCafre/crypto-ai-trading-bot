@@ -9,6 +9,7 @@ when something does not match, so it can run from cron after 00:02 UTC.
 Usage:
     uv run python scripts/paper_parity.py
     uv run python scripts/paper_parity.py --mode live --cache
+    uv run python scripts/paper_parity.py --since 2026-10-02  # skip start-up day
     uv run python scripts/paper_parity.py --log var/state/donchian_decisions_paper.jsonl
 """
 
@@ -92,6 +93,12 @@ def main() -> None:
     parser.add_argument("--log", type=Path, default=None)
     parser.add_argument("--exchange", default=s.EXCHANGE_ID)
     parser.add_argument("--cache", action="store_true", help="use the parquet cache")
+    parser.add_argument(
+        "--since",
+        type=pd.Timestamp,
+        default=None,
+        help="ignore decisions for candles before this date (e.g. the start-up day)",
+    )
     parser.add_argument("--tolerance", type=float, default=1e-6)
     parser.add_argument(
         "--max-slippage-pct", type=float, default=s.BACKTEST_SLIPPAGE_PCT
@@ -102,6 +109,11 @@ def main() -> None:
 
     log = args.log or Path(s.DONCHIAN_DECISION_LOG_PATH.replace("{mode}", args.mode))
     records = read_decisions(log)
+    if args.since is not None:
+        since = (
+            args.since.tz_localize("UTC") if args.since.tzinfo is None else args.since
+        )
+        records = [r for r in records if pd.Timestamp(r["candle"]) >= since]
     if not records:
         sys.exit(f"No decisions in {log}")
     pairs = sorted({str(r["pair"]) for r in records})
