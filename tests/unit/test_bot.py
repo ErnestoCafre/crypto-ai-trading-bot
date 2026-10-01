@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -1463,6 +1463,38 @@ class TestRiskStatePersistence:
 
 
 class TestLifecycle:
+    @pytest.mark.asyncio
+    async def test_start_refuses_a_second_bot_on_the_same_state(self):
+        from trading_bot.state_lock import InstanceLock, InstanceLockError
+
+        orch = _setup_orchestrator()
+        holder = InstanceLock(orch._lock_path())
+        holder.acquire()
+        try:
+            with (
+                patch.object(orch, "_init_components") as init,
+                pytest.raises(InstanceLockError),
+            ):
+                await orch.start()
+            init.assert_not_called()  # no state read or written
+        finally:
+            holder.release()
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_the_instance_lock(self):
+        from trading_bot.state_lock import InstanceLock
+
+        orch = _setup_orchestrator()
+        orch._instance_lock = InstanceLock(orch._lock_path())
+        orch._instance_lock.acquire()
+
+        await orch.stop()
+
+        assert not orch._instance_lock.held
+        other = InstanceLock(orch._lock_path())
+        other.acquire()
+        other.release()
+
     @pytest.mark.asyncio
     async def test_stop_closes_executor_once(self):
         orch = _setup_orchestrator()

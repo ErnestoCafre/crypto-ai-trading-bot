@@ -79,6 +79,13 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   `var/state/risk_state_{mode}.json`). Si falta o está corrupto, el bot arranca
   desde el balance actual y deja un warning. En Docker vive en el volumen
   `botstate` (`/app/var/state`), así sobrevive a recrear el contenedor.
+- **Una sola instancia por estado**: al arrancar, el bot toma un lock del
+  sistema operativo sobre `<RISK_STATE_PATH>.lock`. Una segunda instancia sobre
+  el mismo estado (otro proceso u otro contenedor con el mismo volumen) sale
+  con código 1 sin leer ni escribir nada; si no, las dos operarían las mismas
+  velas y se pisarían la cuenta paper y los stops. Paper y live usan archivos
+  distintos y pueden correr a la vez. El lock se libera solo si el proceso
+  muere, así que un crash no deja un lock colgado.
 - En live, **un retiro de fondos cuenta como pérdida** para el drawdown: tras
   retirar, reiniciar una vez con `RISK_RESET=true`.
 - En paper la cuenta simulada (efectivo, posiciones y último precio) se

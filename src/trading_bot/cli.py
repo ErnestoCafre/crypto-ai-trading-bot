@@ -31,9 +31,14 @@ def main() -> None:
     logger.info("AI modules: {}", active_ai if active_ai else "none")
 
     from trading_bot.core.bot import TradingOrchestrator
+    from trading_bot.state_lock import InstanceLockError
 
     orchestrator = TradingOrchestrator(settings)
-    asyncio.run(orchestrator.start())
+    try:
+        asyncio.run(orchestrator.start())
+    except InstanceLockError as exc:
+        logger.error("{}", exc)
+        sys.exit(1)
 
 
 def run() -> None:

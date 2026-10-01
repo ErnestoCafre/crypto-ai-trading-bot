@@ -63,6 +63,7 @@ from trading_bot.risk.position_sizer import PositionSizer
 from trading_bot.risk.risk_state import RiskStateStore
 from trading_bot.risk.stop_loss import StopLossManager
 from trading_bot.risk.stop_tracker import StopTracker
+from trading_bot.state_lock import InstanceLock
 
 # News window scored for sentiment, and articles kept per pair per fetch.
 NEWS_WINDOW = timedelta(hours=24)
@@ -94,6 +95,7 @@ class TradingOrchestrator:
         self._scheduler: object | None = None
         self._running: bool = False
         self._closed: bool = False
+        self._instance_lock: InstanceLock | None = None
 
         # Core components — initialised in start()
         self._fetcher: CCXTFetcher | None = None
@@ -169,6 +171,12 @@ class TradingOrchestrator:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
         logger.info("TradingOrchestrator starting…")
+
+        # Before any state is read: a second bot on the same state would
+        # trade the same candles and overwrite this one's account.
+        self._instance_lock = InstanceLock(self._lock_path())
+        self._instance_lock.acquire()
+        logger.info("Instance lock held: {}", self._instance_lock.path)
 
         await self._init_components()
         await self._init_ai_components()
@@ -260,6 +268,9 @@ class TradingOrchestrator:
 
         if self._journal is not None:
             await self._journal.close()
+
+        if self._instance_lock is not None:
+            self._instance_lock.release()
 
     async def run_trading_cycle(self) -> None:
         """One complete trading cycle: price, check drawdown, process each pair."""
@@ -1573,6 +1584,11 @@ class TradingOrchestrator:
 
     def _risk_state_path(self) -> Path:
         return self._mode_path(self._settings.RISK_STATE_PATH)
+
+    def _lock_path(self) -> Path:
+        """One bot per risk state file (paper and live use different ones)."""
+        path = self._risk_state_path()
+        return path.with_name(path.name + ".lock")
 
     async def _load_risk_state(self, portfolio_value: float) -> None:
         """Restore drawdown latch and stops from disk, or start fresh."""
