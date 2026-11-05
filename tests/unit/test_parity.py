@@ -41,7 +41,7 @@ def _records(ohlcv: pd.DataFrame, days: int = 5) -> list[dict]:
     targets = _targets(ohlcv)
     out = []
     for candle in ohlcv.index[-days - 1 : -1]:
-        decided = candle + pd.Timedelta(days=1, minutes=2)
+        decided = candle + pd.Timedelta(24 * 60 + 2, unit="min")
         out.append(
             {
                 "pair": PAIR,
@@ -87,7 +87,7 @@ def test_missing_day_and_late_decision_are_reported():
     records = _records(ohlcv)
     del records[1]
     records[-1]["decided_at"] = (
-        pd.Timestamp(records[-1]["candle"]) + pd.Timedelta(days=1, hours=3)
+        pd.Timestamp(records[-1]["candle"]) + pd.Timedelta(27, unit="h")
     ).isoformat()
     failures = _check(records, ohlcv).failures(**LIMITS)
     assert any("no decision for" in f for f in failures)
@@ -98,7 +98,7 @@ def test_fill_measured_against_next_open():
     ohlcv = _daily()
     records = _records(ohlcv)
     candle = pd.Timestamp(records[0]["candle"])
-    next_open = float(ohlcv.loc[candle + pd.Timedelta(days=1), "open"])
+    next_open = float(ohlcv.loc[candle + pd.Timedelta(1, unit="D"), "open"])
     price = next_open * 1.002  # 0.2 % worse than the open
     records[0]["fill"] = {
         "side": "buy",
@@ -119,7 +119,7 @@ def test_sell_below_open_is_adverse():
     ohlcv = _daily()
     records = _records(ohlcv)
     candle = pd.Timestamp(records[0]["candle"])
-    next_open = float(ohlcv.loc[candle + pd.Timedelta(days=1), "open"])
+    next_open = float(ohlcv.loc[candle + pd.Timedelta(1, unit="D"), "open"])
     records[0]["fill"] = {"side": "sell", "quantity": 1.0, "price": next_open * 0.999}
     assert _check(records, ohlcv).fills[0].slippage_pct == pytest.approx(0.1)
 
@@ -130,7 +130,7 @@ def test_lag_counts_from_the_first_decision_of_a_candle():
     retry = {
         **records[-1],
         "decided_at": (
-            pd.Timestamp(records[-1]["candle"]) + pd.Timedelta(days=1, hours=5)
+            pd.Timestamp(records[-1]["candle"]) + pd.Timedelta(29, unit="h")
         ).isoformat(),
     }
     report = _check([*records, retry], ohlcv)
@@ -154,3 +154,18 @@ def test_decision_log_round_trip_skips_malformed_lines(tmp_path):
     log.append({"pair": PAIR, "target": 0.6})
     assert [r["target"] for r in read_decisions(path)] == [0.5, 0.6]
     assert read_decisions(tmp_path / "missing.jsonl") == []
+
+
+def test_held_not_ready_record_is_reported_not_crashing():
+    # The bot logs no target when it holds a pair with too little history
+    # (audit M-1 fix); parity must report it instead of raising KeyError.
+    ohlcv = _daily()
+    records = _records(ohlcv)
+    held = dict(records[-1])
+    held.pop("target")
+    held["held_not_ready"] = True
+    records[-1] = held
+    report = _check(records, ohlcv)
+    assert report.rows[-1].bot_target is None
+    assert report.rows[-1].target_gap is None
+    assert any("bot computed no target" in f for f in report.failures(**LIMITS))

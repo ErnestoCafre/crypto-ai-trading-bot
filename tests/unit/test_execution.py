@@ -262,7 +262,9 @@ class TestLiveExecutor:
             },
         )
         executor = LiveExecutor(
-            exchange=mock_exchange, pairs=["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+            exchange=mock_exchange,
+            pairs=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+            owned={"BTC/USDT": 0.5, "ETH/USDT": 2.0},
         )
         balance = await executor.get_balance()
 
@@ -285,25 +287,121 @@ class TestLiveExecutor:
         mock_exchange = _mock_exchange(
             {"total": {"USDT": 1000.0, "BTC": 0.5}, "free": {}, "used": {}}
         )
-        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor = LiveExecutor(
+            exchange=mock_exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         with pytest.raises(RuntimeError, match="BTC/USDT"):
             await executor.get_balance()
 
     @pytest.mark.asyncio()
     async def test_place_order_handles_none_average(self) -> None:
         mock_exchange = _mock_exchange({})
+        mock_exchange.fetch_order = AsyncMock(return_value={"id": "ord-1"})
+        # Balance before / after the order: the fill is measured from it.
+        mock_exchange.fetch_balance = AsyncMock(
+            side_effect=[{"total": {"BTC": 0.0}}, {"total": {"BTC": 0.0099}}]
+        )
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
 
         result = await executor.place_order(
             "BTC/USDT", "buy", "market", 0.01, price=50000.0
         )
         assert result.filled_price == 50000.0
-        assert result.filled_quantity == 0.01
+        assert result.filled_quantity == pytest.approx(0.0099)
         assert result.fee == 0.0
-        assert result.status == "closed"
+        # Fill neither in the response nor in fetch_order: flagged (audit M-2).
+        assert result.status == "unconfirmed"
+        assert executor.owned("BTC/USDT") == pytest.approx(0.0099)
+        mock_exchange.fetch_order.assert_awaited_with("ord-1", "BTC/USDT")
+
+    @pytest.mark.asyncio()
+    async def test_unmeasurable_fill_assumes_the_requested_amount(self) -> None:
+        mock_exchange = _mock_exchange({})
+        mock_exchange.fetch_order = AsyncMock(return_value={"id": "ord-1"})
+        mock_exchange.fetch_balance = AsyncMock(side_effect=ConnectionError("down"))
+        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        result = await executor.place_order(
+            "BTC/USDT", "buy", "market", 0.01, price=50000.0
+        )
+        assert result.filled_quantity == 0.01
+        assert result.status == "unconfirmed"
+
+    @pytest.mark.asyncio()
+    async def test_buy_fee_in_base_is_not_credited_to_the_ledger(self) -> None:
+        # Binance without BNB charges the buy fee in the bought coin: the
+        # account receives filled - fee, so the ledger must too.
+        mock_exchange = _mock_exchange({})
+        mock_exchange.create_order = AsyncMock(
+            return_value={
+                "id": "1",
+                "status": "closed",
+                "filled": 0.01,
+                "average": 50000.0,
+                "fee": {"cost": 0.00001, "currency": "BTC"},
+            }
+        )
+        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        result = await executor.place_order("BTC/USDT", "buy", "market", 0.01)
+        assert result.filled_quantity == 0.01  # what the exchange filled
+        assert executor.owned("BTC/USDT") == pytest.approx(0.00999)
+
+        mock_exchange.create_order = AsyncMock(
+            return_value={
+                "id": "2",
+                "status": "closed",
+                "filled": 0.01,
+                "fees": [{"cost": 0.5, "currency": "USDT"}],
+            }
+        )
+        await executor.place_order("BTC/USDT", "buy", "market", 0.01)
+        assert executor.owned("BTC/USDT") == pytest.approx(0.01999)
 
         no_price = await executor.place_order("BTC/USDT", "sell", "market", 0.01)
         assert no_price.filled_price == 0.0
+
+    @pytest.mark.asyncio()
+    async def test_place_order_fetches_the_fill_when_not_reported(self) -> None:
+        mock_exchange = _mock_exchange({})
+        mock_exchange.fetch_order = AsyncMock(
+            return_value={
+                "id": "ord-1",
+                "status": "expired",
+                "filled": 0.0,
+                "average": None,
+                "cost": 0.0,
+            }
+        )
+        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+
+        result = await executor.place_order(
+            "BTC/USDT", "buy", "market", 0.01, price=50000.0
+        )
+
+        assert result.filled_quantity == 0.0  # nothing filled: not assumed
+        assert result.status == "expired"
+
+    @pytest.mark.asyncio()
+    async def test_fill_price_from_cost_when_average_missing(self) -> None:
+        mock_exchange = _mock_exchange({})
+        mock_exchange.create_order = AsyncMock(
+            return_value={"id": "1", "status": "closed", "filled": 0.02, "cost": 990.0}
+        )
+        executor = LiveExecutor(exchange=mock_exchange)
+        result = await executor.place_order(
+            "BTC/USDT", "sell", "market", 0.02, price=50000.0
+        )
+        assert result.filled_price == pytest.approx(49_500.0)
+        mock_exchange.fetch_order.assert_not_awaited()
+
+    @pytest.mark.asyncio()
+    async def test_market_order_does_not_send_a_price(self) -> None:
+        mock_exchange = _mock_exchange({})
+        executor = LiveExecutor(exchange=mock_exchange)
+        await executor.place_order("BTC/USDT", "buy", "market", 0.01, price=50000.0)
+        await executor.place_order("BTC/USDT", "buy", "limit", 0.01, price=49000.0)
+        calls = mock_exchange.create_order.await_args_list
+        assert calls[0].kwargs["price"] is None
+        assert calls[1].kwargs["price"] == 49000.0
 
     @pytest.mark.asyncio()
     async def test_place_order_prefers_average_then_price(self) -> None:
@@ -333,7 +431,9 @@ class TestLiveExecutor:
             tickers={"BTC/USDT": {"last": 60000.0}},
             limits={"BTC/USDT": {"amount": {"min": 0.00001}}},
         )
-        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor = LiveExecutor(
+            exchange=mock_exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 1.0}
+        )
         assert await executor.get_position("BTC/USDT") == pytest.approx(0.12345)
         assert await executor.get_position("ETH/USDT") == 0.0
 
@@ -392,6 +492,7 @@ class TestLiveExecutor:
         )
 
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor.restore({"owned": {"BTC/USDT": 0.5}, "orders": {"ord-1": "BTC/USDT"}})
         results = await executor.close_all_positions()
 
         mock_exchange.cancel_order.assert_called_once_with("ord-1", "BTC/USDT")
@@ -434,6 +535,12 @@ class TestLiveExecutor:
         )
 
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT", "ETH/USDT"])
+        executor.restore(
+            {
+                "owned": {"BTC/USDT": 1.0, "ETH/USDT": 1.0},
+                "orders": {"bot-1": "BTC/USDT"},
+            }
+        )
         results = await executor.close_all_positions()
 
         # Only the bot's pair order is cancelled; BNB/DOGE are untouched;
@@ -454,7 +561,9 @@ class TestLiveExecutor:
             {"free": {"BTC": 0.0}, "used": {"BTC": 0.5}, "total": {"BTC": 0.5}},
             tickers={"BTC/USDT": {"last": 60000.0}},
         )
-        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor = LiveExecutor(
+            exchange=mock_exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         assert await executor.get_position("BTC/USDT") == pytest.approx(0.5)
 
     @pytest.mark.asyncio()
@@ -516,6 +625,7 @@ class TestLiveExecutor:
 
         mock_exchange.fetch_open_orders = AsyncMock(side_effect=fetch_open_orders)
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor.restore({"owned": {"BTC/USDT": 0.5}, "orders": {"stop-1": "BTC/USDT"}})
 
         await executor.close_all_positions()
 

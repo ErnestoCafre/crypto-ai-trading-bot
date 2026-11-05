@@ -50,7 +50,13 @@ class CCXTFetcher(BaseFetcher):
     # -- async context manager --
 
     async def __aenter__(self) -> CCXTFetcher:
-        await self._exchange.load_markets()
+        try:
+            await self._exchange.load_markets()
+        except BaseException:
+            # __aexit__ does not run when __aenter__ raises: close the HTTP
+            # session here or it leaks (ccxt warns "Unclosed client session").
+            await self._exchange.close()
+            raise
         return self
 
     async def __aexit__(

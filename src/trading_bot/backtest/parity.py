@@ -24,7 +24,9 @@ import pandas as pd
 
 from trading_bot.backtest.target_engine import TargetExposureEngine
 
-DAY = pd.Timedelta(days=1)
+# Built from an explicit unit: pd.Timedelta(days=1) trips numpy>=2.5's
+# deprecated "generic" timedelta64 unit inside pandas 2.3.
+DAY = pd.Timedelta(1, unit="D")
 # Float residue allowed over a cost budget (a 0.1 % fee is not "> 0.1 %").
 _COST_EPSILON = 1e-9
 
@@ -33,7 +35,9 @@ _COST_EPSILON = 1e-9
 class ParityRow:
     pair: str
     candle: pd.Timestamp
-    bot_target: float
+    # None: the bot computed no target (``held_not_ready``: too little history
+    # while holding, so it held instead of trading).
+    bot_target: float | None
     ref_target: float | None  # None: candle missing from the reference data
     held_w: float
     wanted: float
@@ -46,7 +50,7 @@ class ParityRow:
 
     @property
     def target_gap(self) -> float | None:
-        if self.ref_target is None:
+        if self.ref_target is None or self.bot_target is None:
             return None
         return abs(self.bot_target - self.ref_target)
 
@@ -79,7 +83,12 @@ class ParityReport:
         out: list[str] = []
         for r in self.rows:
             day = r.candle.date().isoformat()
-            if r.ref_target is None:
+            if r.bot_target is None:
+                out.append(
+                    f"{r.pair} {day}: bot computed no target (too little "
+                    "history while holding; position held)"
+                )
+            elif r.ref_target is None:
                 out.append(f"{r.pair} {day}: candle not in the reference data")
             elif r.target_gap is not None and r.target_gap > tolerance:
                 out.append(
@@ -151,7 +160,7 @@ def check_parity(
         row = ParityRow(
             pair=pair,
             candle=candle,
-            bot_target=float(record["target"]),
+            bot_target=_optional_float(record.get("target")),
             ref_target=ref_target,
             held_w=float(record.get("held_w") or 0.0),
             wanted=float(record.get("wanted") or 0.0),
@@ -195,6 +204,10 @@ def _with_fill(
         slippage_pct=slippage,
         fee_pct=fee / notional * 100 if notional > 0 else None,
     )
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)
 
 
 def _utc(value: Any) -> pd.Timestamp:

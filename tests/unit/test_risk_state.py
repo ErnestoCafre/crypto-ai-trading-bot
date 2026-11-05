@@ -163,6 +163,13 @@ class TestStopTracker:
         )
         assert tracker.check_hit("BTC/USDT", later) == 47_500.0  # gap open
 
+    def test_hit_candle_is_rechecked_until_the_stop_is_removed(self) -> None:
+        # A failed exit must not consume the hit (audit M-3).
+        bars = _bars([(50_000, 49_900), (49_500, 47_900), (49_800, 49_500)])
+        tracker = self._tracker(bars)
+        assert tracker.check_hit("BTC/USDT", bars) == 48_000.0
+        assert tracker.check_hit("BTC/USDT", bars) == 48_000.0  # retried
+
     def test_round_trip_dict(self) -> None:
         bars = _bars([(50_000, 49_900), (49_500, 48_100)])
         tracker = self._tracker(bars)

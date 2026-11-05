@@ -225,6 +225,12 @@ class TestAIExposureMultiplier:
         assert mult == pytest.approx(0.25)
         assert not block
 
+    def test_out_of_range_sentiment_never_goes_below_floor(self) -> None:
+        mult, _ = ai_exposure_multiplier(AISignals(sentiment_score=-3.0), 0.25)
+        assert mult == pytest.approx(0.25)
+        mult, _ = ai_exposure_multiplier(AISignals(sentiment_score=-3.0), 0.0)
+        assert mult == pytest.approx(0.0)
+
     def test_weighted_mean_of_sources(self) -> None:
         ai = AISignals(
             sentiment_score=-0.5, llm_recommendation="NEUTRAL", llm_confidence=0.9

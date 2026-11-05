@@ -28,10 +28,14 @@ class DrawdownMonitor:
         initial_value: float = 0.0,
         clock: Callable[[], datetime] = _utc_now,
         settings: Settings | None = None,
+        daily_loss_limit: bool = True,
     ) -> None:
         settings = settings or get_settings()
         self._max_dd_pct = settings.MAX_DRAWDOWN_PCT
         self._max_daily_loss_pct = settings.MAX_DAILY_LOSS_PCT
+        # False: the daily loss limit never pauses (donchian_ensemble with
+        # DONCHIAN_DAILY_LOSS_ACTION=off); the max drawdown HALT still applies.
+        self._daily_loss_limit = daily_loss_limit
         self._clock = clock
 
         self._peak_value: float = initial_value
@@ -74,7 +78,7 @@ class DrawdownMonitor:
             )
             return TradingState.HALTED
 
-        if self._state == TradingState.DAILY_PAUSED:
+        if self._state == TradingState.DAILY_PAUSED or not self._daily_loss_limit:
             return None
 
         if (
@@ -160,13 +164,17 @@ class DrawdownMonitor:
         data: dict[str, Any],
         clock: Callable[[], datetime] = _utc_now,
         settings: Settings | None = None,
+        daily_loss_limit: bool = True,
     ) -> DrawdownMonitor:
         """Rebuild a monitor from :meth:`to_dict` output.
 
         Raises KeyError/TypeError/ValueError on malformed data.
         """
         monitor = cls(
-            initial_value=float(data["peak_value"]), clock=clock, settings=settings
+            initial_value=float(data["peak_value"]),
+            clock=clock,
+            settings=settings,
+            daily_loss_limit=daily_loss_limit,
         )
         monitor._day_start_value = float(data["day_start_value"])
         monitor._current_day = str(data["current_day"])

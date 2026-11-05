@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from trading_bot.config.settings import Settings
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defaults are asserted against Settings, not the runner's environment
+    (a CI job with BOT_MODE=live must not fail these tests)."""
+    for key in Settings.model_fields:
+        monkeypatch.delenv(key, raising=False)
 
 
 class TestSettings:
@@ -97,3 +106,53 @@ class TestSignalWeightValidation:
     def test_threshold_must_be_a_probability(self) -> None:
         with pytest.raises(ValidationError):
             Settings(_env_file=None, MIN_CONFIDENCE_THRESHOLD=1.5)  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# .env.example stays in sync with Settings (audit: drift found 2026-11-05)
+# ---------------------------------------------------------------------------
+
+ENV_EXAMPLE = Path(__file__).resolve().parents[2] / ".env.example"
+# Read by docker-compose, not by Settings.
+COMPOSE_ONLY = {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"}
+# Documented on purpose with a value other than the default.
+EXAMPLE_OVERRIDES = {"LLM_MODEL"}  # pinned snapshot of the default alias
+
+
+def _env_example() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^([A-Z][A-Z0-9_]*)=([^#]*)", line)
+        if match:
+            values[match.group(1)] = match.group(2).strip()
+    return values
+
+
+def test_env_example_has_no_unknown_keys() -> None:
+    unknown = set(_env_example()) - set(Settings.model_fields) - COMPOSE_ONLY
+    assert not unknown, f"keys Settings ignores (extra='ignore'): {sorted(unknown)}"
+
+
+def test_env_example_matches_the_defaults() -> None:
+    """Copying .env.example (README Setup) must not override calibrated defaults."""
+    for key, raw in _env_example().items():
+        if key in COMPOSE_ONLY | EXAMPLE_OVERRIDES or raw == "":
+            continue
+        expected = Settings(_env_file=None).model_dump()[key]  # type: ignore[call-arg]
+        parsed = Settings(_env_file=None, **{key: raw}).model_dump()[key]  # type: ignore[call-arg]
+        assert parsed == expected, f"{key}: .env.example={raw!r}, default={expected!r}"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "MAX_RISK_PER_TRADE_PCT",
+        "MAX_POSITION_PCT",
+        "MAX_DRAWDOWN_PCT",
+        "MAX_DAILY_LOSS_PCT",
+    ],
+)
+@pytest.mark.parametrize("value", [0.0, -1.0, 150.0])
+def test_risk_percentages_are_validated(key: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{key: value})  # type: ignore[call-arg]

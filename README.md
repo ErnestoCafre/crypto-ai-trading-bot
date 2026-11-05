@@ -70,8 +70,11 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   vende al precio del stop, o al `open` si la vela abrió por debajo (gap).
   En `STRATEGY_MODE=donchian_ensemble` no hay stop por trade: la salida es el
   stop de cada canal al cierre diario (ver Modo donchian_ensemble).
-- **Pérdida diaria** (`MAX_DAILY_LOSS_PCT`): liquida y notifica una vez; las
-  entradas nuevas quedan bloqueadas hasta el siguiente día UTC (se levanta sola).
+- **Pérdida diaria** (`MAX_DAILY_LOSS_PCT`): notifica una vez y bloquea las
+  entradas nuevas hasta el siguiente día UTC (se levanta sola). En
+  `regime_selector` además liquida; en `donchian_ensemble` la acción la elige
+  `DONCHIAN_DAILY_LOSS_ACTION` (por defecto no liquida, ver Modo
+  donchian_ensemble).
 - **Drawdown máximo** (`MAX_DRAWDOWN_PCT`): liquida y notifica una vez y deja el
   bot en estado `HALTED`: no abre posiciones nuevas, ni tras reiniciar, hasta un
   reset manual. Stops y salidas siguen funcionando.
@@ -85,9 +88,24 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   con código 1 sin leer ni escribir nada; si no, las dos operarían las mismas
   velas y se pisarían la cuenta paper y los stops. Paper y live usan archivos
   distintos y pueden correr a la vez. El lock se libera solo si el proceso
-  muere, así que un crash no deja un lock colgado.
+  muere, así que un crash no deja un lock colgado. Es un lock *advisory*
+  (`flock`) local: no protege entre máquinas ni en sistemas de archivos que no
+  lo respetan (NFS, algunos bind mounts de Docker Desktop en macOS/Windows), y
+  solo cubre `RISK_STATE_PATH`: dos instancias con distinto `RISK_STATE_PATH`
+  no deben compartir `DONCHIAN_DECISION_LOG_PATH`.
 - En live, **un retiro de fondos cuenta como pérdida** para el drawdown: tras
   retirar, reiniciar una vez con `RISK_RESET=true`.
+- En live el bot lleva un **libro de posición propio** (`live_ledger` en el
+  archivo de estado): solo opera, valora y liquida las monedas que *él*
+  compró de cada par, nunca más que el saldo real del exchange. Monedas tuyas
+  del mismo activo en la cuenta se ignoran (se avisa en el log al arrancar) y
+  el kill-switch solo cancela las órdenes stop que colocó el bot. Sin libro
+  guardado (primer arranque en live o estado de una versión anterior) adopta
+  solo lo que cubren sus stops guardados; con
+  `LIVE_ADOPT_EXISTING_BALANCE=true` adopta todo el saldo de cada par (usarlo
+  una vez, con una cuenta dedicada). El saldo en USDT sigue contando entero
+  para el drawdown: lo recomendable sigue siendo una cuenta o subcuenta
+  dedicada.
 - En paper la cuenta simulada (efectivo, posiciones y último precio) se
   guarda en el mismo archivo, en la misma escritura atómica que los stops, así
   que un reinicio sigue desde donde estaba: posiciones, pico y drawdown
@@ -176,7 +194,10 @@ default sigue siendo `regime_selector`.
 - **Estado**: se reconstruye en cada ciclo recorriendo el OHLCV (el bot pide
   al menos 1000 velas diarias, o 360 + 90 + la ventana más larga si se
   configuran ventanas mayores), así que no se persiste y un reinicio da la
-  misma exposición. Con menos de 360 + 90 velas la exposición es 0. En BTC/ETH/SOL
+  misma exposición. Con menos de 360 + 90 velas la exposición es 0 si el par
+  está plano; si hay posición, el bot **no la vende**: la mantiene, avisa (log
+  y Telegram, una vez por vela) y reintenta cada hora, porque una historia
+  corta es un problema de datos y no una señal. En BTC/ETH/SOL
   2017-2026, una ventana de 720 velas ya reproducía el estado de la historia
   completa en todos los días probados (450 no). Si algún canal no tiene en la
   ventana un close debajo de su punto medio, el bot avisa con un warning.
@@ -195,7 +216,9 @@ default sigue siendo `regime_selector`.
   (`TRADING_INTERVAL_MINUTES` no se usa en este modo). El de las 00:02 opera
   el cierre diario cerca del open siguiente, como el backtest; los demás
   valoran la cartera, vigilan el kill-switch y reintentan un rebalanceo
-  fallido.
+  fallido: tanto si la orden dio error como si volvió sin ejecutarse
+  (rechazada o `expired`); en el decision log queda `order_error` o
+  `unfilled`.
 - **Asignación**: en este modo `MAX_POSITION_PCT` es la asignación de cada
   par. Con 25 % y 3 pares, la exposición total máxima es 75 % y la cartera
   rinde ~¾ de la 1/N testeada (mismo Sharpe, menos CAGR y menos drawdown).
@@ -204,10 +227,26 @@ default sigue siendo `regime_selector`.
   usan el stop ATR ni `place_stop_loss`, y al arrancar se cancelan los stops
   que hubiera dejado el otro modo. No hay stop de catástrofe en el exchange:
   el backtest no lo simula, y uno intradía cambiaría la estrategia validada.
-- **Riesgo**: el kill-switch (HALTED / DAILY_PAUSED), el límite diario, el
-  risk_state y el journal siguen igual. Con el kill-switch activo la
-  exposición solo puede bajar. En el journal, cada venta parcial queda como
-  un trade cerrado con su P&L.
+- **Riesgo**: el HALT por drawdown máximo liquida y deja la exposición en
+  0 hasta un reset manual. El límite de **pérdida diaria** hace lo que diga
+  `DONCHIAN_DAILY_LOSS_ACTION`:
+  - `block_increases` (**por defecto**): no vende; ese día la exposición solo
+    puede bajar. Las salidas siguen siendo los stops de canal.
+  - `liquidate`: vende todo (el comportamiento anterior, igual que
+    `regime_selector`); el rebalanceo del día siguiente vuelve a comprar.
+  - `halve`: vende la mitad de cada posición y bloquea subas.
+  - `off`: sin límite diario en este modo (el HALT sigue).
+
+  Por qué no liquidar por defecto: es una salida intradía con la que la
+  estrategia no se validó. En Bitcoin los retornos de 1-24 h tienden a
+  revertir tras caídas grandes, y un stop solo agrega valor si hay momentum
+  en su horizonte (Kaminski & Lo, 2014). En un escenario sintético de estrés
+  (caídas intradía del 12 % que cierran cerca del open), `liquidate` y
+  `halve` realizaban las pérdidas en los mínimos hasta llegar al HALT del
+  15 % (Sharpe 0,85 → 0,04), mientras `block_increases` igualaba al bot sin
+  límite. Comparar con datos reales antes de operar:
+  `scripts/run_backtest.py --strategy-mode donchian_ensemble --compare-daily-loss`.
+  En el journal, cada venta parcial queda como un trade cerrado con su P&L.
 - **IA**: solo puede reducir w. Sentimiento negativo y LLM SHORT/CLOSE dan
   un multiplicador entre `AI_SIZING_FLOOR` y 1; las lecturas alcistas no
   suben nada. Un consenso SHORT del LLM impide aumentar la exposición. Sin
@@ -252,7 +291,9 @@ porque su historia empieza en 2020-08 y se pierde 2021.
 Cautelas: con ~2,75 años de holdout, el error estándar del Sharpe es ~0,6.
 La ventaja sobre buy&hold está más en el drawdown (−12 % contra −64 %) que
 en el retorno: en holdout, buy&hold de BTC rindió más. El backtest no
-simula IA, kill-switch ni mínimos del exchange. **No operar en real sin un
+simula IA ni mínimos del exchange. El kill-switch (HALT y pérdida diaria) se
+simula desde la auditoría de 2026-11 con una aproximación pesimista (precio
+lineal del open al low, mínimos simultáneos); `--no-kill-switch` lo apaga. **No operar en real sin un
 período previo de paper trading** en este modo (`BOT_MODE=paper`,
 `STRATEGY_MODE=donchian_ensemble`), comparando sus fills con el backtest.
 
@@ -280,7 +321,9 @@ termina con código 1 si algo no coincide:
 - **Ejecución**: slippage adverso de cada fill contra el open de t+1, y fee
   sobre el nocional. El promedio no debe superar `BACKTEST_SLIPPAGE_PCT` ni
   `BACKTEST_FEE_PCT`.
-- **Continuidad**: una decisión por par y día desde la primera.
+- **Continuidad**: una decisión por par y día desde la primera. Un día en que
+  el bot mantuvo una posición sin historia suficiente (`held_not_ready`) se
+  reporta como discrepancia.
 - **Demora**: primera decisión de la vela a más de 60 minutos del cierre
   (`--max-lag-min`). Los reintentos horarios mientras el riesgo bloquea una
   suba no cuentan como demora.

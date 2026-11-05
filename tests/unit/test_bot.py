@@ -93,6 +93,8 @@ def _make_settings(**overrides):
         "RISK_STATE_PATH": _RISK_STATE_PATH,
         "DONCHIAN_DECISION_LOG_PATH": _DECISION_LOG_PATH,
         "RISK_RESET": False,
+        "LIVE_ADOPT_EXISTING_BALANCE": False,
+        "DONCHIAN_DAILY_LOSS_ACTION": "block_increases",
         "LLM_ANALYSIS_INTERVAL_MIN": 15,
         "OHLCV_FETCH_MAX_RETRIES": 5,
         "OHLCV_FETCH_TIMEOUT_S": 60.0,
@@ -208,6 +210,7 @@ def _wire_mocks(orch: TradingOrchestrator, ohlcv=None):
     orch._executor.close_all_positions = AsyncMock(return_value=[])
     orch._executor.get_position = AsyncMock(return_value=0.0)
     orch._executor.update_prices = MagicMock()
+    orch._executor.record_external_fill = MagicMock()
 
     orch._fetcher = AsyncMock()
     orch._fetcher.fetch_ohlcv = AsyncMock(return_value=ohlcv)
@@ -912,6 +915,9 @@ class TestPositionAwareness:
             "get_balance",
             AsyncMock(return_value={"total": 1_234.0, "cash": 1_234.0}),
         )
+        monkeypatch.setattr(
+            LiveExecutor, "exchange_holdings", AsyncMock(return_value={})
+        )
 
         await orch._init_components()
 
@@ -998,7 +1004,7 @@ class TestStopLoss:
         assert stop.quantity == pytest.approx(0.01)
         assert stop.order_id is None
         # The candle forming at entry (last closed + 1h) is never checked.
-        entry_candle = ohlcv.index[-1] + pd.Timedelta(hours=1)
+        entry_candle = ohlcv.index[-1] + pd.Timedelta(1, unit="h")
         assert stop.last_checked == entry_candle.isoformat()
 
     @pytest.mark.asyncio
@@ -1018,6 +1024,28 @@ class TestStopLoss:
         assert "BTC/USDT" not in orch._stop_tracker
         orch._notifier.send_alert.assert_awaited_once()
         assert "STOP-LOSS" in orch._notifier.send_alert.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_failed_stop_exit_is_retried_next_cycle(self):
+        # A rebound after a failed exit must not leave the stop unfired (M-3).
+        ohlcv = _flat_ohlcv()
+        ohlcv.iloc[-2, ohlcv.columns.get_loc("low")] = 47_500.0
+        orch = self._orch(ohlcv)
+        orch._executor = await _paper_with_btc()
+        orch._stop_tracker.register(
+            "BTC/USDT", 48_000.0, 1.0, None, entry_candle=ohlcv.index[-5]
+        )
+        real_place = orch._executor.place_order
+        orch._executor.place_order = AsyncMock(side_effect=ConnectionError("down"))
+
+        await orch.run_trading_cycle()
+        assert await orch._executor.get_position("BTC/USDT") == 1.0
+        assert "BTC/USDT" in orch._stop_tracker
+
+        orch._executor.place_order = real_place
+        await orch.run_trading_cycle()
+        assert await orch._executor.get_position("BTC/USDT") == 0.0
+        assert "BTC/USDT" not in orch._stop_tracker
 
     @pytest.mark.asyncio
     async def test_paper_gap_below_stop_sells_at_open(self):
@@ -1086,7 +1114,9 @@ class TestStopLoss:
         exchange = _live_exchange(btc=0.0123456)
         exchange.create_order = AsyncMock(return_value={"id": "stop-1"})
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.0123456}
+        )
 
         await orch._register_stop("BTC/USDT", 48_000.1299, _flat_ohlcv())
 
@@ -1108,7 +1138,9 @@ class TestStopLoss:
         exchange = _live_exchange(btc=0.5)
         exchange.create_order = AsyncMock(side_effect=Exception("rejected"))
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
 
         await orch._register_stop("BTC/USDT", 48_000.0, _flat_ohlcv())
 
@@ -1125,7 +1157,9 @@ class TestStopLoss:
         calls.attach_mock(exchange.create_order, "create_order")
         orch = self._orch(_flat_ohlcv())
         _set_signal(orch, SignalType.CLOSE)
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         orch._stop_tracker.register("BTC/USDT", 48_000.0, 0.5, "stop-1", None)
 
         await orch.run_trading_cycle()
@@ -1151,7 +1185,9 @@ class TestStopLoss:
             }
         )
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         orch._stop_tracker.register("BTC/USDT", 48_000.0, 0.5, "stop-1", None)
 
         await orch.run_trading_cycle()
@@ -1159,6 +1195,8 @@ class TestStopLoss:
         exchange.fetch_order.assert_awaited_once_with("stop-1", "BTC/USDT")
         assert "BTC/USDT" not in orch._stop_tracker
         orch._notifier.send_alert.assert_awaited_once()
+        # The exchange sold the bot's coins: the ledger follows (audit H-1).
+        assert orch._executor.owned("BTC/USDT") == 0.0
 
     @pytest.mark.asyncio
     async def test_externally_cancelled_native_stop_is_watched(self):
@@ -1169,7 +1207,9 @@ class TestStopLoss:
             return_value={"id": "stop-1", "status": "canceled"}
         )
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         orch._stop_tracker.register("BTC/USDT", 48_000.0, 0.5, "stop-1", None)
 
         await orch.run_trading_cycle()
@@ -1538,7 +1578,7 @@ class TestMarketData:
 
         kwargs = orch._fetcher.fetch_ohlcv.call_args.kwargs
         # 100 closed bars + the forming one, plus one bar of slack.
-        expected = before - pd.Timedelta(minutes=minutes * 102)
+        expected = before - pd.Timedelta(minutes * 102, unit="min")
         assert abs((kwargs["since"] - expected).total_seconds()) < 5
         assert kwargs["limit"] == 101
         assert kwargs["timeframe"] == tf
@@ -1741,7 +1781,7 @@ class TestSentimentAndCaches:
             fear_greed_score=0.7,
             num_sources_analyzed=3,
             time_window="1h",
-            timestamp=datetime.now(UTC) - pd.Timedelta(minutes=age_min),
+            timestamp=datetime.now(UTC) - pd.Timedelta(age_min, unit="min"),
         )
 
     def test_stale_sentiment_is_ignored(self):
@@ -1771,7 +1811,7 @@ class TestSentimentAndCaches:
                 total_tokens=0,
                 total_cost_usd=0.0,
                 total_latency_ms=0,
-                timestamp=datetime.now(UTC) - pd.Timedelta(minutes=age_min),
+                timestamp=datetime.now(UTC) - pd.Timedelta(age_min, unit="min"),
             )
 
         orch._latest_llm_decision["BTC/USDT"] = decision(age_min=10)

@@ -8,9 +8,15 @@ license = {text = "MIT"}
 
 dependencies = [
     # Core
-    "ccxt>=4.5",
+    # Upper bound: a major release may change how stopLossPrice maps to
+    # Binance STOP_LOSS (live native stops). Re-check before raising it.
+    # >=4.5.87: earlier releases pin certifi/multidict versions with known
+    # vulnerabilities (pip-audit in CI).
+    "ccxt>=4.5.87,<5",
     "pandas>=2.2,<3",
-    "numpy>=1.26",
+    # numpy 2.5 deprecated the "generic" timedelta64 unit (future error) and
+    # pandas 2.3 still uses it internally; 2.6+ is untested with pandas<3.
+    "numpy>=1.26,<2.6",
     "sqlalchemy[asyncio]>=2.0.48,<2.2",
     "alembic>=1.18",
     "pydantic>=2.0",
@@ -31,7 +37,8 @@ dependencies = [
     # Metrics
     "quantstats>=0.0.62",
     # Dashboard
-    "streamlit>=1.50",
+    # >=1.66: earlier releases cap pillow<13 (pillow 12.x has known CVEs).
+    "streamlit>=1.66",
     "plotly>=5.18",
     # DB driver (URLs are rewritten to postgresql+asyncpg://)
     "asyncpg>=0.29",
@@ -131,6 +138,12 @@ markers = [
     "ai: marks AI module tests",
 ]
 addopts = "-v --tb=short"
+# Deprecations raised from our own code fail the suite: they become errors
+# in a later library release (e.g. numpy timedelta64 generic unit).
+filterwarnings = [
+    "error::DeprecationWarning:trading_bot",
+    "error::FutureWarning:trading_bot",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trading_bot"]

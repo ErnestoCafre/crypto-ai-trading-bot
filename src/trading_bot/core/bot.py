@@ -55,6 +55,7 @@ from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 from trading_bot.data.news.base import BaseNewsFetcher
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
 from trading_bot.execution.base import BaseExecutor
+from trading_bot.execution.live_executor import LiveExecutor
 from trading_bot.execution.paper_executor import PaperExecutor
 from trading_bot.notifications.base import BaseNotifier
 from trading_bot.risk.ai_confidence import AIConfidenceFilter
@@ -70,6 +71,7 @@ NEWS_WINDOW = timedelta(hours=24)
 NEWS_PER_PAIR = 10
 
 DONCHIAN_STRATEGY = "donchian_ensemble"
+DAILY_LOSS_ACTIONS = ("liquidate", "block_increases", "halve", "off")
 DONCHIAN_TIMEFRAME = "1d"
 # Share of free quote cash a rebalancing buy may spend: leaves room for the
 # fee and slippage so the exchange does not reject it for insufficient funds.
@@ -136,10 +138,24 @@ class TradingOrchestrator:
         # decision log once its orders ran.
         self._cycle_decisions: dict[str, dict[str, object]] = {}
         self._decision_log: DecisionLog | None = None
+        # donchian_ensemble: (pair, candle) already alerted for holding a
+        # position without enough history to compute its target.
+        self._not_ready_alerted: set[tuple[str, str]] = set()
+        # Prices of the running cycle (fills of risk actions use them).
+        self._last_cycle_prices: dict[str, float] = {}
 
     @property
     def _target_mode(self) -> bool:
         return self._settings.STRATEGY_MODE == DONCHIAN_STRATEGY
+
+    @property
+    def _daily_loss_action(self) -> str:
+        """What the daily loss limit does: always 'liquidate' outside
+        donchian_ensemble; DONCHIAN_DAILY_LOSS_ACTION in it (audit M-4)."""
+        if not self._target_mode:
+            return "liquidate"
+        action = self._settings.DONCHIAN_DAILY_LOSS_ACTION
+        return action if action in DAILY_LOSS_ACTIONS else "liquidate"
 
     @property
     def _timeframe(self) -> str:
@@ -292,6 +308,14 @@ class TradingOrchestrator:
             if price is not None:
                 prices[pair] = price
         self._executor.update_prices(prices)
+        self._last_cycle_prices = prices
+        stale = [p for p in self._settings.TRADING_PAIRS if p not in prices]
+        if stale:
+            logger.warning(
+                "No price this cycle for {}: valued at the last known price, "
+                "not traded",
+                ", ".join(stale),
+            )
 
         # Stops run before valuation and signals, and regardless of halts.
         await self._process_stops(market_data)
@@ -442,8 +466,6 @@ class TradingOrchestrator:
             )
             if s.EXCHANGE_SANDBOX:
                 exchange.set_sandbox_mode(True)
-
-            from trading_bot.execution.live_executor import LiveExecutor
 
             self._executor = LiveExecutor(exchange=exchange, pairs=s.TRADING_PAIRS)
         else:
@@ -1054,15 +1076,22 @@ class TradingOrchestrator:
     async def _execute_order(
         self, pair: str, side: str, quantity: float, price: float
     ) -> OrderResult:
-        """Send a market order via the executor."""
+        """Send a market order via the executor; persist any fill at once.
+
+        The fill changes the paper account or the live ledger: saving right
+        away keeps a crash before the end of the cycle from forgetting it.
+        """
         assert self._executor is not None
-        return await self._executor.place_order(
+        result = await self._executor.place_order(
             pair=pair,
             side=side,
             order_type="market",
             quantity=quantity,
             price=price,
         )
+        if result.filled_quantity > 0:
+            self._save_risk_state()
+        return result
 
     async def _report_fill(self, result: OrderResult, strategy: str) -> bool:
         """Log and notify a fill; False if nothing was filled."""
@@ -1190,6 +1219,9 @@ class TradingOrchestrator:
             self._stop_tracker.remove(pair)
             price = float(order.get("average") or order.get("price") or 0.0)
             qty = float(order.get("filled") or 0.0)
+            # The exchange sold the bot's coins: keep the ledger in step.
+            self._executor.record_external_fill(pair, "sell", qty)
+            self._save_risk_state()
             if self._journal is not None:
                 fee = order.get("fee")
                 await self._journal.record_exit(
@@ -1339,18 +1371,30 @@ class TradingOrchestrator:
 
         for pair, candle, delta in sorted(orders, key=lambda o: o[2]):
             try:
+                done = True
                 if delta < 0:
-                    await self._rebalance_sell(pair, -delta, prices[pair])
+                    done = await self._rebalance_sell(pair, -delta, prices[pair])
                 elif delta > 0:
-                    await self._rebalance_buy(pair, delta, prices[pair])
+                    done = await self._rebalance_buy(pair, delta, prices[pair])
             except Exception:
                 logger.exception("{}: rebalance order failed", pair)
                 if pair in self._cycle_decisions:
                     self._cycle_decisions[pair]["order_error"] = True
                 continue  # not marked: retried next cycle
+            if not done:
+                # An order went out and nothing filled (rejected, expired):
+                # leave the candle unmarked so the next hourly cycle retries.
+                logger.warning(
+                    "{}: rebalance order not filled — retrying next cycle", pair
+                )
+                if pair in self._cycle_decisions:
+                    self._cycle_decisions[pair]["unfilled"] = True
+                continue
             self._rebalanced[pair] = candle
-        self._save_risk_state()
+        # Decisions first: a crash before the state save only repeats the
+        # candle (parity keeps the last record), never loses its record.
         self._write_decisions()
+        self._save_risk_state()
 
     def _write_decisions(self) -> None:
         """Append this cycle's decisions; a logging failure never stops trading."""
@@ -1382,6 +1426,28 @@ class TradingOrchestrator:
         held_value = held * price
         sleeve = equity * allocation
         current = held_value / sleeve if sleeve > 0 else 0.0
+        candle = pd.Timestamp(ohlcv.index[-1]).isoformat()
+
+        if not target.ready and held_value > 0:
+            # Too little history is a data problem (truncated fetch, renamed
+            # symbol, longer lookbacks), not a signal: a target of 0 would
+            # liquidate the position. Hold it, alert, and retry next cycle.
+            await self._alert_not_ready(pair, candle, len(ohlcv))
+            self._cycle_decisions[pair] = {
+                "mode": str(s.BOT_MODE),
+                "pair": pair,
+                "candle": candle,
+                "decided_at": datetime.now(UTC).isoformat(),
+                "bars": len(ohlcv),
+                "ready": False,
+                "held_w": current,
+                "equity": equity,
+                "price": price,
+                "allocation": allocation,
+                "held_not_ready": True,
+                "fill": None,
+            }
+            return None
 
         multiplier, block_increase = ai_exposure_multiplier(
             self._build_ai_signals(pair, ohlcv),
@@ -1416,7 +1482,7 @@ class TradingOrchestrator:
         self._cycle_decisions[pair] = {
             "mode": str(s.BOT_MODE),
             "pair": pair,
-            "candle": pd.Timestamp(ohlcv.index[-1]).isoformat(),
+            "candle": candle,
             "decided_at": datetime.now(UTC).isoformat(),
             "bars": len(ohlcv),
             "ready": target.ready,
@@ -1446,6 +1512,22 @@ class TradingOrchestrator:
             return None
         return delta
 
+    async def _alert_not_ready(self, pair: str, candle: str, bars: int) -> None:
+        """Warn (and notify once per candle) that a held pair has no target."""
+        s = self._settings
+        needed = required_history(s.DONCHIAN_LOOKBACKS, s.DONCHIAN_VOL_WINDOW)
+        message = (
+            f"{pair}: position held but only {bars} daily candles were fetched "
+            f"(need {needed}). Not rebalancing: check the market data."
+        )
+        logger.error(message)
+        key = (pair, candle)
+        if key in self._not_ready_alerted:
+            return
+        self._not_ready_alerted.add(key)
+        if self._notifier is not None:
+            await self._notifier.send_alert(message, level="warning")
+
     def _log_target(self, pair: str, target: EnsembleTarget, bars: int) -> None:
         if not target.ready:
             logger.warning(
@@ -1469,18 +1551,22 @@ class TradingOrchestrator:
             {c.lookback: c.stop for c in target.channels if c.in_position},
         )
 
-    async def _rebalance_sell(self, pair: str, value: float, price: float) -> None:
+    async def _rebalance_sell(self, pair: str, value: float, price: float) -> bool:
+        """Sell ``value`` of ``pair``; False only if an order went unfilled."""
         assert self._executor is not None
         held = await self._executor.get_position(pair)
         quantity = held if value >= held * price else value / price
         quantity = await self._executor.tradable_amount(pair, quantity, price)
         if quantity <= 0:
             logger.info("{}: sell of ${:,.2f} below market minimum", pair, value)
-            return
-        await self._fill_rebalance(pair, "sell", quantity, price)
+            return True
+        return await self._fill_rebalance(pair, "sell", quantity, price)
 
-    async def _rebalance_buy(self, pair: str, value: float, price: float) -> None:
-        """Buy up to ``value``, or what the free quote cash affords."""
+    async def _rebalance_buy(self, pair: str, value: float, price: float) -> bool:
+        """Buy up to ``value``, or what the free quote cash affords.
+
+        False only if an order went out and nothing filled.
+        """
         assert self._executor is not None
         balance = await self._executor.get_balance()
         free = float(balance.get("free", balance.get("cash", 0.0)))
@@ -1495,12 +1581,13 @@ class TradingOrchestrator:
         quantity = await self._executor.tradable_amount(pair, spend / price, price)
         if quantity <= 0:
             logger.info("{}: buy of ${:,.2f} below market minimum", pair, spend)
-            return
-        await self._fill_rebalance(pair, "buy", quantity, price)
+            return True
+        return await self._fill_rebalance(pair, "buy", quantity, price)
 
     async def _fill_rebalance(
         self, pair: str, side: str, quantity: float, price: float
-    ) -> None:
+    ) -> bool:
+        """Send one rebalance order; True if anything filled."""
         assert self._executor is not None
         result = await self._execute_order(pair, side, quantity, price)
         if pair in self._cycle_decisions:
@@ -1513,13 +1600,14 @@ class TradingOrchestrator:
                 "at": result.timestamp.isoformat(),
             }
         if not await self._report_fill(result, DONCHIAN_STRATEGY):
-            return
+            return False
         if self._journal is not None:
             await self._journal.record_rebalance(
                 result,
                 strategy=DONCHIAN_STRATEGY,
                 position_after=await self._executor.get_position(pair),
             )
+        return True
 
     async def _drop_trade_stops(self) -> None:
         """donchian_ensemble exits through its channel stops, not per-trade
@@ -1547,23 +1635,49 @@ class TradingOrchestrator:
     # ------------------------------------------------------------------
 
     async def _handle_risk_trigger(self, state: TradingState) -> None:
-        """Liquidate and notify once, on entering DAILY_PAUSED or HALTED."""
+        """Act and notify once, on entering DAILY_PAUSED or HALTED.
+
+        HALTED always liquidates. DAILY_PAUSED liquidates too, except in
+        donchian_ensemble where DONCHIAN_DAILY_LOSS_ACTION decides (audit M-4):
+        ``block_increases`` sells nothing and ``halve`` sells half of each
+        position. In every case increases stay blocked until the next UTC day.
+        """
         assert self._executor is not None
         assert self._drawdown_monitor is not None
         reason = self._drawdown_monitor.halt_reason
+        action = (
+            "liquidate" if state == TradingState.HALTED else self._daily_loss_action
+        )
         if state == TradingState.HALTED:
             message = (
                 f"KILL SWITCH — {reason}. Emergency liquidation in progress. "
                 "Trading HALTED until manual reset (RISK_RESET=true)."
             )
-        else:
+        elif action == "liquidate":
             message = (
                 f"DAILY LOSS LIMIT — {reason}. Liquidating; new entries paused "
                 "until the next UTC day."
             )
+        elif action == "halve":
+            message = (
+                f"DAILY LOSS LIMIT — {reason}. Selling half of each position; "
+                "exposure may not increase until the next UTC day."
+            )
+        else:
+            message = (
+                f"DAILY LOSS LIMIT — {reason}. Not liquidating "
+                "(DONCHIAN_DAILY_LOSS_ACTION=block_increases): exposure may "
+                "only go down until the next UTC day."
+            )
         logger.warning(message)
         if self._notifier is not None:
             await self._notifier.send_alert(message, level="kill_switch")
+
+        if action == "halve":
+            await self._halve_positions()
+            return
+        if action != "liquidate":
+            return
         try:
             results = await self._executor.close_all_positions()
         finally:
@@ -1577,6 +1691,34 @@ class TradingOrchestrator:
                     await self._journal.record_exit(
                         result, strategy="risk_manager", reason=reason
                     )
+
+    async def _halve_positions(self) -> None:
+        """Sell half of every pair held (daily loss, ``halve`` policy)."""
+        assert self._executor is not None
+        for pair in self._settings.TRADING_PAIRS:
+            try:
+                held = await self._executor.get_position(pair)
+                price = self._last_cycle_prices.get(pair)
+                if held <= 0:
+                    continue
+                if not price:
+                    logger.warning("{}: no price this cycle — not halved", pair)
+                    continue
+                quantity = await self._executor.tradable_amount(pair, held / 2, price)
+                if quantity <= 0:
+                    logger.info("{}: half position below market minimum", pair)
+                    continue
+                result = await self._execute_order(pair, "sell", quantity, price)
+                if not await self._report_fill(result, "risk_manager"):
+                    continue
+                if self._journal is not None:
+                    await self._journal.record_rebalance(
+                        result,
+                        strategy="risk_manager",
+                        position_after=await self._executor.get_position(pair),
+                    )
+            except Exception:
+                logger.exception("{}: could not halve the position", pair)
 
     def _mode_path(self, template: str) -> Path:
         """State file path; "{mode}" keeps paper and live state apart."""
@@ -1606,7 +1748,9 @@ class TradingOrchestrator:
         if data is not None:
             try:
                 monitor = DrawdownMonitor.from_dict(
-                    data["drawdown"], settings=self._settings
+                    data["drawdown"],
+                    settings=self._settings,
+                    daily_loss_limit=self._daily_loss_action != "off",
                 )
                 tracker = StopTracker.from_dict(data.get("stops") or {})
                 self._rebalanced = {
@@ -1620,9 +1764,17 @@ class TradingOrchestrator:
                 monitor, tracker = None, StopTracker()
                 self._rebalanced = {}
 
+        ledger_bootstrapped = False
+        if isinstance(self._executor, LiveExecutor):
+            ledger_bootstrapped = await self._load_live_ledger(data, tracker)
+            # Valuation now counts only the bot's coins.
+            portfolio_value = (await self._executor.get_balance())["total"]
+
         if monitor is None:
             monitor = DrawdownMonitor(
-                initial_value=portfolio_value, settings=self._settings
+                initial_value=portfolio_value,
+                settings=self._settings,
+                daily_loss_limit=self._daily_loss_action != "off",
             )
             logger.info("Drawdown baseline: ${:,.2f}", portfolio_value)
         else:
@@ -1639,6 +1791,11 @@ class TradingOrchestrator:
                 monitor.rebaseline(portfolio_value)
                 # Its positions are gone too: rebalance today's candle again.
                 self._rebalanced = {}
+            if ledger_bootstrapped:
+                # The saved peak valued every coin in the account; the ledger
+                # values only the bot's. Keep the latch, re-anchor values so
+                # the difference is not read as a drawdown.
+                monitor.rebaseline(portfolio_value)
 
         if self._settings.RISK_RESET is True:
             logger.warning(
@@ -1653,6 +1810,69 @@ class TradingOrchestrator:
         self._stop_tracker = tracker
         await self._reconcile_stops(native_orders_cancelled=False)
         self._save_risk_state()
+
+    async def _load_live_ledger(
+        self, data: dict[str, object] | None, tracker: StopTracker
+    ) -> bool:
+        """Restore (or bootstrap) the live position ledger; True if bootstrapped.
+
+        Without a saved ledger the bot adopts what its saved stops cover, or
+        the whole balance of each pair with LIVE_ADOPT_EXISTING_BALANCE=true.
+        Either way the ledger is then clamped to the exchange balance, and
+        coins above it are reported as the owner's and left alone.
+        """
+        executor = self._executor
+        assert isinstance(executor, LiveExecutor)
+        saved = data.get("live_ledger") if data is not None else None
+        if saved is not None:
+            try:
+                if not isinstance(saved, dict):
+                    raise TypeError("live_ledger is not an object")
+                executor.restore(saved)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                logger.error(
+                    "Saved live ledger in {} is invalid — rebuilding it",
+                    self._risk_state_path(),
+                )
+                saved = None
+        if saved is None:
+            holdings = await executor.exchange_holdings()
+            if self._settings.LIVE_ADOPT_EXISTING_BALANCE is True:
+                owned = {p: q for p, q in holdings.items() if q > 0}
+                how = "whole balance (LIVE_ADOPT_EXISTING_BALANCE=true)"
+            else:
+                owned = {}
+                for pair in tracker.pairs():
+                    stop = tracker.get(pair)
+                    if stop is not None and pair in holdings:
+                        owned[pair] = min(stop.quantity, holdings[pair])
+                how = "quantities covered by saved stops"
+            orders = {
+                stop.order_id: pair
+                for pair in tracker.pairs()
+                if (stop := tracker.get(pair)) is not None and stop.order_id
+            }
+            executor.restore({"owned": owned, "orders": orders})
+            logger.warning(
+                "No live position ledger saved — adopted the {}: {}",
+                how,
+                {p: round(q, 8) for p, q in owned.items()} or "nothing",
+            )
+        else:
+            logger.info(
+                "Live position ledger restored: {}",
+                executor.to_dict()["owned"] or "flat",
+            )
+        for pair, qty in (await executor.reconcile()).items():
+            logger.warning(
+                "{}: {:.8f} held on the exchange is not in the bot's ledger — "
+                "ignored (not traded, valued or liquidated). To hand it to the "
+                "bot, start once with LIVE_ADOPT_EXISTING_BALANCE=true and an "
+                "empty state file.",
+                pair,
+                qty,
+            )
+        return saved is None
 
     def _restore_paper_account(self, snapshot: object) -> bool:
         """Restore the simulated account saved with the risk state."""
@@ -1694,6 +1914,8 @@ class TradingOrchestrator:
         # the stops and rebalanced candles saved next to it.
         if isinstance(self._executor, PaperExecutor):
             state["paper_account"] = self._executor.to_dict()
+        elif isinstance(self._executor, LiveExecutor):
+            state["live_ledger"] = self._executor.to_dict()
         try:
             self._risk_store.save(state)
         except Exception:

@@ -60,18 +60,30 @@ class Settings(BaseSettings):
     # pair's allocation); a target of 0 always closes. In the backtest 0.05
     # cut fills 3-5x vs 0 at a similar Sharpe; 0.10 lowered it (README).
     REBALANCE_THRESHOLD: float = Field(default=0.05, ge=0.0, lt=1.0)
+    # donchian_ensemble: what MAX_DAILY_LOSS_PCT does (the max drawdown HALT
+    # always liquidates). Liquidating mid-day and re-buying at the next daily
+    # rebalance is an intraday exit the strategy was never validated with
+    # (audit M-4), so by default the limit only blocks increases until the
+    # next UTC day; the channel stops remain the exits.
+    #   liquidate        sell everything (regime_selector always does this)
+    #   block_increases  sell nothing; exposure may only go down that day
+    #   halve            sell half of each position, then block increases
+    #   off              no daily limit in this mode
+    DONCHIAN_DAILY_LOSS_ACTION: Literal[
+        "liquidate", "block_increases", "halve", "off"
+    ] = "block_increases"
 
     # --- Orchestrator ---
     TRADING_TIMEFRAME: str = "1h"
-    TRADING_INTERVAL_MINUTES: int = 60
-    OHLCV_LOOKBACK_BARS: int = 250
+    TRADING_INTERVAL_MINUTES: int = Field(default=60, ge=1)
+    OHLCV_LOOKBACK_BARS: int = Field(default=250, ge=1)
     # Bounded retries (exponential backoff + jitter) and a total timeout per
     # OHLCV fetch, so an exchange outage cannot stall the trading cycle.
     OHLCV_FETCH_MAX_RETRIES: int = 5
     OHLCV_FETCH_TIMEOUT_S: float = 60.0
-    INITIAL_BALANCE: float = 100_000.0
-    PAPER_SLIPPAGE_PCT: float = 0.05
-    PAPER_FEE_PCT: float = 0.1
+    INITIAL_BALANCE: float = Field(default=100_000.0, gt=0.0)
+    PAPER_SLIPPAGE_PCT: float = Field(default=0.05, ge=0.0, lt=100.0)
+    PAPER_FEE_PCT: float = Field(default=0.1, ge=0.0, lt=100.0)
 
     # --- Risk Management ---
     # Sizing: quantity = min(risk budget / stop distance, position cap). The
@@ -80,10 +92,12 @@ class Settings(BaseSettings):
     # ~0.18 %, no volatility adjustment). See README "Tamaño de posición".
     # donchian_ensemble: MAX_POSITION_PCT is each pair's allocation instead
     # and MAX_RISK_PER_TRADE_PCT is unused.
-    MAX_RISK_PER_TRADE_PCT: float = 0.20
-    MAX_POSITION_PCT: float = 25.0
-    MAX_DRAWDOWN_PCT: float = 15.0
-    MAX_DAILY_LOSS_PCT: float = 3.0
+    # Percentages of the portfolio: a 0, negative or >100 value is a typo
+    # that would silently disable a limit or lever the account (spot only).
+    MAX_RISK_PER_TRADE_PCT: float = Field(default=0.20, gt=0.0, le=100.0)
+    MAX_POSITION_PCT: float = Field(default=25.0, gt=0.0, le=100.0)
+    MAX_DRAWDOWN_PCT: float = Field(default=15.0, gt=0.0, le=100.0)
+    MAX_DAILY_LOSS_PCT: float = Field(default=3.0, gt=0.0, le=100.0)
     # Persisted drawdown latch + stops. "{mode}" is replaced by BOT_MODE so a
     # paper session never overwrites the live halt state.
     RISK_STATE_PATH: str = "var/state/risk_state_{mode}.json"
@@ -91,6 +105,13 @@ class Settings(BaseSettings):
     DONCHIAN_DECISION_LOG_PATH: str = "var/state/donchian_decisions_{mode}.jsonl"
     # Manual reset of a max-drawdown HALT on startup. Remove after use.
     RISK_RESET: bool = False
+    # Live: the bot only trades what its position ledger says it bought (the
+    # account may hold the owner's coins). With no ledger saved yet (first
+    # live start, or upgrading from a version without one) true adopts the
+    # whole balance of each traded pair as the bot's; false (default) adopts
+    # only what its saved stops cover and ignores the rest. Ignored once a
+    # ledger exists.
+    LIVE_ADOPT_EXISTING_BALANCE: bool = False
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = ""
@@ -173,9 +194,9 @@ class Settings(BaseSettings):
     MEAN_REVERSION_ENTRIES: bool = False
 
     # --- Backtesting ---
-    BACKTEST_INITIAL_CAPITAL: float = 100_000.0
-    BACKTEST_FEE_PCT: float = 0.1
-    BACKTEST_SLIPPAGE_PCT: float = 0.05
+    BACKTEST_INITIAL_CAPITAL: float = Field(default=100_000.0, gt=0.0)
+    BACKTEST_FEE_PCT: float = Field(default=0.1, ge=0.0, lt=100.0)
+    BACKTEST_SLIPPAGE_PCT: float = Field(default=0.05, ge=0.0, lt=100.0)
     BACKTEST_WALK_FORWARD_SPLITS: int = 5
     # Warm-up share before the first OOS fold (scripts/run_backtest.py default).
     BACKTEST_WALK_FORWARD_TRAIN_RATIO: float = 0.6

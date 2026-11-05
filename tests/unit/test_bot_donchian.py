@@ -153,15 +153,47 @@ class TestTargetRebalancing:
         executor.place_order.assert_not_awaited()
         assert await executor.get_position(PAIR) == held
 
-    async def test_insufficient_history_targets_zero(self, tmp_path):
+    async def test_insufficient_history_holds_position_and_alerts(self, tmp_path):
+        # Too little history is a data problem, not a sell signal (audit M-1).
         short = _daily(n=400)
         executor = _paper()
         await executor.place_order(PAIR, "buy", "market", 0.5, 20_000.0)
         orch = _orchestrator(tmp_path, short, executor)
+        orch._notifier = AsyncMock()
 
         await orch.run_trading_cycle()
+        await orch.run_trading_cycle()
 
-        assert await executor.get_position(PAIR) == 0.0
+        assert await executor.get_position(PAIR) == 0.5
+        assert PAIR not in orch._rebalanced  # retried next cycle
+        orch._notifier.send_alert.assert_awaited_once()  # once per candle
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "decisions_paper.jsonl").read_text().splitlines()
+        ]
+        assert records[-1]["held_not_ready"] is True
+
+    async def test_unfilled_order_is_retried_next_cycle(self, tmp_path):
+        # A rejected/expired order must not mark the candle done (audit H-2).
+        executor = _paper()
+        real_place = executor.place_order
+        rejected = PaperExecutor._rejected(PAIR, "buy", 0.0)
+        executor.place_order = AsyncMock(return_value=rejected)
+        orch = _orchestrator(tmp_path, _daily(), executor)
+
+        await orch.run_trading_cycle()
+        assert PAIR not in orch._rebalanced
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "decisions_paper.jsonl").read_text().splitlines()
+        ]
+        assert records[-1]["unfilled"] is True
+
+        executor.place_order = AsyncMock(wraps=real_place)
+        await orch.run_trading_cycle()
+        executor.place_order.assert_awaited_once()
+        assert PAIR in orch._rebalanced
+        assert await executor.get_position(PAIR) > 0
 
     async def test_no_history_and_flat_places_nothing(self, tmp_path):
         executor = _paper()
@@ -550,3 +582,62 @@ async def test_journal_keeps_memory_in_sync_when_db_write_fails(journal_db):  # 
 
     after = journal._open[PAIR]
     assert (after.entry_price, after.quantity) == snapshot
+
+
+class TestDailyLossPolicy:
+    """DONCHIAN_DAILY_LOSS_ACTION (audit M-4): the daily limit must not force
+    an intraday exit the strategy was never validated with, unless asked."""
+
+    async def _paused_cycle(self, tmp_path, action: str):
+        ohlcv = _daily()
+        price = float(ohlcv["close"].iloc[-1])
+        executor = _paper()
+        await executor.place_order(PAIR, "buy", "market", 20_000 / price, price)
+        orch = _orchestrator(
+            tmp_path, ohlcv, executor, DONCHIAN_DAILY_LOSS_ACTION=action
+        )
+        orch._notifier = AsyncMock()
+        # Day started 3.4 % higher; peak equal, so only the daily limit fires.
+        orch._drawdown_monitor = DrawdownMonitor(initial_value=103_500.0)
+        held = await executor.get_position(PAIR)
+        await orch.run_trading_cycle()
+        return orch, executor, held
+
+    async def test_block_increases_sells_nothing(self, tmp_path):
+        orch, executor, held = await self._paused_cycle(tmp_path, "block_increases")
+        assert orch._drawdown_monitor.state == TradingState.DAILY_PAUSED
+        assert await executor.get_position(PAIR) == pytest.approx(held)
+        assert "Not liquidating" in orch._notifier.send_alert.call_args.args[0]
+
+    async def test_liquidate_sells_everything(self, tmp_path):
+        orch, executor, _ = await self._paused_cycle(tmp_path, "liquidate")
+        assert orch._drawdown_monitor.state == TradingState.DAILY_PAUSED
+        assert await executor.get_position(PAIR) == 0.0
+
+    async def test_halve_sells_half(self, tmp_path):
+        orch, executor, held = await self._paused_cycle(tmp_path, "halve")
+        assert orch._drawdown_monitor.state == TradingState.DAILY_PAUSED
+        assert await executor.get_position(PAIR) == pytest.approx(held / 2)
+
+    async def test_paused_day_never_raises_exposure(self, tmp_path):
+        orch, executor, held = await self._paused_cycle(tmp_path, "block_increases")
+        orch._rebalanced = {}  # force a new rebalance the same day
+        await orch.run_trading_cycle()
+        assert await executor.get_position(PAIR) <= held + 1e-12
+
+    async def test_off_disables_the_daily_limit(self, tmp_path):
+        orch = _orchestrator(tmp_path, _daily(), DONCHIAN_DAILY_LOSS_ACTION="off")
+        await orch._load_risk_state(100_000.0)
+        assert orch._drawdown_monitor.update(96_000.0) is None  # -4 % in a day
+        assert orch._drawdown_monitor.state == TradingState.ACTIVE
+        # The max drawdown HALT still applies.
+        assert orch._drawdown_monitor.update(80_000.0) == TradingState.HALTED
+
+    def test_regime_selector_always_liquidates(self, tmp_path):
+        orch = _orchestrator(
+            tmp_path,
+            _daily(),
+            STRATEGY_MODE="regime_selector",
+            DONCHIAN_DAILY_LOSS_ACTION="block_increases",
+        )
+        assert orch._daily_loss_action == "liquidate"

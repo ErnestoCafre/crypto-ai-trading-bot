@@ -72,7 +72,7 @@ def _print(report: ParityReport) -> None:
     for r in report.rows:
         print(
             f"{r.pair:<10} {r.candle.date().isoformat():<10} "
-            f"{r.bot_target:>7.3f} {_fmt(r.ref_target, '>7.3f')} "
+            f"{_fmt(r.bot_target, '>7.3f')} {_fmt(r.ref_target, '>7.3f')} "
             f"{_fmt(r.target_gap, '>9.2e')} {r.lag_min:>7.0f} "
             f"{r.fill_side or '-':>4} {_fmt(r.fill_price, '>12.4f')} "
             f"{_fmt(r.next_open, '>12.4f')} {_fmt(r.slippage_pct, '>7.3f')} "
