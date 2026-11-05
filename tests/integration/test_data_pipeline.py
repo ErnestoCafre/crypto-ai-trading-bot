@@ -117,13 +117,24 @@ class TestCCXTIntegration:
     @pytest.mark.asyncio
     @pytest.mark.slow
     async def test_fetch_small_ohlcv(self) -> None:
-        """Fetch 10 candles from Binance (real network call)."""
+        """Fetch 10 candles from Binance (real network call).
+
+        Skipped, not failed, when Binance is unreachable (sandboxed CI,
+        egress proxy, geo-block): that says nothing about the code.
+        """
+        import ccxt.async_support as ccxt_async
+
         from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 
         since = datetime.now(UTC) - timedelta(hours=12)
 
-        async with CCXTFetcher(exchange_id="binance", sandbox=False) as fetcher:
-            df = await fetcher.fetch_ohlcv("BTC/USDT", "1h", since=since, limit=10)
+        try:
+            async with CCXTFetcher(
+                exchange_id="binance", sandbox=False, max_retries=1
+            ) as fetcher:
+                df = await fetcher.fetch_ohlcv("BTC/USDT", "1h", since=since, limit=10)
+        except ccxt_async.NetworkError as exc:  # incl. ExchangeNotAvailable
+            pytest.skip(f"Binance unreachable: {type(exc).__name__}")
 
         assert isinstance(df, pd.DataFrame)
         assert len(df) <= 10
