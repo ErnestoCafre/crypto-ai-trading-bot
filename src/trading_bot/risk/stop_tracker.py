@@ -82,13 +82,16 @@ class StopTracker:
             closed = closed[closed.index > pd.Timestamp(stop.last_checked)]
         if closed.empty:
             return None
-        stop.last_checked = closed.index[-1].isoformat()
 
         for bar_open, bar_low in zip(closed["open"], closed["low"], strict=True):
+            # A hit leaves ``last_checked`` alone: until the exit fills and the
+            # stop is removed, the same candle triggers again next cycle (a
+            # failed sell must not leave the position unprotected).
             if bar_open <= stop.stop_price:
                 return float(bar_open)
             if bar_low <= stop.stop_price:
                 return stop.stop_price
+        stop.last_checked = closed.index[-1].isoformat()
         return None
 
     def to_dict(self) -> dict[str, dict[str, Any]]:

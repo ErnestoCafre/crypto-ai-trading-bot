@@ -1020,6 +1020,28 @@ class TestStopLoss:
         assert "STOP-LOSS" in orch._notifier.send_alert.call_args.args[0]
 
     @pytest.mark.asyncio
+    async def test_failed_stop_exit_is_retried_next_cycle(self):
+        # A rebound after a failed exit must not leave the stop unfired (M-3).
+        ohlcv = _flat_ohlcv()
+        ohlcv.iloc[-2, ohlcv.columns.get_loc("low")] = 47_500.0
+        orch = self._orch(ohlcv)
+        orch._executor = await _paper_with_btc()
+        orch._stop_tracker.register(
+            "BTC/USDT", 48_000.0, 1.0, None, entry_candle=ohlcv.index[-5]
+        )
+        real_place = orch._executor.place_order
+        orch._executor.place_order = AsyncMock(side_effect=ConnectionError("down"))
+
+        await orch.run_trading_cycle()
+        assert await orch._executor.get_position("BTC/USDT") == 1.0
+        assert "BTC/USDT" in orch._stop_tracker
+
+        orch._executor.place_order = real_place
+        await orch.run_trading_cycle()
+        assert await orch._executor.get_position("BTC/USDT") == 0.0
+        assert "BTC/USDT" not in orch._stop_tracker
+
+    @pytest.mark.asyncio
     async def test_paper_gap_below_stop_sells_at_open(self):
         ohlcv = _flat_ohlcv()
         ohlcv.iloc[-2, ohlcv.columns.get_loc("open")] = 46_000.0
