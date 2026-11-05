@@ -26,7 +26,11 @@ from typing import Any
 
 from trading_bot.ai.prediction.feature_engine import PrecomputedFeatureEngine
 from trading_bot.backtest.engine import BacktestEngine
-from trading_bot.backtest.target_engine import Execution, TargetExposureEngine
+from trading_bot.backtest.target_engine import (
+    DailyLossAction,
+    Execution,
+    TargetExposureEngine,
+)
 from trading_bot.config.settings import Settings, get_settings
 from trading_bot.core.regime import RegimeDetector
 from trading_bot.core.signal_combiner import SignalCombiner
@@ -122,14 +126,19 @@ def build_target_engine(
     rebalance_threshold: float | None = None,
     execution: Execution = "next_open",
     min_history: int | None = None,
+    kill_switch: bool = True,
+    daily_loss_action: DailyLossAction | None = None,
 ) -> TargetExposureEngine:
     """TargetExposureEngine configured like the donchian_ensemble bot.
 
     ``allocation`` defaults to MAX_POSITION_PCT (each pair's share of the
     portfolio); pass 1.0 to backtest one pair as a full sleeve.
     ``min_history=None`` keeps the live warm-up (longest channel + vol window).
+    ``kill_switch`` simulates MAX_DRAWDOWN_PCT and MAX_DAILY_LOSS_PCT with
+    DONCHIAN_DAILY_LOSS_ACTION (or ``daily_loss_action``), as the bot does.
     """
     s = settings or get_settings()
+    action = daily_loss_action or s.DONCHIAN_DAILY_LOSS_ACTION
     return TargetExposureEngine(
         lookbacks=s.DONCHIAN_LOOKBACKS,
         vol_target=s.DONCHIAN_VOL_TARGET,
@@ -145,4 +154,7 @@ def build_target_engine(
         slippage_pct=slippage_pct,
         execution=execution,
         min_history=min_history,
+        max_drawdown_pct=s.MAX_DRAWDOWN_PCT if kill_switch else None,
+        max_daily_loss_pct=s.MAX_DAILY_LOSS_PCT if kill_switch else None,
+        daily_loss_action=action,
     )

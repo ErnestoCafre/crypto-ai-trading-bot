@@ -17,7 +17,19 @@ Execution (``execution``):
 
 Costs: slippage moves the fill price against the order and the fee is a
 percentage of the filled notional, per side, on the traded amount only.
-Not simulated: AI sources, the drawdown kill-switch and exchange minimums.
+
+Kill-switch (optional, ``max_drawdown_pct`` / ``max_daily_loss_pct``): the
+live bot values the portfolio every hour and reacts when it falls
+``max_daily_loss_pct`` below the day's first valuation (daily limit, action
+``daily_loss_action``) or ``max_drawdown_pct`` below its peak (HALT: liquidate
+and never raise exposure again). With daily bars the intraday path is
+approximated: every held pair moves linearly from its open to its low, and
+a limit fires at the first point of that path where the portfolio crosses
+it; sells fill there. The day starts at the open valuation and the peak is
+tracked on open and close valuations. This is pessimistic (all lows at the
+same moment, continuous rather than hourly checks) on purpose.
+
+Not simulated: AI sources and exchange minimums.
 """
 
 from __future__ import annotations
@@ -43,6 +55,10 @@ from trading_bot.core.strategies.donchian_ensemble import (
 
 STRATEGY_NAME = "donchian_ensemble"
 Execution = Literal["next_open", "close"]
+DailyLossAction = Literal["liquidate", "block_increases", "halve", "off"]
+DAILY_LOSS_ACTIONS: tuple[str, ...] = ("liquidate", "block_increases", "halve", "off")
+# Share of each position a daily-loss action sells.
+_DAILY_SELL_SHARE = {"liquidate": 1.0, "halve": 0.5}
 
 # Share of a lot below which a sell is treated as closing it (float residue).
 _EPSILON = 1e-12
@@ -59,6 +75,8 @@ class TargetExposureResult:
     traded_notional: pd.Series  # per day, all pairs
     fees: float
     parameters: dict[str, object] = field(default_factory=dict)
+    # Kill-switch events: (day, "daily_<action>" | "halted").
+    risk_events: list[tuple[pd.Timestamp, str]] = field(default_factory=list)
 
     def metrics(
         self,
@@ -93,6 +111,9 @@ class TargetExposureResult:
         sells = [t for t in self.trades if days[0] <= t.exit_time <= days[-1]]
         out["sell_fills"] = float(len(sells))
         out["fills"] = float((self.traded_notional.loc[days] > 0).sum())
+        events = [kind for ts, kind in self.risk_events if days[0] <= ts <= days[-1]]
+        out["daily_loss_events"] = float(sum(k.startswith("daily") for k in events))
+        out["halted"] = float("halted" in events)
         return out
 
 
@@ -111,6 +132,9 @@ class TargetExposureEngine:
         slippage_pct: float = 0.05,
         execution: Execution = "next_open",
         min_history: int | None = None,
+        max_drawdown_pct: float | None = None,
+        max_daily_loss_pct: float | None = None,
+        daily_loss_action: DailyLossAction = "liquidate",
     ) -> None:
         if not 0 < allocation <= 1:
             raise ValueError("allocation must be in (0, 1]")
@@ -118,6 +142,21 @@ class TargetExposureEngine:
             raise ValueError("rebalance_threshold must be >= 0")
         if execution not in ("next_open", "close"):
             raise ValueError(f"unknown execution {execution!r}")
+        if daily_loss_action not in DAILY_LOSS_ACTIONS:
+            raise ValueError(f"unknown daily_loss_action {daily_loss_action!r}")
+        for name, pct in (
+            ("max_drawdown_pct", max_drawdown_pct),
+            ("max_daily_loss_pct", max_daily_loss_pct),
+        ):
+            if pct is not None and not 0 < pct <= 100:
+                raise ValueError(f"{name} must be in (0, 100]")
+        self._max_dd = None if max_drawdown_pct is None else max_drawdown_pct / 100
+        self._max_daily = (
+            None
+            if max_daily_loss_pct is None or daily_loss_action == "off"
+            else max_daily_loss_pct / 100
+        )
+        self._daily_action: DailyLossAction = daily_loss_action
         self._lookbacks = tuple(lookbacks)
         self._vol_target = vol_target
         self._vol_window = vol_window
@@ -163,7 +202,7 @@ class TargetExposureEngine:
                 {p: data[p][col].astype(float) for p in pairs}, index=index
             )
 
-        opens, closes = aligned("open"), aligned("close")
+        opens, closes, lows = aligned("open"), aligned("close"), aligned("low")
         decided = pd.DataFrame({p: self.targets(data[p]) for p in pairs}, index=index)
         # A day without a bar for a pair decides nothing for it: the live bot
         # has no new closed candle and leaves the pair alone. Filling it with
@@ -174,22 +213,42 @@ class TargetExposureEngine:
         marks = closes.ffill()
 
         book = _Book(pairs, self._capital, self._fee, self._slip)
+        risk = _RiskState(peak=self._capital) if self._risk_enabled else None
         equity = np.empty(len(index))
         held_w = np.zeros((len(index), len(pairs)))
         notional = np.zeros(len(index))
 
         for i, ts in enumerate(index):
+            # The day opens at the open (or the last mark without a bar).
+            prev_marks = marks.iloc[i - 1] if i > 0 else closes.iloc[i]
+            day_open = opens.iloc[i].where(opens.iloc[i].notna(), prev_marks)
+            day_low = lows.iloc[i].where(lows.iloc[i].notna(), day_open)
+            if risk is not None:
+                risk.start_day(book.equity(day_open))
             if self._execution == "next_open" and i > 0:
-                prices = opens.iloc[i].where(opens.iloc[i].notna(), marks.iloc[i - 1])
                 tradable = opens.iloc[i].notna() & known.iloc[i - 1]
                 notional[i] += self._rebalance(
-                    book, targets.iloc[i - 1], prices, tradable, ts
+                    book,
+                    targets.iloc[i - 1],
+                    day_open,
+                    tradable,
+                    ts,
+                    allow_increase=risk is None or not risk.halted,
                 )
+            if risk is not None:
+                notional[i] += self._intraday_risk(book, risk, day_open, day_low, ts)
             if self._execution == "close":
                 notional[i] += self._rebalance(
-                    book, targets.iloc[i], marks.iloc[i], closes.iloc[i].notna(), ts
+                    book,
+                    targets.iloc[i],
+                    marks.iloc[i],
+                    closes.iloc[i].notna(),
+                    ts,
+                    allow_increase=risk is None or not (risk.halted or risk.paused),
                 )
             value = book.equity(marks.iloc[i])
+            if risk is not None:
+                risk.peak = max(risk.peak, value)
             equity[i] = value
             for j, p in enumerate(pairs):
                 px = marks.iloc[i][p]
@@ -203,6 +262,7 @@ class TargetExposureEngine:
             trades=book.trades,
             traded_notional=pd.Series(notional, index=index),
             fees=book.fees,
+            risk_events=list(risk.events) if risk is not None else [],
             parameters={
                 "strategy": STRATEGY_NAME,
                 "pairs": pairs,
@@ -215,8 +275,60 @@ class TargetExposureEngine:
                 "slippage_pct": self._slip * 100,
                 "execution": self._execution,
                 "min_history": self._min_history,
+                "max_drawdown_pct": None
+                if self._max_dd is None
+                else self._max_dd * 100,
+                "max_daily_loss_pct": (
+                    None if self._max_daily is None else self._max_daily * 100
+                ),
+                "daily_loss_action": self._daily_action,
             },
         )
+
+    @property
+    def _risk_enabled(self) -> bool:
+        return self._max_dd is not None or self._max_daily is not None
+
+    def _intraday_risk(
+        self,
+        book: _Book,
+        risk: _RiskState,
+        day_open: pd.Series,
+        day_low: pd.Series,
+        ts: pd.Timestamp,
+    ) -> float:
+        """Fire the limits crossed on the open→low path; returns notional sold."""
+        limits: list[tuple[str, float]] = []
+        if self._max_daily is not None and not risk.paused:
+            limits.append(("daily", risk.day_start * (1 - self._max_daily)))
+        if self._max_dd is not None and not risk.halted:
+            limits.append(("drawdown", risk.peak * (1 - self._max_dd)))
+        traded = 0.0
+        when = ts.to_pydatetime()
+        reached = 0.0  # position on the path already walked, in [0, 1]
+        while limits and not risk.halted:
+            hits = [
+                (f, kind)
+                for kind, level in limits
+                if (f := _crossing(book, day_open, day_low, level, reached)) is not None
+            ]
+            if not hits:
+                break
+            # Earliest first; on a tie the HALT wins (it liquidates anyway).
+            reached, kind = min(hits, key=lambda h: (h[0], h[1] != "drawdown"))
+            limits = [(k, lv) for k, lv in limits if k != kind]
+            prices = day_open + reached * (day_low - day_open)
+            if kind == "drawdown":
+                traded += book.sell_share(1.0, prices, when, "kill_switch")
+                risk.halted = True
+                risk.events.append((ts, "halted"))
+            else:
+                risk.paused = True
+                risk.events.append((ts, f"daily_{self._daily_action}"))
+                share = _DAILY_SELL_SHARE.get(self._daily_action, 0.0)
+                if share:
+                    traded += book.sell_share(share, prices, when, "daily_loss_limit")
+        return traded
 
     def _rebalance(
         self,
@@ -225,8 +337,12 @@ class TargetExposureEngine:
         prices: pd.Series,
         tradable: pd.Series,
         ts: pd.Timestamp,
+        allow_increase: bool = True,
     ) -> float:
-        """Trade every pair towards its target; returns the notional traded."""
+        """Trade every pair towards its target; returns the notional traded.
+
+        With ``allow_increase=False`` (kill-switch engaged) only sells run.
+        """
         equity = book.equity(prices)
         if equity <= 0:
             return 0.0
@@ -242,7 +358,7 @@ class TargetExposureEngine:
                 allocation=self._allocation,
                 threshold=self._threshold,
             )
-            if delta != 0.0:
+            if delta < 0 or (delta > 0 and allow_increase):
                 orders[pair] = delta
         traded = 0.0
         when = ts.to_pydatetime()
@@ -255,6 +371,49 @@ class TargetExposureEngine:
             else:
                 traded += book.buy(pair, delta / px, px, when)
         return traded
+
+
+@dataclass
+class _RiskState:
+    """Kill-switch state across the simulated days."""
+
+    peak: float
+    day_start: float = 0.0
+    paused: bool = False  # daily limit hit today
+    halted: bool = False  # max drawdown hit: latched
+    events: list[tuple[pd.Timestamp, str]] = field(default_factory=list)
+
+    def start_day(self, value: float) -> None:
+        self.day_start = value
+        self.paused = False
+        self.peak = max(self.peak, value)
+
+
+def _crossing(
+    book: _Book,
+    day_open: pd.Series,
+    day_low: pd.Series,
+    level: float,
+    start: float,
+) -> float | None:
+    """First f in [start, 1] where the portfolio on the open→low path is at
+    or below ``level``; None if it never gets there.
+
+    Value(f) = cash + sum(qty x (open + f x (low - open))): linear in f.
+    """
+    at_open = book.cash
+    drop = 0.0
+    for pair, qty in book.qty.items():
+        if qty <= 0 or pd.isna(day_open[pair]):
+            continue
+        at_open += qty * float(day_open[pair])
+        drop += qty * float(day_open[pair] - day_low[pair])
+    if at_open - start * drop <= level:
+        return start
+    if drop <= 0:
+        return None
+    f = (at_open - level) / drop
+    return f if f <= 1.0 else None
 
 
 @dataclass
@@ -308,7 +467,27 @@ class _Book:
         self.fees += fee
         return cost
 
-    def sell(self, pair: str, qty: float, price: float, when: datetime) -> float:
+    def sell_share(
+        self, share: float, prices: pd.Series, when: datetime, reason: str
+    ) -> float:
+        """Sell ``share`` of every position at ``prices``; returns proceeds."""
+        traded = 0.0
+        for pair, lot in self._lots.items():
+            px = prices[pair]
+            if lot.qty <= 0 or pd.isna(px) or px <= 0:
+                continue
+            qty = lot.qty if share >= 1.0 else lot.qty * share
+            traded += self.sell(pair, qty, float(px), when, reason)
+        return traded
+
+    def sell(
+        self,
+        pair: str,
+        qty: float,
+        price: float,
+        when: datetime,
+        reason: str | None = None,
+    ) -> float:
         lot = self._lots[pair]
         qty = min(qty, lot.qty)
         if qty <= 0:
@@ -335,7 +514,7 @@ class _Book:
                 pnl_pct=pnl / (lot.avg_price * qty) * 100 if lot.avg_price else 0.0,
                 fees=fee + entry_fee,
                 slippage=price * self._slip * qty,
-                exit_reason="exit" if closing else "rebalance",
+                exit_reason=reason or ("exit" if closing else "rebalance"),
             )
         )
         self.cash += proceeds - fee

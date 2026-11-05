@@ -162,3 +162,136 @@ class TestPortfolio:
             TargetExposureEngine(rebalance_threshold=-0.1)
         with pytest.raises(ValueError):
             TargetExposureEngine(execution="vwap")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch simulation (audit M-4)
+# ---------------------------------------------------------------------------
+
+CRASH_DAY = 20
+
+
+def _trend_with_crash(n: int = 30, dip: float = 0.10) -> pd.DataFrame:
+    """Steady uptrend (fully invested) with one day whose low dips ``dip``
+    below its open and closes back up."""
+    close = 100 * 1.01 ** np.arange(n)
+    open_ = np.concatenate([[100.0], close[:-1]])
+    low = np.minimum(open_, close) * 0.999
+    low[CRASH_DAY] = open_[CRASH_DAY] * (1 - dip)
+    index = pd.date_range("2024-01-01", periods=n, freq="1D", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": close, "low": low, "close": close, "volume": 1.0},
+        index=index,
+    )
+
+
+def _risk_engine(**kwargs) -> TargetExposureEngine:
+    return TargetExposureEngine(
+        lookbacks=(2,),
+        vol_target=0.0,  # falsy: no volatility scaling, w = 1 in the trend
+        vol_window=2,
+        min_history=0,
+        rebalance_threshold=0.0,
+        fee_pct=0.0,
+        slippage_pct=0.0,
+        **kwargs,
+    )
+
+
+class TestKillSwitchSimulation:
+    def _run(self, **kwargs):
+        df = _trend_with_crash()
+        res = _risk_engine(**kwargs).run({"X/USDT": df})
+        return df, res, df.index[CRASH_DAY]
+
+    def test_disabled_by_default(self) -> None:
+        _, res, day = self._run()
+        assert res.risk_events == []
+        assert res.exposure.loc[day, "X/USDT"] > 0.99
+
+    def test_liquidate_sells_where_the_limit_is_crossed(self) -> None:
+        df, res, day = self._run(max_daily_loss_pct=3.0, daily_loss_action="liquidate")
+        assert res.risk_events == [(day, "daily_liquidate")]
+        assert res.exposure.loc[day, "X/USDT"] == 0.0
+        sell = next(t for t in res.trades if t.exit_reason == "daily_loss_limit")
+        # Fully invested: the portfolio is 3 % down when the price is 3 % down.
+        assert sell.exit_price == pytest.approx(df["open"].iloc[CRASH_DAY] * 0.97)
+        # The next open rebuys: the strategy still wants full exposure.
+        assert res.exposure.iloc[CRASH_DAY + 1]["X/USDT"] > 0.99
+
+    def test_block_increases_keeps_the_position(self) -> None:
+        _, res, day = self._run(
+            max_daily_loss_pct=3.0, daily_loss_action="block_increases"
+        )
+        assert res.risk_events == [(day, "daily_block_increases")]
+        assert res.exposure.loc[day, "X/USDT"] > 0.99
+
+    def test_halve_sells_half(self) -> None:
+        _, res, day = self._run(max_daily_loss_pct=3.0, daily_loss_action="halve")
+        assert res.risk_events == [(day, "daily_halve")]
+        assert res.exposure.loc[day, "X/USDT"] == pytest.approx(0.5, abs=0.02)
+
+    def test_off_ignores_the_daily_limit(self) -> None:
+        _, res, _ = self._run(max_daily_loss_pct=3.0, daily_loss_action="off")
+        assert res.risk_events == []
+
+    def test_drawdown_halts_for_good(self) -> None:
+        df, res, day = self._run(
+            max_daily_loss_pct=3.0,
+            max_drawdown_pct=5.0,
+            daily_loss_action="block_increases",
+        )
+        # Same path: the daily limit at -3 %, then the HALT at -5 %.
+        assert res.risk_events == [(day, "daily_block_increases"), (day, "halted")]
+        sell = next(t for t in res.trades if t.exit_reason == "kill_switch")
+        assert sell.exit_price == pytest.approx(df["open"].iloc[CRASH_DAY] * 0.95)
+        assert (res.exposure.iloc[CRASH_DAY:]["X/USDT"] == 0.0).all()  # no re-entry
+        assert res.metrics()["halted"] == 1.0
+
+    def test_liquidation_first_leaves_nothing_to_halt(self) -> None:
+        _, res, day = self._run(
+            max_daily_loss_pct=3.0, max_drawdown_pct=5.0, daily_loss_action="liquidate"
+        )
+        assert res.risk_events == [(day, "daily_liquidate")]
+
+    def test_shallow_dip_triggers_nothing(self) -> None:
+        df = _trend_with_crash(dip=0.02)
+        res = _risk_engine(max_daily_loss_pct=3.0, max_drawdown_pct=5.0).run({"X": df})
+        assert res.risk_events == []
+
+    def test_metrics_count_events_in_the_window(self) -> None:
+        _, res, day = self._run(max_daily_loss_pct=3.0, daily_loss_action="halve")
+        assert res.metrics()["daily_loss_events"] == 1.0
+        assert (
+            res.metrics(start=day + pd.Timedelta(1, unit="D"))["daily_loss_events"]
+            == 0.0
+        )
+
+    def test_rejects_bad_risk_parameters(self) -> None:
+        with pytest.raises(ValueError):
+            TargetExposureEngine(max_daily_loss_pct=0.0)
+        with pytest.raises(ValueError):
+            TargetExposureEngine(max_drawdown_pct=150.0)
+        with pytest.raises(ValueError):
+            TargetExposureEngine(daily_loss_action="panic")  # type: ignore[arg-type]
+
+
+def test_pipeline_simulates_the_bots_kill_switch(monkeypatch) -> None:
+    from trading_bot.backtest.pipeline import build_target_engine
+    from trading_bot.config.settings import Settings
+
+    for key in Settings.model_fields:
+        monkeypatch.delenv(key, raising=False)
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    params = (
+        build_target_engine(settings=settings)
+        .run({"X": _trend_with_crash()})
+        .parameters
+    )
+    assert params["max_drawdown_pct"] == settings.MAX_DRAWDOWN_PCT
+    assert params["max_daily_loss_pct"] == settings.MAX_DAILY_LOSS_PCT
+    assert params["daily_loss_action"] == "block_increases"
+
+    off = build_target_engine(settings=settings, kill_switch=False)
+    params = off.run({"X": _trend_with_crash()}).parameters
+    assert params["max_drawdown_pct"] is None and params["max_daily_loss_pct"] is None

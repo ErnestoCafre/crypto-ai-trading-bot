@@ -14,6 +14,12 @@ Usage:
     uv run python scripts/run_backtest.py --max-risk-pct 0.25 --max-position-pct 25
     uv run python scripts/run_backtest.py --strategy-mode donchian_ensemble \
         --pairs BTC/USDT,ETH/USDT,SOL/USDT --holdout-start 2024-01-01
+    # compare the daily-loss policies (audit M-4) on the portfolio
+    uv run python scripts/run_backtest.py --strategy-mode donchian_ensemble \
+        --compare-daily-loss --holdout-start 2024-01-01
+
+donchian_ensemble simulates the kill-switch like the bot (MAX_DRAWDOWN_PCT,
+MAX_DAILY_LOSS_PCT, DONCHIAN_DAILY_LOSS_ACTION) unless --no-kill-switch.
 """
 
 from __future__ import annotations
@@ -22,13 +28,18 @@ import argparse
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 
 from trading_bot.backtest.metrics import infer_periods_per_year
 from trading_bot.backtest.pipeline import build_live_engine, build_target_engine
 from trading_bot.backtest.report import BacktestReporter
-from trading_bot.backtest.target_engine import TargetExposureEngine
+from trading_bot.backtest.target_engine import (
+    DAILY_LOSS_ACTIONS,
+    DailyLossAction,
+    TargetExposureEngine,
+)
 from trading_bot.backtest.walk_forward import WalkForwardValidator
 from trading_bot.config import get_settings
 from trading_bot.config.settings import Settings
@@ -105,6 +116,22 @@ def main() -> None:
         "--holdout-start",
         default=None,
         help="donchian_ensemble: also report before/after this date",
+    )
+    parser.add_argument(
+        "--daily-loss-action",
+        choices=list(DAILY_LOSS_ACTIONS),
+        default=None,
+        help="donchian_ensemble: DONCHIAN_DAILY_LOSS_ACTION",
+    )
+    parser.add_argument(
+        "--no-kill-switch",
+        action="store_true",
+        help="donchian_ensemble: do not simulate the drawdown/daily limits",
+    )
+    parser.add_argument(
+        "--compare-daily-loss",
+        action="store_true",
+        help="donchian_ensemble: portfolio under every daily-loss policy",
     )
     args = parser.parse_args()
 
@@ -204,7 +231,21 @@ def _run_donchian(args: argparse.Namespace, settings: Settings) -> None:
             ("holdout", str(cut), None),
         ]
 
-    def build(allocation: float) -> TargetExposureEngine:
+    action = args.daily_loss_action or settings.DONCHIAN_DAILY_LOSS_ACTION
+    kill_switch = not args.no_kill_switch
+    print(
+        "kill-switch: "
+        + (
+            f"max DD {settings.MAX_DRAWDOWN_PCT}% (HALT), daily loss "
+            f"{settings.MAX_DAILY_LOSS_PCT}% -> {action}"
+            if kill_switch
+            else "not simulated"
+        )
+    )
+
+    def build(
+        allocation: float, policy: str = action, simulate: bool = kill_switch
+    ) -> TargetExposureEngine:
         return build_target_engine(
             initial_capital=args.capital,
             fee_pct=args.fee_pct,
@@ -213,11 +254,18 @@ def _run_donchian(args: argparse.Namespace, settings: Settings) -> None:
             allocation=allocation,
             rebalance_threshold=threshold,
             execution=args.execution,
+            kill_switch=simulate,
+            daily_loss_action=cast(DailyLossAction, policy),
         )
 
-    runs = [(pair, build(1.0).run({pair: df})) for pair, df in data.items()]
     alloc = settings.MAX_POSITION_PCT / 100
-    runs.append((f"portfolio ({alloc:.0%}/pair)", build(alloc).run(data)))
+    if args.compare_daily_loss:
+        runs = [("no kill-switch", build(alloc, simulate=False).run(data))]
+        runs += [(p, build(alloc, policy=p).run(data)) for p in DAILY_LOSS_ACTIONS]
+        print(f"portfolio ({alloc:.0%}/pair), daily-loss policies:")
+    else:
+        runs = [(pair, build(1.0).run({pair: df})) for pair, df in data.items()]
+        runs.append((f"portfolio ({alloc:.0%}/pair)", build(alloc).run(data)))
     for name, result in runs:
         for label, start, end in periods:
             m = result.metrics(start, end)
@@ -226,7 +274,9 @@ def _run_donchian(args: argparse.Namespace, settings: Settings) -> None:
                 f"CAGR {m['cagr']:6.2f}%  maxDD {m['max_drawdown_pct']:5.2f}%  "
                 f"exposure {m.get('avg_exposure_pct', 0):5.1f}%  "
                 f"turnover {m.get('turnover_per_year', 0):5.2f}x/y  "
-                f"fills {int(m.get('fills', 0))}"
+                f"fills {int(m.get('fills', 0))}  "
+                f"daily-loss {int(m.get('daily_loss_events', 0))}"
+                + ("  HALTED" if m.get("halted") else "")
             )
 
 
