@@ -162,6 +162,18 @@ class TestCCXTFetcher:
         assert "ETH/USDT" in pairs
         assert "OLD/USDT" not in pairs
 
+    @pytest.mark.asyncio
+    async def test_failed_enter_closes_the_exchange(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._exchange.load_markets = AsyncMock(side_effect=OSError("down"))
+        fetcher._exchange.close = AsyncMock()
+
+        with pytest.raises(OSError):
+            async with fetcher:
+                pass
+
+        fetcher._exchange.close.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # CoinGeckoFetcher
