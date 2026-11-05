@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     # pair's allocation); a target of 0 always closes. In the backtest 0.05
     # cut fills 3-5x vs 0 at a similar Sharpe; 0.10 lowered it (README).
     REBALANCE_THRESHOLD: float = Field(default=0.05, ge=0.0, lt=1.0)
+    # donchian_ensemble: what MAX_DAILY_LOSS_PCT does (the max drawdown HALT
+    # always liquidates). Liquidating mid-day and re-buying at the next daily
+    # rebalance is an intraday exit the strategy was never validated with
+    # (audit M-4), so by default the limit only blocks increases until the
+    # next UTC day; the channel stops remain the exits.
+    #   liquidate        sell everything (regime_selector always does this)
+    #   block_increases  sell nothing; exposure may only go down that day
+    #   halve            sell half of each position, then block increases
+    #   off              no daily limit in this mode
+    DONCHIAN_DAILY_LOSS_ACTION: Literal[
+        "liquidate", "block_increases", "halve", "off"
+    ] = "block_increases"
 
     # --- Orchestrator ---
     TRADING_TIMEFRAME: str = "1h"

@@ -71,6 +71,7 @@ NEWS_WINDOW = timedelta(hours=24)
 NEWS_PER_PAIR = 10
 
 DONCHIAN_STRATEGY = "donchian_ensemble"
+DAILY_LOSS_ACTIONS = ("liquidate", "block_increases", "halve", "off")
 DONCHIAN_TIMEFRAME = "1d"
 # Share of free quote cash a rebalancing buy may spend: leaves room for the
 # fee and slippage so the exchange does not reject it for insufficient funds.
@@ -140,10 +141,21 @@ class TradingOrchestrator:
         # donchian_ensemble: (pair, candle) already alerted for holding a
         # position without enough history to compute its target.
         self._not_ready_alerted: set[tuple[str, str]] = set()
+        # Prices of the running cycle (fills of risk actions use them).
+        self._last_cycle_prices: dict[str, float] = {}
 
     @property
     def _target_mode(self) -> bool:
         return self._settings.STRATEGY_MODE == DONCHIAN_STRATEGY
+
+    @property
+    def _daily_loss_action(self) -> str:
+        """What the daily loss limit does: always 'liquidate' outside
+        donchian_ensemble; DONCHIAN_DAILY_LOSS_ACTION in it (audit M-4)."""
+        if not self._target_mode:
+            return "liquidate"
+        action = self._settings.DONCHIAN_DAILY_LOSS_ACTION
+        return action if action in DAILY_LOSS_ACTIONS else "liquidate"
 
     @property
     def _timeframe(self) -> str:
@@ -296,6 +308,7 @@ class TradingOrchestrator:
             if price is not None:
                 prices[pair] = price
         self._executor.update_prices(prices)
+        self._last_cycle_prices = prices
         stale = [p for p in self._settings.TRADING_PAIRS if p not in prices]
         if stale:
             logger.warning(
@@ -1622,23 +1635,49 @@ class TradingOrchestrator:
     # ------------------------------------------------------------------
 
     async def _handle_risk_trigger(self, state: TradingState) -> None:
-        """Liquidate and notify once, on entering DAILY_PAUSED or HALTED."""
+        """Act and notify once, on entering DAILY_PAUSED or HALTED.
+
+        HALTED always liquidates. DAILY_PAUSED liquidates too, except in
+        donchian_ensemble where DONCHIAN_DAILY_LOSS_ACTION decides (audit M-4):
+        ``block_increases`` sells nothing and ``halve`` sells half of each
+        position. In every case increases stay blocked until the next UTC day.
+        """
         assert self._executor is not None
         assert self._drawdown_monitor is not None
         reason = self._drawdown_monitor.halt_reason
+        action = (
+            "liquidate" if state == TradingState.HALTED else self._daily_loss_action
+        )
         if state == TradingState.HALTED:
             message = (
                 f"KILL SWITCH — {reason}. Emergency liquidation in progress. "
                 "Trading HALTED until manual reset (RISK_RESET=true)."
             )
-        else:
+        elif action == "liquidate":
             message = (
                 f"DAILY LOSS LIMIT — {reason}. Liquidating; new entries paused "
                 "until the next UTC day."
             )
+        elif action == "halve":
+            message = (
+                f"DAILY LOSS LIMIT — {reason}. Selling half of each position; "
+                "exposure may not increase until the next UTC day."
+            )
+        else:
+            message = (
+                f"DAILY LOSS LIMIT — {reason}. Not liquidating "
+                "(DONCHIAN_DAILY_LOSS_ACTION=block_increases): exposure may "
+                "only go down until the next UTC day."
+            )
         logger.warning(message)
         if self._notifier is not None:
             await self._notifier.send_alert(message, level="kill_switch")
+
+        if action == "halve":
+            await self._halve_positions()
+            return
+        if action != "liquidate":
+            return
         try:
             results = await self._executor.close_all_positions()
         finally:
@@ -1652,6 +1691,34 @@ class TradingOrchestrator:
                     await self._journal.record_exit(
                         result, strategy="risk_manager", reason=reason
                     )
+
+    async def _halve_positions(self) -> None:
+        """Sell half of every pair held (daily loss, ``halve`` policy)."""
+        assert self._executor is not None
+        for pair in self._settings.TRADING_PAIRS:
+            try:
+                held = await self._executor.get_position(pair)
+                price = self._last_cycle_prices.get(pair)
+                if held <= 0:
+                    continue
+                if not price:
+                    logger.warning("{}: no price this cycle — not halved", pair)
+                    continue
+                quantity = await self._executor.tradable_amount(pair, held / 2, price)
+                if quantity <= 0:
+                    logger.info("{}: half position below market minimum", pair)
+                    continue
+                result = await self._execute_order(pair, "sell", quantity, price)
+                if not await self._report_fill(result, "risk_manager"):
+                    continue
+                if self._journal is not None:
+                    await self._journal.record_rebalance(
+                        result,
+                        strategy="risk_manager",
+                        position_after=await self._executor.get_position(pair),
+                    )
+            except Exception:
+                logger.exception("{}: could not halve the position", pair)
 
     def _mode_path(self, template: str) -> Path:
         """State file path; "{mode}" keeps paper and live state apart."""
@@ -1681,7 +1748,9 @@ class TradingOrchestrator:
         if data is not None:
             try:
                 monitor = DrawdownMonitor.from_dict(
-                    data["drawdown"], settings=self._settings
+                    data["drawdown"],
+                    settings=self._settings,
+                    daily_loss_limit=self._daily_loss_action != "off",
                 )
                 tracker = StopTracker.from_dict(data.get("stops") or {})
                 self._rebalanced = {
@@ -1703,7 +1772,9 @@ class TradingOrchestrator:
 
         if monitor is None:
             monitor = DrawdownMonitor(
-                initial_value=portfolio_value, settings=self._settings
+                initial_value=portfolio_value,
+                settings=self._settings,
+                daily_loss_limit=self._daily_loss_action != "off",
             )
             logger.info("Drawdown baseline: ${:,.2f}", portfolio_value)
         else:

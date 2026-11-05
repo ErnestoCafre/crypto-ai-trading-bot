@@ -94,6 +94,7 @@ def _make_settings(**overrides):
         "DONCHIAN_DECISION_LOG_PATH": _DECISION_LOG_PATH,
         "RISK_RESET": False,
         "LIVE_ADOPT_EXISTING_BALANCE": False,
+        "DONCHIAN_DAILY_LOSS_ACTION": "block_increases",
         "LLM_ANALYSIS_INTERVAL_MIN": 15,
         "OHLCV_FETCH_MAX_RETRIES": 5,
         "OHLCV_FETCH_TIMEOUT_S": 60.0,
