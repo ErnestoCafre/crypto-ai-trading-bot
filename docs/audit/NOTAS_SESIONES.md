@@ -178,10 +178,11 @@ Estado persistido (todo bajo `var/`, ignorado por git):
 
 ## 8. Estado de los hallazgos
 
-Todos corregidos (informe §7) salvo **M-4** (¿la pérdida diaria debe liquidar
-o solo bloquear aumentos en `donchian_ensemble`? Es una decisión del dueño, y
-falta simularla en el backtest). Pendiente también: paper real ≥ 30 días con
-`paper_parity.py` y backtests con datos reales en un entorno con red.
+Todos los hallazgos de código están corregidos (informe §7 y §9; M-4 con
+`DONCHIAN_DAILY_LOSS_ACTION=block_increases` por defecto). Pendiente
+operativo: backtests con datos reales en un entorno con red (incluido
+`run_backtest.py --compare-daily-loss`), paper real ≥ 30 días con
+`paper_parity.py` y testnet en live.
 
 ## 9. Comportamiento nuevo a tener en cuenta en pruebas
 
@@ -199,6 +200,13 @@ falta simularla en el backtest). Pendiente también: paper real ≥ 30 días con
 - **Stops vigilados**: la vela que tocó el stop se reevalúa hasta que la
   salida se ejecuta.
 - El estado se guarda después de **cada fill** (`_execute_order`).
+- **Pérdida diaria en donchian_ensemble**: por defecto no liquida
+  (`block_increases`); `liquidate`, `halve` y `off` disponibles. El backtest
+  simula el kill-switch por defecto (`--no-kill-switch` para apagarlo,
+  `--compare-daily-loss` para comparar políticas). Escenario de estrés:
+  `synth_ohlcv.py OUT.csv 1D 2200 7 0.40 0.02` con `MAX_POSITION_PCT=100`.
+- **GitHub desde la sesión**: `git push` funciona por el proxy; `gh` falla con
+  el `GH_TOKEN` del entorno (inválido): usar `env -u GH_TOKEN gh ...`.
 - El Postgres local de §3 no sobrevive a la pausa del contenedor: si
   `pg_ctl` da "Permission denied", repetir `chmod o+x` sobre los directorios
   padre y arrancarlo de nuevo con `-w`.

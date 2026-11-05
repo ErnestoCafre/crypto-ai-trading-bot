@@ -28,14 +28,14 @@ Notas operativas para repetir esta auditoría en otra sesión:
 | Paridad (`scripts/paper_parity.py`) | **OK** sobre un decision log generado offline (200 días, 0 discrepancias de target) |
 
 Hallazgos: **0 críticos, 2 altos, 5 medios, 7 bajos**. En la 1.ª ronda se
-corrigieron 4 defectos menores (§4). En la **2.ª ronda (§7)** se corrigieron
-todos los hallazgos salvo **M-4**, que es una decisión de política de riesgo
-y queda abierta. Una **auditoría de consistencia** posterior (§8) encontró y
-corrigió 4 problemas más que habían introducido o destapado los cambios.
+corrigieron 4 defectos menores (§4). En la **2.ª ronda (§7)** se corrigió
+todo salvo M-4. Una **auditoría de consistencia** (§8) encontró y corrigió 4
+problemas más. En la **3.ª ronda (§9)** se resolvió M-4 y se simuló el
+kill-switch en el backtest.
 
-Estado por hallazgo: ver la tabla de §7. Lo único abierto antes de pasar a
-vivo es M-4, además de las validaciones con datos reales que este entorno no
-permitió (§5).
+Ya no quedan hallazgos de código abiertos. Antes de operar en vivo faltan
+las validaciones operativas que este entorno no permitió (§5 y §6): datos
+reales, paper ≥ 30 días y testnet.
 
 ---
 
@@ -344,7 +344,7 @@ antes y después, y la paridad sigue en OK.
 | M-1 liquidación sin historia | **Corregido** | `f1d49c4` | Con posición y `ready=False` el bot mantiene la posición, alerta una vez por vela y reintenta (`held_not_ready`). |
 | M-2 `filled=None` | **Corregido** | `2fc2b40`, `3747bf9` | Se hace `fetch_order`; si sigue sin dato, el fill se mide por la variación del saldo base y queda `unconfirmed`. |
 | M-3 stop consumido sin salir | **Corregido** | `c223f17` | Una vela que tocó el stop se reevalúa hasta que la salida se ejecuta. |
-| M-4 kill-switch diario vs rebalanceo | **Abierto** (decisión) | — | Requiere elegir la política: ¿la pérdida diaria debe liquidar o solo bloquear aumentos en `donchian_ensemble`? Y simularla en el backtest. |
+| M-4 kill-switch diario vs rebalanceo | **Corregido** (3.ª ronda, §9) | `7d9d48f`, `4fd7fa4` | `DONCHIAN_DAILY_LOSS_ACTION` (por defecto `block_increases`) y simulación del kill-switch en el backtest. |
 | M-5 numpy/pandas | **Corregido** | `f899be4` | `numpy<2.6`, `ccxt<5`; `parity.DAY` y los tests usan unidades explícitas; pytest convierte en error las deprecaciones originadas en `trading_bot`. |
 | B-1 settings sin validar | **Corregido** | `f306de0` | Límites en porcentajes, balances, costos e intervalos. |
 | B-2 línea rota en el decision log | **Corregido** | `b2e9c9a` | El siguiente registro arranca en línea nueva. |
@@ -403,6 +403,79 @@ Verificación final: **747 ok, 1 skip** (red), cobertura 90 %, ruff, format
 y mypy limpios. Alembic en PostgreSQL 16: `check` sin drift y
 downgrade/upgrade ok. Backtests idénticos a los de la 1.ª ronda y paridad OK.
 
+## 9. Tercera ronda: M-4 (pérdida diaria) y simulación del kill-switch
+
+**Decisión.** En `donchian_ensemble` el límite de pérdida diaria ya **no
+liquida por defecto**. `DONCHIAN_DAILY_LOSS_ACTION` admite:
+
+- `block_increases` (**por defecto**): notifica, no vende, y la exposición
+  solo puede bajar hasta el siguiente día UTC.
+- `liquidate`: el comportamiento anterior.
+- `halve`: vende la mitad de cada posición y bloquea subas.
+- `off`: sin límite diario.
+
+El HALT por drawdown máximo y `regime_selector` siguen liquidando siempre.
+
+**Fundamento:**
+
+1. Liquidar por una caída intradía es una salida que la estrategia validada
+   no tiene: sus salidas son los stops de canal al cierre diario.
+2. Kaminski & Lo (2014): un stop-loss solo agrega valor si hay momentum en
+   el horizonte en que actúa; sin él, solo baja el retorno esperado.
+3. En Bitcoin, los retornos de 1-24 h muestran reversión a la media, mayor
+   tras caídas grandes (De Nicola, *Ledger* 2021; estudio de shocks
+   intradía, 2022). Vender en esa caída es vender en el horizonte que
+   tiende a revertir.
+4. Backtest de estrés sintético (`synth_ohlcv.py ... 0.40 0.02`: vol 40 %,
+   caídas intradía del 12 % en ~2 % de los días que cierran cerca del open;
+   un par al 100 %):
+
+| Política | Sharpe | CAGR | maxDD | Eventos diarios | HALT |
+|---|---|---|---|---|---|
+| sin kill-switch | 0,85 | 9,05 % | 13,8 % | 0 | no |
+| `liquidate` | 0,04 | 0,07 % | 15,0 % | 6 | **sí** |
+| `block_increases` | 0,85 | 9,05 % | 13,8 % | 23 | no |
+| `halve` | 0,18 | 0,85 % | 15,0 % | 6 | **sí** |
+| `off` | 0,85 | 9,05 % | 13,8 % | 0 | no |
+
+Liquidar realiza cada pérdida en el mínimo; la acumulación lleva al HALT
+del 15 % y el bot queda fuera para siempre. Los datos son sintéticos y las
+caídas, por construcción, cierran cerca del open: el resultado favorece a
+`block_increases` por diseño del escenario. **Hay que repetir la comparación
+con datos reales** (`run_backtest.py --compare-daily-loss`) antes de vivo.
+
+**Simulación** (`TargetExposureEngine`, opcional, activada por defecto en
+`build_target_engine` y `run_backtest.py`):
+
+- HALT: vende todo y nunca más sube la exposición.
+- Pérdida diaria: aplica la acción elegida.
+- Camino intradía: cada par va linealmente del open al low, y el límite
+  dispara donde se cruza. Es pesimista: mínimos simultáneos y chequeo
+  continuo, cuando el bot chequea cada hora.
+- Los eventos quedan en `risk_events` y se cuentan en `metrics()`
+  (`daily_loss_events`, `halted`).
+
+Sin límites, el motor es idéntico al anterior (los tests de exactitud pasan).
+
+**Auditoría de consistencia de la 3.ª ronda:**
+
+- La paridad usa el motor sin kill-switch y compara solo targets antes de
+  riesgo: no cambia.
+- `block_increases` y `off` coinciden en el backtest, porque el rebalanceo
+  ocurre en la apertura, antes del camino intradía. En vivo, `block_increases`
+  además frena los reintentos horarios de un rebalanceo fallido ese día.
+  Diferencia esperada y documentada.
+- `DrawdownMonitor(daily_loss_limit=...)` solo lo construye el bot (dos
+  sitios, ambos actualizados); el dashboard y el healthcheck leen el estado
+  sin construir el monitor.
+- `halve` usa los precios del ciclo en curso (`_last_cycle_prices`), nunca
+  atributos privados del executor; sin precio, ese par no se toca.
+- `.env.example` documenta el setting con su default (lo verifica el test
+  de sincronía), y README y docstrings reflejan el comportamiento nuevo.
+
+Verificación: **764 ok, 1 skip** (red), cobertura 90 %; ruff, format y mypy
+limpios.
+
 ## Fuentes consultadas
 
 - Código de ccxt 4.5.84 instalado (`.venv/.../ccxt/async_support/binance.py`).
@@ -411,3 +484,5 @@ downgrade/upgrade ok. Backtests idénticos a los de la 1.ª ronda y paridad OK.
 - [Binance Academy: stop-loss con la API](https://www.binance.com/ru/academy/articles/how-to-place-a-stop-loss-order-with-binance-api).
 - Límite de 1000 velas por página en `/api/v3/klines` (fuentes secundarias): [rustrade-data](https://docs.rs/rustrade-data/0.5.0/src/rustrade_data/exchange/binance/historical.rs.html).
 - Deprecación de la unidad genérica de `timedelta64` en numpy 2.5: [numpy-discussion](https://go.mail-archive.com/numpy-discussion@python.org/msg08568.html), [xarray PR 11340](https://github.com/pydata/xarray/pull/11340.patch).
+- Kaminski & Lo, *When Do Stop-Loss Rules Stop Losses?* (Journal of Financial Markets, 2014): [MIT DSpace](https://dspace.mit.edu/bitstream/handle/1721.1/114876/Lo_When%20Do%20Stop-Loss.pdf).
+- Reversión intradía en Bitcoin: [De Nicola, *On the Intraday Behavior of Bitcoin* (Ledger, 2021)](https://ledger.pitt.edu/ojs/ledger/article/view/213); [estudio de shocks intradía (2022)](https://informahealthcare.com/doi/abs/10.1080/15140326.2022.2151253).

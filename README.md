@@ -70,8 +70,11 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   vende al precio del stop, o al `open` si la vela abrió por debajo (gap).
   En `STRATEGY_MODE=donchian_ensemble` no hay stop por trade: la salida es el
   stop de cada canal al cierre diario (ver Modo donchian_ensemble).
-- **Pérdida diaria** (`MAX_DAILY_LOSS_PCT`): liquida y notifica una vez; las
-  entradas nuevas quedan bloqueadas hasta el siguiente día UTC (se levanta sola).
+- **Pérdida diaria** (`MAX_DAILY_LOSS_PCT`): notifica una vez y bloquea las
+  entradas nuevas hasta el siguiente día UTC (se levanta sola). En
+  `regime_selector` además liquida; en `donchian_ensemble` la acción la elige
+  `DONCHIAN_DAILY_LOSS_ACTION` (por defecto no liquida, ver Modo
+  donchian_ensemble).
 - **Drawdown máximo** (`MAX_DRAWDOWN_PCT`): liquida y notifica una vez y deja el
   bot en estado `HALTED`: no abre posiciones nuevas, ni tras reiniciar, hasta un
   reset manual. Stops y salidas siguen funcionando.
@@ -224,10 +227,26 @@ default sigue siendo `regime_selector`.
   usan el stop ATR ni `place_stop_loss`, y al arrancar se cancelan los stops
   que hubiera dejado el otro modo. No hay stop de catástrofe en el exchange:
   el backtest no lo simula, y uno intradía cambiaría la estrategia validada.
-- **Riesgo**: el kill-switch (HALTED / DAILY_PAUSED), el límite diario, el
-  risk_state y el journal siguen igual. Con el kill-switch activo la
-  exposición solo puede bajar. En el journal, cada venta parcial queda como
-  un trade cerrado con su P&L.
+- **Riesgo**: el HALT por drawdown máximo liquida y deja la exposición en
+  0 hasta un reset manual. El límite de **pérdida diaria** hace lo que diga
+  `DONCHIAN_DAILY_LOSS_ACTION`:
+  - `block_increases` (**por defecto**): no vende; ese día la exposición solo
+    puede bajar. Las salidas siguen siendo los stops de canal.
+  - `liquidate`: vende todo (el comportamiento anterior, igual que
+    `regime_selector`); el rebalanceo del día siguiente vuelve a comprar.
+  - `halve`: vende la mitad de cada posición y bloquea subas.
+  - `off`: sin límite diario en este modo (el HALT sigue).
+
+  Por qué no liquidar por defecto: es una salida intradía con la que la
+  estrategia no se validó. En Bitcoin los retornos de 1-24 h tienden a
+  revertir tras caídas grandes, y un stop solo agrega valor si hay momentum
+  en su horizonte (Kaminski & Lo, 2014). En un escenario sintético de estrés
+  (caídas intradía del 12 % que cierran cerca del open), `liquidate` y
+  `halve` realizaban las pérdidas en los mínimos hasta llegar al HALT del
+  15 % (Sharpe 0,85 → 0,04), mientras `block_increases` igualaba al bot sin
+  límite. Comparar con datos reales antes de operar:
+  `scripts/run_backtest.py --strategy-mode donchian_ensemble --compare-daily-loss`.
+  En el journal, cada venta parcial queda como un trade cerrado con su P&L.
 - **IA**: solo puede reducir w. Sentimiento negativo y LLM SHORT/CLOSE dan
   un multiplicador entre `AI_SIZING_FLOOR` y 1; las lecturas alcistas no
   suben nada. Un consenso SHORT del LLM impide aumentar la exposición. Sin
@@ -272,7 +291,9 @@ porque su historia empieza en 2020-08 y se pierde 2021.
 Cautelas: con ~2,75 años de holdout, el error estándar del Sharpe es ~0,6.
 La ventaja sobre buy&hold está más en el drawdown (−12 % contra −64 %) que
 en el retorno: en holdout, buy&hold de BTC rindió más. El backtest no
-simula IA, kill-switch ni mínimos del exchange. **No operar en real sin un
+simula IA ni mínimos del exchange. El kill-switch (HALT y pérdida diaria) se
+simula desde la auditoría de 2026-11 con una aproximación pesimista (precio
+lineal del open al low, mínimos simultáneos); `--no-kill-switch` lo apaga. **No operar en real sin un
 período previo de paper trading** en este modo (`BOT_MODE=paper`,
 `STRATEGY_MODE=donchian_ensemble`), comparando sus fills con el backtest.
 
