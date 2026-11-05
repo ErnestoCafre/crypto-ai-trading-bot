@@ -453,7 +453,8 @@ class OrderResult:
     filled_quantity: float
     fee: float
     slippage_pct: float
-    status: str                  # paper: "filled" | "rejected"; live: estado ccxt ("closed", "open", ...)
+    status: str                  # paper: "filled" | "rejected"; live: estado ccxt ("closed", "expired", ...)
+                                 # o "unconfirmed" si el exchange no informó el fill (medido por saldo)
     timestamp: datetime
 
 
@@ -470,7 +471,11 @@ class BaseExecutor(ABC):
         price: Optional[float] = None,
     ) -> OrderResult:
         """Paper limita la cantidad al efectivo (compra) o a lo que se tiene
-        (venta); si no queda nada ejecutable devuelve status="rejected"."""
+        (venta); si no queda nada ejecutable devuelve status="rejected".
+        Live: en `market` no envía `price` (solo referencia); si la respuesta
+        no trae `filled` consulta la orden una vez y, si sigue sin dato, mide
+        el fill por la variación del saldo base. `filled_quantity == 0` =
+        nada ejecutado (el bot no da el rebalanceo por hecho)."""
         ...
 
     @abstractmethod
@@ -491,14 +496,17 @@ class BaseExecutor(ABC):
 
     @abstractmethod
     async def get_position(self, pair: str) -> float:
-        """Cantidad del activo base en `pair` (live: saldo total, incluido el
-        bloqueado por un stop; dust bajo el mínimo del mercado = 0)."""
+        """Cantidad del activo base del *bot* en `pair`. Live: min(libro de
+        posición propio, saldo total del exchange) — el saldo total incluye
+        lo bloqueado por un stop; monedas del dueño fuera del libro no
+        cuentan; dust bajo el mínimo del mercado = 0."""
         ...
 
     @abstractmethod
     async def close_all_positions(self) -> list[OrderResult]:
-        """Kill-switch: cancela órdenes (incl. stops) y vende los activos de
-        los pares configurados, nunca otros activos de la cuenta."""
+        """Kill-switch: cancela los stops nativos que colocó el bot y vende lo
+        que el libro le atribuye en los pares configurados; nunca otros
+        activos ni órdenes/monedas del dueño."""
         ...
 
     def update_prices(self, prices: dict[str, float]) -> None:
@@ -513,11 +521,18 @@ class BaseExecutor(ABC):
     async def get_order(self, order_id: str, pair: str) -> dict:
         """Orden nativa (estructura ccxt); usado para seguir stops nativos."""
 
+    def record_external_fill(self, pair: str, side: str, quantity: float) -> None:
+        """Fill que ejecutó el exchange por su cuenta (stop nativo). Live lo
+        aplica al libro de posición; no-op por defecto."""
+
     async def close(self) -> None:
         """Libera conexiones del exchange. No-op por defecto."""
 ```
 
-**Implementaciones**: `PaperExecutor` (sandbox), `LiveExecutor` (CCXT real)
+**Implementaciones**: `PaperExecutor` (sandbox), `LiveExecutor` (CCXT real).
+`LiveExecutor` expone además `to_dict()` / `restore()` (libro persistido en el
+risk state como `live_ledger`), `exchange_holdings()` y `reconcile()`
+(recorta el libro al saldo real y devuelve las monedas ajenas).
 
 ---
 
