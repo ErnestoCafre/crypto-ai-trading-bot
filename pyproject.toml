@@ -10,7 +10,9 @@ dependencies = [
     # Core
     # Upper bound: a major release may change how stopLossPrice maps to
     # Binance STOP_LOSS (live native stops). Re-check before raising it.
-    "ccxt>=4.5,<5",
+    # >=4.5.87: earlier releases pin certifi/multidict versions with known
+    # vulnerabilities (pip-audit in CI).
+    "ccxt>=4.5.87,<5",
     "pandas>=2.2,<3",
     # numpy 2.5 deprecated the "generic" timedelta64 unit (future error) and
     # pandas 2.3 still uses it internally; 2.6+ is untested with pandas<3.
@@ -35,7 +37,8 @@ dependencies = [
     # Metrics
     "quantstats>=0.0.62",
     # Dashboard
-    "streamlit>=1.50",
+    # >=1.66: earlier releases cap pillow<13 (pillow 12.x has known CVEs).
+    "streamlit>=1.66",
     "plotly>=5.18",
     # DB driver (URLs are rewritten to postgresql+asyncpg://)
     "asyncpg>=0.29",

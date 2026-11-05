@@ -476,6 +476,29 @@ Sin límites, el motor es idéntico al anterior (los tests de exactitud pasan).
 Verificación: **764 ok, 1 skip** (red), cobertura 90 %; ruff, format y mypy
 limpios.
 
+## 10. CI y dependencias vulnerables (hallados al abrir el PR)
+
+- **CI roto desde antes de la auditoría.** Todos los jobs fallaban en "Set
+  up job", también en `main`: `astral-sh/setup-uv@v10` no existe, porque
+  desde v8 la acción solo publica versiones completas inmutables, sin
+  etiqueta flotante de major. Se fijó al SHA de `v10.3.3`, con la versión en
+  un comentario, como recomienda el proyecto. Con eso pasan lint, typecheck,
+  test (PostgreSQL 16 de servicio + `alembic upgrade/check` + pytest con
+  `--cov-fail-under=75`) y docker.
+- **76 vulnerabilidades conocidas en 7 paquetes del lock** (pip-audit del job
+  `audit`): pillow 12.3, filelock, aiohttp, virtualenv, multidict, certifi y
+  setuptools. Dos venían forzadas por dependencias:
+  - ccxt 4.5.84 fijaba `certifi==2026.6.17` y `multidict==6.7.1`;
+  - streamlit 1.64 exigía `pillow<13`.
+
+  Se subió a ccxt 4.5.89 (publicado el 2026-10-20: la versión más antigua
+  con las fijaciones corregidas que lleva más de dos semanas publicada; el
+  mapeo `stopLossPrice` → `STOP_LOSS` está verificado igual en el código) y a
+  streamlit 1.66.1. Los mínimos subieron en `pyproject.toml` (`ccxt>=4.5.87`,
+  `streamlit>=1.66`) y el resto de paquetes se actualizó en el lock.
+  Resultado: pip-audit sin vulnerabilidades, 764 tests ok y el dashboard
+  importa sin errores.
+
 ## Fuentes consultadas
 
 - Código de ccxt 4.5.84 instalado (`.venv/.../ccxt/async_support/binance.py`).
