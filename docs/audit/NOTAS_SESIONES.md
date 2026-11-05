@@ -38,8 +38,20 @@ uv run mypy src
 - `tests/integration` **no necesita Postgres**: usa
   `sqlite+aiosqlite:///:memory:`. Solo `TestCCXTIntegration` usa red (Binance)
   y hace *skip* si no hay acceso.
-- Resultado de referencia (tras los fixes de la auditoría): 703 passed,
-  1 skipped, cobertura 90 %.
+- Resultado de referencia (tras la 2.ª ronda de correcciones): 747 passed,
+  1 skipped, cobertura 90 %, 30 warnings (todos de aiosqlite).
+- pytest convierte en **error** cualquier `DeprecationWarning`/`FutureWarning`
+  originado en `trading_bot` (`pyproject.toml`): usar
+  `pd.Timedelta(1, unit="D")` o `datetime.timedelta`, nunca
+  `pd.Timedelta(days=1)` (con numpy 2.5 + pandas 2.3 dispara la deprecación).
+- Los tests de `Settings` limpian el entorno (fixture autouse en
+  `tests/unit/test_config.py`); `tests/unit/test_bot.py::_make_settings` es un
+  `MagicMock`: cualquier setting nuevo que el bot lea debe agregarse ahí (un
+  atributo ausente del mock es *truthy*), y en el código compararlo con
+  `is True`, como `RISK_RESET`.
+- `.env.example` se valida contra `Settings` (sin claves desconocidas y con
+  valores iguales a los defaults): al agregar un setting, documentarlo con su
+  default.
 - Warnings esperados: `DeprecationWarning` de numpy 2.5 por la unidad genérica
   de `timedelta64` dentro de `pd.Timedelta(...)` (pandas 2.3.3). No es del
   código del proyecto; ver hallazgo M-5 del informe.
@@ -164,9 +176,29 @@ Estado persistido (todo bajo `var/`, ignorado por git):
 
 ---
 
-## 8. Pendientes abiertos (del informe)
+## 8. Estado de los hallazgos
 
-H-1 cuenta compartida en live · H-2 orden no ejecutada marcada como hecha ·
-M-1 liquidación con historia insuficiente · M-2 `filled=None` · M-3 stop no
-reevaluado · M-4 kill-switch diario vs rebalanceo · M-5 tope de numpy ·
-B-1..B-7 robustez. Detalle y escenarios en el informe.
+Todos corregidos (informe §7) salvo **M-4** (¿la pérdida diaria debe liquidar
+o solo bloquear aumentos en `donchian_ensemble`? Es una decisión del dueño, y
+falta simularla en el backtest). Pendiente también: paper real ≥ 30 días con
+`paper_parity.py` y backtests con datos reales en un entorno con red.
+
+## 9. Comportamiento nuevo a tener en cuenta en pruebas
+
+- **Live, libro de posición** (`live_ledger` en el risk state): posición =
+  min(libro, saldo). Para tests de `LiveExecutor` pasar `owned={...}` o
+  `restore({"owned": ..., "orders": ...})`; con el libro vacío el bot no posee
+  nada. Primer arranque sin libro: adopta lo que cubren los stops guardados;
+  `LIVE_ADOPT_EXISTING_BALANCE=true` adopta todo el saldo.
+- **Fills**: `place_order` en live hace un `fetch_balance` antes de la orden
+  (para medir fills no informados) y descuenta del libro la comisión en
+  moneda base. `status="unconfirmed"` = fill medido por saldo.
+- **donchian_ensemble**: una orden sin fill no marca la vela (se reintenta);
+  con posición e historia insuficiente se mantiene y alerta
+  (`held_not_ready` en el log, que la paridad reporta como discrepancia).
+- **Stops vigilados**: la vela que tocó el stop se reevalúa hasta que la
+  salida se ejecuta.
+- El estado se guarda después de **cada fill** (`_execute_order`).
+- El Postgres local de §3 no sobrevive a la pausa del contenedor: si
+  `pg_ctl` da "Permission denied", repetir `chmod o+x` sobre los directorios
+  padre y arrancarlo de nuevo con `-w`.

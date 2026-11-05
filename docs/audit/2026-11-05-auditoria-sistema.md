@@ -18,24 +18,24 @@ Notas operativas para repetir esta auditoría en otra sesión:
 
 | Área | Estado |
 |---|---|
-| Suite (`tests/unit`, `tests/ai`, `tests/integration`) | **700 ok, 1 fallo de entorno** (red) → tras los fixes: **703 ok, 1 skip** |
-| Cobertura de líneas | **90 %** (6601 sentencias) |
+| Suite (`tests/unit`, `tests/ai`, `tests/integration`) | **700 ok, 1 fallo de entorno** (red) → 1.ª ronda: 703 ok, 1 skip → **2.ª ronda: 747 ok, 1 skip** |
+| Cobertura de líneas | **90 %** (6800 sentencias tras la 2.ª ronda) |
+| Warnings de la suite | 74 → **30** (los 30 restantes son de aiosqlite, librería de terceros) |
 | ruff / ruff format / mypy | Sin errores |
 | Migraciones Alembic en PostgreSQL 16 real | `upgrade head`, `downgrade base`, `upgrade head` ok; `alembic check`: **sin drift** modelo↔migración |
 | TradeJournal sobre PostgreSQL real | ok (entradas, scale-in, venta parcial, cierre, snapshot) |
 | Backtest `donchian_ensemble` y `regime_selector` | Corren de punta a punta (datos **sintéticos**: no hay acceso a exchanges) |
 | Paridad (`scripts/paper_parity.py`) | **OK** sobre un decision log generado offline (200 días, 0 discrepancias de target) |
 
-Hallazgos: **0 críticos, 2 altos, 5 medios, 7 bajos**. Se corrigieron 4 en
-commits separados (§4); el resto queda como recomendación porque cambiaría la
-lógica de trading o el comportamiento operativo y requiere decisión del dueño.
+Hallazgos: **0 críticos, 2 altos, 5 medios, 7 bajos**. En la 1.ª ronda se
+corrigieron 4 defectos menores (§4). En la **2.ª ronda (§7)** se corrigieron
+todos los hallazgos salvo **M-4**, que es una decisión de política de riesgo
+y queda abierta. Una **auditoría de consistencia** posterior (§8) encontró y
+corrigió 4 problemas más que habían introducido o destapado los cambios.
 
-Lo más importante antes de pasar a vivo:
-
-1. En **live**, `get_position` y la liquidación cuentan **todo** el saldo del
-   activo base de la cuenta, no solo lo que compró el bot (H-1).
-2. En `donchian_ensemble`, una orden **no ejecutada sin excepción** marca la
-   vela como rebalanceada y no se reintenta ese día (H-2).
+Estado por hallazgo: ver la tabla de §7. Lo único abierto antes de pasar a
+vivo es M-4, además de las validaciones con datos reales que este entorno no
+permitió (§5).
 
 ---
 
@@ -329,6 +329,79 @@ Cada fix trae su test de regresión (el de huecos falla sin el fix).
    `live_executor.py`.
 
 ---
+
+## 7. Segunda ronda: correcciones de los hallazgos
+
+Criterio: corregir la causa, no el síntoma, con un test de regresión por
+cambio (cada test falla sin su fix) y sin alterar la estrategia validada. Los
+backtests sobre los mismos datos sintéticos dan **resultados idénticos**
+antes y después, y la paridad sigue en OK.
+
+| Hallazgo | Estado | Commit | Qué cambió |
+|---|---|---|---|
+| H-1 cuenta compartida en live | **Corregido** | `cf3d586`, `3747bf9` | `LiveExecutor` lleva un libro de posición propio (`live_ledger` en el risk state): posición = min(libro, saldo real). Valoración, salidas y liquidación usan solo eso; el kill-switch cancela solo los stops del bot. Sin libro guardado adopta lo cubierto por sus stops (`LIVE_ADOPT_EXISTING_BALANCE=true` adopta todo). El estado se guarda tras cada fill. El pico de drawdown se re-ancla al crear el libro, para que no haya un HALT falso. |
+| H-2 orden sin fill marcada como hecha | **Corregido** | `f1d49c4` | Si una orden vuelve sin ejecutar, la vela no se marca y se reintenta al ciclo siguiente (`unfilled` en el decision log). "Bajo el mínimo del mercado" sigue contando como hecho. |
+| M-1 liquidación sin historia | **Corregido** | `f1d49c4` | Con posición y `ready=False` el bot mantiene la posición, alerta una vez por vela y reintenta (`held_not_ready`). |
+| M-2 `filled=None` | **Corregido** | `2fc2b40`, `3747bf9` | Se hace `fetch_order`; si sigue sin dato, el fill se mide por la variación del saldo base y queda `unconfirmed`. |
+| M-3 stop consumido sin salir | **Corregido** | `c223f17` | Una vela que tocó el stop se reevalúa hasta que la salida se ejecuta. |
+| M-4 kill-switch diario vs rebalanceo | **Abierto** (decisión) | — | Requiere elegir la política: ¿la pérdida diaria debe liquidar o solo bloquear aumentos en `donchian_ensemble`? Y simularla en el backtest. |
+| M-5 numpy/pandas | **Corregido** | `f899be4` | `numpy<2.6`, `ccxt<5`; `parity.DAY` y los tests usan unidades explícitas; pytest convierte en error las deprecaciones originadas en `trading_bot`. |
+| B-1 settings sin validar | **Corregido** | `f306de0` | Límites en porcentajes, balances, costos e intervalos. |
+| B-2 línea rota en el decision log | **Corregido** | `b2e9c9a` | El siguiente registro arranca en línea nueva. |
+| B-3 orden log/estado | **Corregido** | `b2e9c9a` | Primero las decisiones, después el estado. |
+| B-4 fsync del directorio | **Corregido** | `b2e9c9a` | `atomic_write_json` sincroniza el directorio (POSIX). |
+| B-5 límites del lock | **Documentado** | `3ea22a3` | README: es advisory y local, y no cubre el decision log. |
+| B-6 precio viejo | **Corregido** | `b2e9c9a` | Warning por par sin precio en el ciclo. |
+| B-7 `price` en market | **Corregido** | `2fc2b40` | No se envía `price` en órdenes de mercado. |
+
+Hallazgo nuevo de esta ronda: **`.env.example` contradecía los defaults**
+(`f306de0`). Fijaba `MAX_RISK_PER_TRADE_PCT=1.0` / `MAX_POSITION_PCT=10.0`,
+la calibración que el README descarta, y el README indica copiarlo a `.env`.
+Además listaba 4 variables que ningún código lee y le faltaban las
+`POSTGRES_*` que exige docker-compose. Un test nuevo impide que vuelva a
+divergir.
+
+## 8. Auditoría de consistencia de los cambios
+
+Revisión del diff completo (`origin/main..HEAD`) y de los módulos que
+consumen lo modificado: el bot, la paridad, el dashboard y el healthcheck
+(que leen el risk state), los scripts y la documentación de contratos.
+
+| # | Problema encontrado | Severidad | Corrección |
+|---|---|---|---|
+| C-1 | El libro sumaba el `filled` bruto en compras; Binance sin BNB cobra la comisión en la moneda comprada. Con monedas del dueño en la cuenta, el bot se atribuía la comisión con monedas ajenas. | Media | `3747bf9`: las compras acreditan lo recibido neto de `fee`/`fees` en moneda base. |
+| C-2 | Un fill no informado se asumía completo; el recorte del libro al saldo no lo corrige cuando hay monedas ajenas. | Media | `3747bf9`: se mide por la variación del saldo; solo se asume si no se puede leer el saldo. |
+| C-3 | El registro `held_not_ready` (nuevo, M-1) no tiene `target`, y `check_parity` hacía `record["target"]`: `paper_parity.py` fallaba con `KeyError`. Reproducido antes de corregir. | Alta para la herramienta (rompía la paridad) | `1708732`: la fila queda sin target y se reporta como discrepancia. |
+| C-4 | `test_defaults`, `test_risk_defaults` y el nuevo test de `.env.example` dependían del entorno: fallaban con `BOT_MODE=live` exportado en CI. Problema preexistente que destapó el test nuevo. | Baja | `799747c`: fixture que limpia las variables de `Settings`. |
+
+Verificado sin problemas:
+
+- Orden de inicialización en live: el libro se carga antes de
+  `_reconcile_stops`, de `_drop_trade_stops` y de la reconciliación del
+  journal, así que todos ven la posición del bot.
+- Los stops nativos llegan al libro: `get_order` olvida las órdenes ya
+  cerradas y `cancel_order` las canceladas, y `record_external_fill` descuenta
+  el fill del stop.
+- El dashboard y el healthcheck solo leen `drawdown`/`stops`/`saved_at`: la
+  clave nueva `live_ledger` no les afecta.
+- La validación nueva de `Settings` coincide con lo que exige el backtest
+  (`allocation ∈ (0, 1]`).
+- README y `docs/API_CONTRACTS.md` reflejan ahora el comportamiento nuevo:
+  posición sin historia, reintento sin fill, límites del lock, libro y fills.
+
+Riesgos residuales del libro (documentados):
+
+- Un crash entre el fill en el exchange y el guardado del estado deja esas
+  monedas fuera del libro. El bot nunca las vende; se reportan como ajenas al
+  arrancar y se pueden adoptar.
+- El saldo en USDT sigue contando entero en el equity y el drawdown: la
+  recomendación sigue siendo una cuenta o subcuenta dedicada.
+- Con comisiones en BNB y `BNB/USDT` como par operado, el consumo de BNB por
+  comisiones no se descuenta del libro (lo corrige el recorte al saldo).
+
+Verificación final: **747 ok, 1 skip** (red), cobertura 90 %, ruff, format
+y mypy limpios. Alembic en PostgreSQL 16: `check` sin drift y
+downgrade/upgrade ok. Backtests idénticos a los de la 1.ª ronda y paridad OK.
 
 ## Fuentes consultadas
 
