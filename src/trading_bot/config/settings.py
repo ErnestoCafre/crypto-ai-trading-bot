@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     DONCHIAN_DECISION_LOG_PATH: str = "var/state/donchian_decisions_{mode}.jsonl"
     # Manual reset of a max-drawdown HALT on startup. Remove after use.
     RISK_RESET: bool = False
+    # Live: the bot only trades what its position ledger says it bought (the
+    # account may hold the owner's coins). With no ledger saved yet (first
+    # live start, or upgrading from a version without one) true adopts the
+    # whole balance of each traded pair as the bot's; false (default) adopts
+    # only what its saved stops cover and ignores the rest. Ignored once a
+    # ledger exists.
+    LIVE_ADOPT_EXISTING_BALANCE: bool = False
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = ""

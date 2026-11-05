@@ -55,6 +55,7 @@ from trading_bot.data.market.ccxt_fetcher import CCXTFetcher
 from trading_bot.data.news.base import BaseNewsFetcher
 from trading_bot.data.onchain.fear_greed import FearGreedIndex
 from trading_bot.execution.base import BaseExecutor
+from trading_bot.execution.live_executor import LiveExecutor
 from trading_bot.execution.paper_executor import PaperExecutor
 from trading_bot.notifications.base import BaseNotifier
 from trading_bot.risk.ai_confidence import AIConfidenceFilter
@@ -452,8 +453,6 @@ class TradingOrchestrator:
             )
             if s.EXCHANGE_SANDBOX:
                 exchange.set_sandbox_mode(True)
-
-            from trading_bot.execution.live_executor import LiveExecutor
 
             self._executor = LiveExecutor(exchange=exchange, pairs=s.TRADING_PAIRS)
         else:
@@ -1064,15 +1063,22 @@ class TradingOrchestrator:
     async def _execute_order(
         self, pair: str, side: str, quantity: float, price: float
     ) -> OrderResult:
-        """Send a market order via the executor."""
+        """Send a market order via the executor; persist any fill at once.
+
+        The fill changes the paper account or the live ledger: saving right
+        away keeps a crash before the end of the cycle from forgetting it.
+        """
         assert self._executor is not None
-        return await self._executor.place_order(
+        result = await self._executor.place_order(
             pair=pair,
             side=side,
             order_type="market",
             quantity=quantity,
             price=price,
         )
+        if result.filled_quantity > 0:
+            self._save_risk_state()
+        return result
 
     async def _report_fill(self, result: OrderResult, strategy: str) -> bool:
         """Log and notify a fill; False if nothing was filled."""
@@ -1200,6 +1206,9 @@ class TradingOrchestrator:
             self._stop_tracker.remove(pair)
             price = float(order.get("average") or order.get("price") or 0.0)
             qty = float(order.get("filled") or 0.0)
+            # The exchange sold the bot's coins: keep the ledger in step.
+            self._executor.record_external_fill(pair, "sell", qty)
+            self._save_risk_state()
             if self._journal is not None:
                 fee = order.get("fee")
                 await self._journal.record_exit(
@@ -1686,6 +1695,12 @@ class TradingOrchestrator:
                 monitor, tracker = None, StopTracker()
                 self._rebalanced = {}
 
+        ledger_bootstrapped = False
+        if isinstance(self._executor, LiveExecutor):
+            ledger_bootstrapped = await self._load_live_ledger(data, tracker)
+            # Valuation now counts only the bot's coins.
+            portfolio_value = (await self._executor.get_balance())["total"]
+
         if monitor is None:
             monitor = DrawdownMonitor(
                 initial_value=portfolio_value, settings=self._settings
@@ -1705,6 +1720,11 @@ class TradingOrchestrator:
                 monitor.rebaseline(portfolio_value)
                 # Its positions are gone too: rebalance today's candle again.
                 self._rebalanced = {}
+            if ledger_bootstrapped:
+                # The saved peak valued every coin in the account; the ledger
+                # values only the bot's. Keep the latch, re-anchor values so
+                # the difference is not read as a drawdown.
+                monitor.rebaseline(portfolio_value)
 
         if self._settings.RISK_RESET is True:
             logger.warning(
@@ -1719,6 +1739,69 @@ class TradingOrchestrator:
         self._stop_tracker = tracker
         await self._reconcile_stops(native_orders_cancelled=False)
         self._save_risk_state()
+
+    async def _load_live_ledger(
+        self, data: dict[str, object] | None, tracker: StopTracker
+    ) -> bool:
+        """Restore (or bootstrap) the live position ledger; True if bootstrapped.
+
+        Without a saved ledger the bot adopts what its saved stops cover, or
+        the whole balance of each pair with LIVE_ADOPT_EXISTING_BALANCE=true.
+        Either way the ledger is then clamped to the exchange balance, and
+        coins above it are reported as the owner's and left alone.
+        """
+        executor = self._executor
+        assert isinstance(executor, LiveExecutor)
+        saved = data.get("live_ledger") if data is not None else None
+        if saved is not None:
+            try:
+                if not isinstance(saved, dict):
+                    raise TypeError("live_ledger is not an object")
+                executor.restore(saved)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                logger.error(
+                    "Saved live ledger in {} is invalid — rebuilding it",
+                    self._risk_state_path(),
+                )
+                saved = None
+        if saved is None:
+            holdings = await executor.exchange_holdings()
+            if self._settings.LIVE_ADOPT_EXISTING_BALANCE is True:
+                owned = {p: q for p, q in holdings.items() if q > 0}
+                how = "whole balance (LIVE_ADOPT_EXISTING_BALANCE=true)"
+            else:
+                owned = {}
+                for pair in tracker.pairs():
+                    stop = tracker.get(pair)
+                    if stop is not None and pair in holdings:
+                        owned[pair] = min(stop.quantity, holdings[pair])
+                how = "quantities covered by saved stops"
+            orders = {
+                stop.order_id: pair
+                for pair in tracker.pairs()
+                if (stop := tracker.get(pair)) is not None and stop.order_id
+            }
+            executor.restore({"owned": owned, "orders": orders})
+            logger.warning(
+                "No live position ledger saved — adopted the {}: {}",
+                how,
+                {p: round(q, 8) for p, q in owned.items()} or "nothing",
+            )
+        else:
+            logger.info(
+                "Live position ledger restored: {}",
+                executor.to_dict()["owned"] or "flat",
+            )
+        for pair, qty in (await executor.reconcile()).items():
+            logger.warning(
+                "{}: {:.8f} held on the exchange is not in the bot's ledger — "
+                "ignored (not traded, valued or liquidated). To hand it to the "
+                "bot, start once with LIVE_ADOPT_EXISTING_BALANCE=true and an "
+                "empty state file.",
+                pair,
+                qty,
+            )
+        return saved is None
 
     def _restore_paper_account(self, snapshot: object) -> bool:
         """Restore the simulated account saved with the risk state."""
@@ -1760,6 +1843,8 @@ class TradingOrchestrator:
         # the stops and rebalanced candles saved next to it.
         if isinstance(self._executor, PaperExecutor):
             state["paper_account"] = self._executor.to_dict()
+        elif isinstance(self._executor, LiveExecutor):
+            state["live_ledger"] = self._executor.to_dict()
         try:
             self._risk_store.save(state)
         except Exception:

@@ -88,6 +88,17 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   muere, así que un crash no deja un lock colgado.
 - En live, **un retiro de fondos cuenta como pérdida** para el drawdown: tras
   retirar, reiniciar una vez con `RISK_RESET=true`.
+- En live el bot lleva un **libro de posición propio** (`live_ledger` en el
+  archivo de estado): solo opera, valora y liquida las monedas que *él*
+  compró de cada par, nunca más que el saldo real del exchange. Monedas tuyas
+  del mismo activo en la cuenta se ignoran (se avisa en el log al arrancar) y
+  el kill-switch solo cancela las órdenes stop que colocó el bot. Sin libro
+  guardado (primer arranque en live o estado de una versión anterior) adopta
+  solo lo que cubren sus stops guardados; con
+  `LIVE_ADOPT_EXISTING_BALANCE=true` adopta todo el saldo de cada par (usarlo
+  una vez, con una cuenta dedicada). El saldo en USDT sigue contando entero
+  para el drawdown: lo recomendable sigue siendo una cuenta o subcuenta
+  dedicada.
 - En paper la cuenta simulada (efectivo, posiciones y último precio) se
   guarda en el mismo archivo, en la misma escritura atómica que los stops, así
   que un reinicio sigue desde donde estaba: posiciones, pico y drawdown

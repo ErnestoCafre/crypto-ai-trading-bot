@@ -1,10 +1,20 @@
-"""Live trading executor — wraps ccxt async exchange (spot only)."""
+"""Live trading executor — wraps ccxt async exchange (spot only).
+
+Position ledger: the account may hold base assets the bot did not buy (the
+owner's own coins, airdrops, a manual trade). The executor keeps the
+quantity *it* bought per pair and treats ``min(ledger, exchange balance)`` as
+the bot's position for sizing, valuation, exits and liquidation, so it never
+sells what it does not own. The ledger is persisted by the bot with the risk
+state (:meth:`to_dict` / :meth:`restore`); taking it below the exchange
+balance only ever ignores coins, so the bot errs on the safe side.
+"""
 
 from __future__ import annotations
 
 import logging
+import math
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,12 +30,99 @@ class LiveExecutor(BaseExecutor):
         exchange: Any,
         pairs: Sequence[str] = (),
         quote_currency: str = "USDT",
+        owned: Mapping[str, float] | None = None,
     ) -> None:
         self._exchange = exchange
         # Only these pairs are managed by the bot: valuation and liquidation
         # never touch other assets held in the account.
         self._pairs = list(pairs)
         self._quote = quote_currency
+        # Base quantity the bot bought and still holds, per pair (see module
+        # docstring). Empty = the bot owns nothing yet.
+        self._owned: dict[str, float] = {}
+        # Native stop orders the bot placed: liquidation cancels only these.
+        self._own_orders: dict[str, str] = {}  # order id -> pair
+        if owned:
+            self.restore({"owned": dict(owned)})
+
+    # -- position ledger --
+
+    def to_dict(self) -> dict[str, Any]:
+        """Ledger snapshot for :meth:`restore` (persisted with the risk state)."""
+        return {"owned": dict(self._owned), "orders": dict(self._own_orders)}
+
+    def restore(self, data: Mapping[str, Any]) -> None:
+        """Replace the ledger with a :meth:`to_dict` snapshot.
+
+        Raises ValueError/TypeError/KeyError on malformed data and leaves the
+        ledger unchanged.
+        """
+        owned: dict[str, float] = {}
+        for pair, qty in dict(data["owned"]).items():
+            value = float(qty)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid owned quantity for {pair}: {qty}")
+            if value > 0:
+                owned[str(pair)] = value
+        orders = {str(k): str(v) for k, v in dict(data.get("orders") or {}).items()}
+        self._owned, self._own_orders = owned, orders
+
+    def owned(self, pair: str) -> float:
+        """Quantity the ledger attributes to the bot (before reconciliation)."""
+        return self._owned.get(pair, 0.0)
+
+    def record_external_fill(self, pair: str, side: str, quantity: float) -> None:
+        """Apply a fill that did not go through :meth:`place_order` (a native
+        stop executed by the exchange)."""
+        self._apply_fill(pair, side, quantity)
+
+    async def exchange_holdings(self) -> dict[str, float]:
+        """Total base balance on the exchange per managed pair (bot or not)."""
+        totals = (await self._exchange.fetch_balance()).get("total") or {}
+        return {p: float(totals.get(self._base(p)) or 0.0) for p in self._pairs}
+
+    async def reconcile(self) -> dict[str, float]:
+        """Clamp the ledger to the exchange balance; return foreign holdings.
+
+        A ledger above the balance means coins left outside the bot (manual
+        sell, a stop filled while it was down): the bot cannot own them any
+        more. Holdings above the ledger are the owner's and are left alone.
+        """
+        holdings = await self.exchange_holdings()
+        foreign: dict[str, float] = {}
+        for pair, total in holdings.items():
+            owned = self.owned(pair)
+            if owned > total:
+                logger.warning(
+                    "%s: ledger %.8f above exchange balance %.8f — clamped",
+                    pair,
+                    owned,
+                    total,
+                )
+                self._set_owned(pair, total)
+            elif total > owned:
+                foreign[pair] = total - owned
+        return foreign
+
+    def _apply_fill(self, pair: str, side: str, quantity: float) -> None:
+        if quantity <= 0:
+            return
+        owned = self.owned(pair)
+        self._set_owned(pair, owned + quantity if side == "buy" else owned - quantity)
+
+    def _set_owned(self, pair: str, quantity: float) -> None:
+        if quantity > 0:
+            self._owned[pair] = quantity
+        else:
+            self._owned.pop(pair, None)
+
+    async def _bot_holdings(self, totals: Mapping[str, Any]) -> dict[str, float]:
+        """min(ledger, exchange total) per managed pair, positive only."""
+        held = {
+            pair: min(self.owned(pair), float(totals.get(self._base(pair)) or 0.0))
+            for pair in self._pairs
+        }
+        return {pair: qty for pair, qty in held.items() if qty > 0}
 
     async def place_order(
         self,
@@ -71,6 +168,7 @@ class LiveExecutor(BaseExecutor):
             )
             status = "unconfirmed"
         filled_qty = float(filled) if filled is not None else quantity
+        self._apply_fill(pair, side, filled_qty)
         fee = order.get("fee") or {}
         return OrderResult(
             order_id=str(uuid.uuid4()),
@@ -112,6 +210,7 @@ class LiveExecutor(BaseExecutor):
         try:
             # Binance (and most ccxt exchanges) require the symbol to cancel.
             await self._exchange.cancel_order(order_id, pair)
+            self._own_orders.pop(order_id, None)
             return True
         except Exception:
             logger.exception("LiveExecutor.cancel_order failed for %s", order_id)
@@ -138,10 +237,7 @@ class LiveExecutor(BaseExecutor):
         used = float((balance.get("used") or {}).get(self._quote) or 0.0)
         cash_total = float(totals.get(self._quote) or 0.0)
 
-        held = {
-            pair: float(totals.get(self._base(pair)) or 0.0) for pair in self._pairs
-        }
-        held = {pair: qty for pair, qty in held.items() if qty > 0}
+        held = await self._bot_holdings(totals)
 
         positions_value = 0.0
         if held:
@@ -161,42 +257,41 @@ class LiveExecutor(BaseExecutor):
         }
 
     async def get_position(self, pair: str) -> float:
-        """Held base-asset amount for ``pair`` (dust below market minimums is 0).
+        """The bot's sellable amount for ``pair``: min(ledger, total balance).
 
-        Uses the total balance: an open stop order locks the position, so the
-        free balance alone would report it as flat.
+        Dust below market minimums is 0. Uses the total balance: an open stop
+        order locks the position, so the free balance alone would read flat.
         """
         balance = await self._exchange.fetch_balance()
-        qty = float((balance.get("total") or {}).get(self._base(pair)) or 0.0)
+        qty = (await self._bot_holdings(balance.get("total") or {})).get(pair, 0.0)
         if qty <= 0:
             return 0.0
         ticker = await self._exchange.fetch_ticker(pair)
         return await self._sellable_amount(pair, qty, self._ticker_price(ticker))
 
     async def close_all_positions(self) -> list[OrderResult]:
-        """Cancel the bot's open orders and sell its base assets to quote."""
+        """Cancel the bot's native stops and sell the bot's holdings to quote.
+
+        Only what the ledger attributes to the bot is sold, and only orders the
+        bot placed are cancelled: the owner's coins and orders are left alone.
+        """
         logger.warning(
             "LiveExecutor.close_all_positions initiated — emergency liquidation"
         )
         results: list[OrderResult] = []
 
-        # 1. Cancel open orders (incl. native stops, which lock the balance) on
-        # managed pairs only. Queried per symbol: Binance rejects symbol-less
-        # fetchOpenOrders by default.
+        # 1. Cancel the bot's open stops (they lock the balance). Queried per
+        # symbol: Binance rejects symbol-less fetchOpenOrders by default.
         for pair in self._pairs:
             for order in await self.get_open_orders(pair):
                 oid = str(order.get("id", ""))
-                if oid and order.get("symbol", pair) == pair:
+                if oid in self._own_orders and order.get("symbol", pair) == pair:
                     await self.cancel_order(oid, pair)
 
-        # 2. Sell managed base assets at market
+        # 2. Sell the bot's holdings at market
         try:
             balance = await self._exchange.fetch_balance()
-            free = balance.get("free") or {}
-            to_sell = {
-                pair: float(free.get(self._base(pair)) or 0.0) for pair in self._pairs
-            }
-            to_sell = {pair: qty for pair, qty in to_sell.items() if qty > 0}
+            to_sell = await self._bot_holdings(balance.get("free") or {})
             tickers = (
                 await self._exchange.fetch_tickers(list(to_sell)) if to_sell else {}
             )
@@ -259,6 +354,7 @@ class LiveExecutor(BaseExecutor):
             order_id = order.get("id")
             if not order_id:
                 raise ValueError("exchange returned no order id")
+            self._own_orders[str(order_id)] = pair
             logger.info(
                 "Stop-loss placed for %s: %s @ %s (order %s)",
                 pair,
@@ -283,7 +379,10 @@ class LiveExecutor(BaseExecutor):
             logger.exception("LiveExecutor.close failed")
 
     async def get_order(self, order_id: str, pair: str) -> dict[str, Any]:
-        return dict(await self._exchange.fetch_order(order_id, pair))
+        order = dict(await self._exchange.fetch_order(order_id, pair))
+        if order.get("status") not in (None, "open"):
+            self._own_orders.pop(order_id, None)  # no longer live: forget it
+        return order
 
     async def tradable_amount(self, pair: str, quantity: float, price: float) -> float:
         """Market precision and minimum amount/notional (buys and sells)."""

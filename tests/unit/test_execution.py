@@ -262,7 +262,9 @@ class TestLiveExecutor:
             },
         )
         executor = LiveExecutor(
-            exchange=mock_exchange, pairs=["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+            exchange=mock_exchange,
+            pairs=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+            owned={"BTC/USDT": 0.5, "ETH/USDT": 2.0},
         )
         balance = await executor.get_balance()
 
@@ -285,7 +287,9 @@ class TestLiveExecutor:
         mock_exchange = _mock_exchange(
             {"total": {"USDT": 1000.0, "BTC": 0.5}, "free": {}, "used": {}}
         )
-        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor = LiveExecutor(
+            exchange=mock_exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         with pytest.raises(RuntimeError, match="BTC/USDT"):
             await executor.get_balance()
 
@@ -380,7 +384,9 @@ class TestLiveExecutor:
             tickers={"BTC/USDT": {"last": 60000.0}},
             limits={"BTC/USDT": {"amount": {"min": 0.00001}}},
         )
-        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor = LiveExecutor(
+            exchange=mock_exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 1.0}
+        )
         assert await executor.get_position("BTC/USDT") == pytest.approx(0.12345)
         assert await executor.get_position("ETH/USDT") == 0.0
 
@@ -439,6 +445,7 @@ class TestLiveExecutor:
         )
 
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor.restore({"owned": {"BTC/USDT": 0.5}, "orders": {"ord-1": "BTC/USDT"}})
         results = await executor.close_all_positions()
 
         mock_exchange.cancel_order.assert_called_once_with("ord-1", "BTC/USDT")
@@ -481,6 +488,12 @@ class TestLiveExecutor:
         )
 
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT", "ETH/USDT"])
+        executor.restore(
+            {
+                "owned": {"BTC/USDT": 1.0, "ETH/USDT": 1.0},
+                "orders": {"bot-1": "BTC/USDT"},
+            }
+        )
         results = await executor.close_all_positions()
 
         # Only the bot's pair order is cancelled; BNB/DOGE are untouched;
@@ -501,7 +514,9 @@ class TestLiveExecutor:
             {"free": {"BTC": 0.0}, "used": {"BTC": 0.5}, "total": {"BTC": 0.5}},
             tickers={"BTC/USDT": {"last": 60000.0}},
         )
-        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor = LiveExecutor(
+            exchange=mock_exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         assert await executor.get_position("BTC/USDT") == pytest.approx(0.5)
 
     @pytest.mark.asyncio()
@@ -563,6 +578,7 @@ class TestLiveExecutor:
 
         mock_exchange.fetch_open_orders = AsyncMock(side_effect=fetch_open_orders)
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        executor.restore({"owned": {"BTC/USDT": 0.5}, "orders": {"stop-1": "BTC/USDT"}})
 
         await executor.close_all_positions()
 

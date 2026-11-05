@@ -61,6 +61,14 @@ class BaseExecutor(ABC):
         """
         return None
 
+    def record_external_fill(  # noqa: B027
+        self, pair: str, side: str, quantity: float
+    ) -> None:
+        """Account for a fill the exchange executed on its own (native stop).
+
+        No-op by default: only executors that track their own position need it.
+        """
+
     async def get_order(self, order_id: str, pair: str) -> dict[str, Any]:
         """Fetch a native order (ccxt order structure)."""
         raise NotImplementedError(f"{type(self).__name__} has no native orders")

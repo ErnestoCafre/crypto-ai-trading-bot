@@ -93,6 +93,7 @@ def _make_settings(**overrides):
         "RISK_STATE_PATH": _RISK_STATE_PATH,
         "DONCHIAN_DECISION_LOG_PATH": _DECISION_LOG_PATH,
         "RISK_RESET": False,
+        "LIVE_ADOPT_EXISTING_BALANCE": False,
         "LLM_ANALYSIS_INTERVAL_MIN": 15,
         "OHLCV_FETCH_MAX_RETRIES": 5,
         "OHLCV_FETCH_TIMEOUT_S": 60.0,
@@ -208,6 +209,7 @@ def _wire_mocks(orch: TradingOrchestrator, ohlcv=None):
     orch._executor.close_all_positions = AsyncMock(return_value=[])
     orch._executor.get_position = AsyncMock(return_value=0.0)
     orch._executor.update_prices = MagicMock()
+    orch._executor.record_external_fill = MagicMock()
 
     orch._fetcher = AsyncMock()
     orch._fetcher.fetch_ohlcv = AsyncMock(return_value=ohlcv)
@@ -912,6 +914,9 @@ class TestPositionAwareness:
             "get_balance",
             AsyncMock(return_value={"total": 1_234.0, "cash": 1_234.0}),
         )
+        monkeypatch.setattr(
+            LiveExecutor, "exchange_holdings", AsyncMock(return_value={})
+        )
 
         await orch._init_components()
 
@@ -1108,7 +1113,9 @@ class TestStopLoss:
         exchange = _live_exchange(btc=0.0123456)
         exchange.create_order = AsyncMock(return_value={"id": "stop-1"})
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.0123456}
+        )
 
         await orch._register_stop("BTC/USDT", 48_000.1299, _flat_ohlcv())
 
@@ -1130,7 +1137,9 @@ class TestStopLoss:
         exchange = _live_exchange(btc=0.5)
         exchange.create_order = AsyncMock(side_effect=Exception("rejected"))
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
 
         await orch._register_stop("BTC/USDT", 48_000.0, _flat_ohlcv())
 
@@ -1147,7 +1156,9 @@ class TestStopLoss:
         calls.attach_mock(exchange.create_order, "create_order")
         orch = self._orch(_flat_ohlcv())
         _set_signal(orch, SignalType.CLOSE)
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         orch._stop_tracker.register("BTC/USDT", 48_000.0, 0.5, "stop-1", None)
 
         await orch.run_trading_cycle()
@@ -1173,7 +1184,9 @@ class TestStopLoss:
             }
         )
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         orch._stop_tracker.register("BTC/USDT", 48_000.0, 0.5, "stop-1", None)
 
         await orch.run_trading_cycle()
@@ -1181,6 +1194,8 @@ class TestStopLoss:
         exchange.fetch_order.assert_awaited_once_with("stop-1", "BTC/USDT")
         assert "BTC/USDT" not in orch._stop_tracker
         orch._notifier.send_alert.assert_awaited_once()
+        # The exchange sold the bot's coins: the ledger follows (audit H-1).
+        assert orch._executor.owned("BTC/USDT") == 0.0
 
     @pytest.mark.asyncio
     async def test_externally_cancelled_native_stop_is_watched(self):
@@ -1191,7 +1206,9 @@ class TestStopLoss:
             return_value={"id": "stop-1", "status": "canceled"}
         )
         orch = self._orch(_flat_ohlcv())
-        orch._executor = LiveExecutor(exchange=exchange, pairs=["BTC/USDT"])
+        orch._executor = LiveExecutor(
+            exchange=exchange, pairs=["BTC/USDT"], owned={"BTC/USDT": 0.5}
+        )
         orch._stop_tracker.register("BTC/USDT", 48_000.0, 0.5, "stop-1", None)
 
         await orch.run_trading_cycle()
