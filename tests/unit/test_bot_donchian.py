@@ -153,15 +153,47 @@ class TestTargetRebalancing:
         executor.place_order.assert_not_awaited()
         assert await executor.get_position(PAIR) == held
 
-    async def test_insufficient_history_targets_zero(self, tmp_path):
+    async def test_insufficient_history_holds_position_and_alerts(self, tmp_path):
+        # Too little history is a data problem, not a sell signal (audit M-1).
         short = _daily(n=400)
         executor = _paper()
         await executor.place_order(PAIR, "buy", "market", 0.5, 20_000.0)
         orch = _orchestrator(tmp_path, short, executor)
+        orch._notifier = AsyncMock()
 
         await orch.run_trading_cycle()
+        await orch.run_trading_cycle()
 
-        assert await executor.get_position(PAIR) == 0.0
+        assert await executor.get_position(PAIR) == 0.5
+        assert PAIR not in orch._rebalanced  # retried next cycle
+        orch._notifier.send_alert.assert_awaited_once()  # once per candle
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "decisions_paper.jsonl").read_text().splitlines()
+        ]
+        assert records[-1]["held_not_ready"] is True
+
+    async def test_unfilled_order_is_retried_next_cycle(self, tmp_path):
+        # A rejected/expired order must not mark the candle done (audit H-2).
+        executor = _paper()
+        real_place = executor.place_order
+        rejected = PaperExecutor._rejected(PAIR, "buy", 0.0)
+        executor.place_order = AsyncMock(return_value=rejected)
+        orch = _orchestrator(tmp_path, _daily(), executor)
+
+        await orch.run_trading_cycle()
+        assert PAIR not in orch._rebalanced
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "decisions_paper.jsonl").read_text().splitlines()
+        ]
+        assert records[-1]["unfilled"] is True
+
+        executor.place_order = AsyncMock(wraps=real_place)
+        await orch.run_trading_cycle()
+        executor.place_order.assert_awaited_once()
+        assert PAIR in orch._rebalanced
+        assert await executor.get_position(PAIR) > 0
 
     async def test_no_history_and_flat_places_nothing(self, tmp_path):
         executor = _paper()

@@ -136,6 +136,9 @@ class TradingOrchestrator:
         # decision log once its orders ran.
         self._cycle_decisions: dict[str, dict[str, object]] = {}
         self._decision_log: DecisionLog | None = None
+        # donchian_ensemble: (pair, candle) already alerted for holding a
+        # position without enough history to compute its target.
+        self._not_ready_alerted: set[tuple[str, str]] = set()
 
     @property
     def _target_mode(self) -> bool:
@@ -1339,15 +1342,25 @@ class TradingOrchestrator:
 
         for pair, candle, delta in sorted(orders, key=lambda o: o[2]):
             try:
+                done = True
                 if delta < 0:
-                    await self._rebalance_sell(pair, -delta, prices[pair])
+                    done = await self._rebalance_sell(pair, -delta, prices[pair])
                 elif delta > 0:
-                    await self._rebalance_buy(pair, delta, prices[pair])
+                    done = await self._rebalance_buy(pair, delta, prices[pair])
             except Exception:
                 logger.exception("{}: rebalance order failed", pair)
                 if pair in self._cycle_decisions:
                     self._cycle_decisions[pair]["order_error"] = True
                 continue  # not marked: retried next cycle
+            if not done:
+                # An order went out and nothing filled (rejected, expired):
+                # leave the candle unmarked so the next hourly cycle retries.
+                logger.warning(
+                    "{}: rebalance order not filled — retrying next cycle", pair
+                )
+                if pair in self._cycle_decisions:
+                    self._cycle_decisions[pair]["unfilled"] = True
+                continue
             self._rebalanced[pair] = candle
         self._save_risk_state()
         self._write_decisions()
@@ -1382,6 +1395,28 @@ class TradingOrchestrator:
         held_value = held * price
         sleeve = equity * allocation
         current = held_value / sleeve if sleeve > 0 else 0.0
+        candle = pd.Timestamp(ohlcv.index[-1]).isoformat()
+
+        if not target.ready and held_value > 0:
+            # Too little history is a data problem (truncated fetch, renamed
+            # symbol, longer lookbacks), not a signal: a target of 0 would
+            # liquidate the position. Hold it, alert, and retry next cycle.
+            await self._alert_not_ready(pair, candle, len(ohlcv))
+            self._cycle_decisions[pair] = {
+                "mode": str(s.BOT_MODE),
+                "pair": pair,
+                "candle": candle,
+                "decided_at": datetime.now(UTC).isoformat(),
+                "bars": len(ohlcv),
+                "ready": False,
+                "held_w": current,
+                "equity": equity,
+                "price": price,
+                "allocation": allocation,
+                "held_not_ready": True,
+                "fill": None,
+            }
+            return None
 
         multiplier, block_increase = ai_exposure_multiplier(
             self._build_ai_signals(pair, ohlcv),
@@ -1416,7 +1451,7 @@ class TradingOrchestrator:
         self._cycle_decisions[pair] = {
             "mode": str(s.BOT_MODE),
             "pair": pair,
-            "candle": pd.Timestamp(ohlcv.index[-1]).isoformat(),
+            "candle": candle,
             "decided_at": datetime.now(UTC).isoformat(),
             "bars": len(ohlcv),
             "ready": target.ready,
@@ -1446,6 +1481,22 @@ class TradingOrchestrator:
             return None
         return delta
 
+    async def _alert_not_ready(self, pair: str, candle: str, bars: int) -> None:
+        """Warn (and notify once per candle) that a held pair has no target."""
+        s = self._settings
+        needed = required_history(s.DONCHIAN_LOOKBACKS, s.DONCHIAN_VOL_WINDOW)
+        message = (
+            f"{pair}: position held but only {bars} daily candles were fetched "
+            f"(need {needed}). Not rebalancing: check the market data."
+        )
+        logger.error(message)
+        key = (pair, candle)
+        if key in self._not_ready_alerted:
+            return
+        self._not_ready_alerted.add(key)
+        if self._notifier is not None:
+            await self._notifier.send_alert(message, level="warning")
+
     def _log_target(self, pair: str, target: EnsembleTarget, bars: int) -> None:
         if not target.ready:
             logger.warning(
@@ -1469,18 +1520,22 @@ class TradingOrchestrator:
             {c.lookback: c.stop for c in target.channels if c.in_position},
         )
 
-    async def _rebalance_sell(self, pair: str, value: float, price: float) -> None:
+    async def _rebalance_sell(self, pair: str, value: float, price: float) -> bool:
+        """Sell ``value`` of ``pair``; False only if an order went unfilled."""
         assert self._executor is not None
         held = await self._executor.get_position(pair)
         quantity = held if value >= held * price else value / price
         quantity = await self._executor.tradable_amount(pair, quantity, price)
         if quantity <= 0:
             logger.info("{}: sell of ${:,.2f} below market minimum", pair, value)
-            return
-        await self._fill_rebalance(pair, "sell", quantity, price)
+            return True
+        return await self._fill_rebalance(pair, "sell", quantity, price)
 
-    async def _rebalance_buy(self, pair: str, value: float, price: float) -> None:
-        """Buy up to ``value``, or what the free quote cash affords."""
+    async def _rebalance_buy(self, pair: str, value: float, price: float) -> bool:
+        """Buy up to ``value``, or what the free quote cash affords.
+
+        False only if an order went out and nothing filled.
+        """
         assert self._executor is not None
         balance = await self._executor.get_balance()
         free = float(balance.get("free", balance.get("cash", 0.0)))
@@ -1495,12 +1550,13 @@ class TradingOrchestrator:
         quantity = await self._executor.tradable_amount(pair, spend / price, price)
         if quantity <= 0:
             logger.info("{}: buy of ${:,.2f} below market minimum", pair, spend)
-            return
-        await self._fill_rebalance(pair, "buy", quantity, price)
+            return True
+        return await self._fill_rebalance(pair, "buy", quantity, price)
 
     async def _fill_rebalance(
         self, pair: str, side: str, quantity: float, price: float
-    ) -> None:
+    ) -> bool:
+        """Send one rebalance order; True if anything filled."""
         assert self._executor is not None
         result = await self._execute_order(pair, side, quantity, price)
         if pair in self._cycle_decisions:
@@ -1513,13 +1569,14 @@ class TradingOrchestrator:
                 "at": result.timestamp.isoformat(),
             }
         if not await self._report_fill(result, DONCHIAN_STRATEGY):
-            return
+            return False
         if self._journal is not None:
             await self._journal.record_rebalance(
                 result,
                 strategy=DONCHIAN_STRATEGY,
                 position_after=await self._executor.get_position(pair),
             )
+        return True
 
     async def _drop_trade_stops(self) -> None:
         """donchian_ensemble exits through its channel stops, not per-trade
