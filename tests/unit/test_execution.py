@@ -292,6 +292,7 @@ class TestLiveExecutor:
     @pytest.mark.asyncio()
     async def test_place_order_handles_none_average(self) -> None:
         mock_exchange = _mock_exchange({})
+        mock_exchange.fetch_order = AsyncMock(return_value={"id": "ord-1"})
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
 
         result = await executor.place_order(
@@ -300,10 +301,56 @@ class TestLiveExecutor:
         assert result.filled_price == 50000.0
         assert result.filled_quantity == 0.01
         assert result.fee == 0.0
-        assert result.status == "closed"
+        # Fill neither in the response nor in fetch_order: flagged (audit M-2).
+        assert result.status == "unconfirmed"
+        mock_exchange.fetch_order.assert_awaited_with("ord-1", "BTC/USDT")
 
         no_price = await executor.place_order("BTC/USDT", "sell", "market", 0.01)
         assert no_price.filled_price == 0.0
+
+    @pytest.mark.asyncio()
+    async def test_place_order_fetches_the_fill_when_not_reported(self) -> None:
+        mock_exchange = _mock_exchange({})
+        mock_exchange.fetch_order = AsyncMock(
+            return_value={
+                "id": "ord-1",
+                "status": "expired",
+                "filled": 0.0,
+                "average": None,
+                "cost": 0.0,
+            }
+        )
+        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+
+        result = await executor.place_order(
+            "BTC/USDT", "buy", "market", 0.01, price=50000.0
+        )
+
+        assert result.filled_quantity == 0.0  # nothing filled: not assumed
+        assert result.status == "expired"
+
+    @pytest.mark.asyncio()
+    async def test_fill_price_from_cost_when_average_missing(self) -> None:
+        mock_exchange = _mock_exchange({})
+        mock_exchange.create_order = AsyncMock(
+            return_value={"id": "1", "status": "closed", "filled": 0.02, "cost": 990.0}
+        )
+        executor = LiveExecutor(exchange=mock_exchange)
+        result = await executor.place_order(
+            "BTC/USDT", "sell", "market", 0.02, price=50000.0
+        )
+        assert result.filled_price == pytest.approx(49_500.0)
+        mock_exchange.fetch_order.assert_not_awaited()
+
+    @pytest.mark.asyncio()
+    async def test_market_order_does_not_send_a_price(self) -> None:
+        mock_exchange = _mock_exchange({})
+        executor = LiveExecutor(exchange=mock_exchange)
+        await executor.place_order("BTC/USDT", "buy", "market", 0.01, price=50000.0)
+        await executor.place_order("BTC/USDT", "buy", "limit", 0.01, price=49000.0)
+        calls = mock_exchange.create_order.await_args_list
+        assert calls[0].kwargs["price"] is None
+        assert calls[1].kwargs["price"] == 49000.0
 
     @pytest.mark.asyncio()
     async def test_place_order_prefers_average_then_price(self) -> None:

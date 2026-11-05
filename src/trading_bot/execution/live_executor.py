@@ -35,34 +35,78 @@ class LiveExecutor(BaseExecutor):
         quantity: float,
         price: float | None = None,
     ) -> OrderResult:
+        """Send an order and report what actually filled.
+
+        For market orders ``price`` is only the reference used when the
+        exchange reports no fill price; it is not sent (ccxt could turn it
+        into a limit on some exchanges). When the response lacks ``filled``
+        the order is fetched once; if it is still unknown the requested
+        quantity is assumed and the status is ``"unconfirmed"``.
+        """
         try:
-            result = await self._exchange.create_order(
+            order = await self._exchange.create_order(
                 symbol=pair,
                 type=order_type,
                 side=side,
                 amount=quantity,
-                price=price,
-            )
-            # ccxt returns None for average/filled/fee on many market orders.
-            filled = result.get("filled")
-            fee = result.get("fee") or {}
-            return OrderResult(
-                order_id=str(uuid.uuid4()),
-                exchange_order_id=str(result.get("id", "")),
-                pair=pair,
-                side=side,
-                filled_price=float(
-                    result.get("average") or result.get("price") or price or 0.0
-                ),
-                filled_quantity=float(filled) if filled is not None else quantity,
-                fee=float(fee.get("cost") or 0.0),
-                slippage_pct=0.0,
-                status=str(result.get("status") or "unknown"),
-                timestamp=datetime.now(UTC),
+                price=None if order_type == "market" else price,
             )
         except Exception:
             logger.exception("LiveExecutor.place_order failed for %s", pair)
             raise
+        order = dict(order or {})
+        if order.get("filled") is None and order.get("id"):
+            order = await self._refresh_order(order, pair)
+
+        filled = order.get("filled")
+        status = str(order.get("status") or "unknown")
+        if filled is None:
+            logger.warning(
+                "%s %s order %s: fill not reported by the exchange — assuming "
+                "%.8f; the position is re-read from the balance",
+                pair,
+                side,
+                order.get("id"),
+                quantity,
+            )
+            status = "unconfirmed"
+        filled_qty = float(filled) if filled is not None else quantity
+        fee = order.get("fee") or {}
+        return OrderResult(
+            order_id=str(uuid.uuid4()),
+            exchange_order_id=str(order.get("id", "")),
+            pair=pair,
+            side=side,
+            filled_price=self._fill_price(order, filled_qty, price),
+            filled_quantity=filled_qty,
+            fee=float(fee.get("cost") or 0.0) if isinstance(fee, dict) else 0.0,
+            slippage_pct=0.0,
+            status=status,
+            timestamp=datetime.now(UTC),
+        )
+
+    async def _refresh_order(self, order: dict[str, Any], pair: str) -> dict[str, Any]:
+        """Merge the exchange's current view of ``order`` (one fetch_order)."""
+        try:
+            fetched = dict(await self._exchange.fetch_order(str(order["id"]), pair))
+        except Exception:
+            logger.warning(
+                "Could not fetch order %s on %s", order["id"], pair, exc_info=True
+            )
+            return order
+        return {**order, **{k: v for k, v in fetched.items() if v is not None}}
+
+    @staticmethod
+    def _fill_price(
+        order: dict[str, Any], filled: float, reference: float | None
+    ) -> float:
+        """Average fill price; cost / filled; order price; else the reference."""
+        if order.get("average"):
+            return float(order["average"])
+        cost = order.get("cost")
+        if cost and filled > 0:
+            return float(cost) / filled
+        return float(order.get("price") or reference or 0.0)
 
     async def cancel_order(self, order_id: str, pair: str | None = None) -> bool:
         try:
