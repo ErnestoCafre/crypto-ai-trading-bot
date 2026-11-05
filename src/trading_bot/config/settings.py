@@ -63,15 +63,15 @@ class Settings(BaseSettings):
 
     # --- Orchestrator ---
     TRADING_TIMEFRAME: str = "1h"
-    TRADING_INTERVAL_MINUTES: int = 60
-    OHLCV_LOOKBACK_BARS: int = 250
+    TRADING_INTERVAL_MINUTES: int = Field(default=60, ge=1)
+    OHLCV_LOOKBACK_BARS: int = Field(default=250, ge=1)
     # Bounded retries (exponential backoff + jitter) and a total timeout per
     # OHLCV fetch, so an exchange outage cannot stall the trading cycle.
     OHLCV_FETCH_MAX_RETRIES: int = 5
     OHLCV_FETCH_TIMEOUT_S: float = 60.0
-    INITIAL_BALANCE: float = 100_000.0
-    PAPER_SLIPPAGE_PCT: float = 0.05
-    PAPER_FEE_PCT: float = 0.1
+    INITIAL_BALANCE: float = Field(default=100_000.0, gt=0.0)
+    PAPER_SLIPPAGE_PCT: float = Field(default=0.05, ge=0.0, lt=100.0)
+    PAPER_FEE_PCT: float = Field(default=0.1, ge=0.0, lt=100.0)
 
     # --- Risk Management ---
     # Sizing: quantity = min(risk budget / stop distance, position cap). The
@@ -80,10 +80,12 @@ class Settings(BaseSettings):
     # ~0.18 %, no volatility adjustment). See README "Tamaño de posición".
     # donchian_ensemble: MAX_POSITION_PCT is each pair's allocation instead
     # and MAX_RISK_PER_TRADE_PCT is unused.
-    MAX_RISK_PER_TRADE_PCT: float = 0.20
-    MAX_POSITION_PCT: float = 25.0
-    MAX_DRAWDOWN_PCT: float = 15.0
-    MAX_DAILY_LOSS_PCT: float = 3.0
+    # Percentages of the portfolio: a 0, negative or >100 value is a typo
+    # that would silently disable a limit or lever the account (spot only).
+    MAX_RISK_PER_TRADE_PCT: float = Field(default=0.20, gt=0.0, le=100.0)
+    MAX_POSITION_PCT: float = Field(default=25.0, gt=0.0, le=100.0)
+    MAX_DRAWDOWN_PCT: float = Field(default=15.0, gt=0.0, le=100.0)
+    MAX_DAILY_LOSS_PCT: float = Field(default=3.0, gt=0.0, le=100.0)
     # Persisted drawdown latch + stops. "{mode}" is replaced by BOT_MODE so a
     # paper session never overwrites the live halt state.
     RISK_STATE_PATH: str = "var/state/risk_state_{mode}.json"
@@ -173,9 +175,9 @@ class Settings(BaseSettings):
     MEAN_REVERSION_ENTRIES: bool = False
 
     # --- Backtesting ---
-    BACKTEST_INITIAL_CAPITAL: float = 100_000.0
-    BACKTEST_FEE_PCT: float = 0.1
-    BACKTEST_SLIPPAGE_PCT: float = 0.05
+    BACKTEST_INITIAL_CAPITAL: float = Field(default=100_000.0, gt=0.0)
+    BACKTEST_FEE_PCT: float = Field(default=0.1, ge=0.0, lt=100.0)
+    BACKTEST_SLIPPAGE_PCT: float = Field(default=0.05, ge=0.0, lt=100.0)
     BACKTEST_WALK_FORWARD_SPLITS: int = 5
     # Warm-up share before the first OOS fold (scripts/run_backtest.py default).
     BACKTEST_WALK_FORWARD_TRAIN_RATIO: float = 0.6
