@@ -11,6 +11,14 @@ from pydantic import ValidationError
 from trading_bot.config.settings import Settings
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defaults are asserted against Settings, not the runner's environment
+    (a CI job with BOT_MODE=live must not fail these tests)."""
+    for key in Settings.model_fields:
+        monkeypatch.delenv(key, raising=False)
+
+
 class TestSettings:
     def test_defaults(self) -> None:
         s = Settings()
