@@ -154,3 +154,18 @@ def test_decision_log_round_trip_skips_malformed_lines(tmp_path):
     log.append({"pair": PAIR, "target": 0.6})
     assert [r["target"] for r in read_decisions(path)] == [0.5, 0.6]
     assert read_decisions(tmp_path / "missing.jsonl") == []
+
+
+def test_held_not_ready_record_is_reported_not_crashing():
+    # The bot logs no target when it holds a pair with too little history
+    # (audit M-1 fix); parity must report it instead of raising KeyError.
+    ohlcv = _daily()
+    records = _records(ohlcv)
+    held = dict(records[-1])
+    held.pop("target")
+    held["held_not_ready"] = True
+    records[-1] = held
+    report = _check(records, ohlcv)
+    assert report.rows[-1].bot_target is None
+    assert report.rows[-1].target_gap is None
+    assert any("bot computed no target" in f for f in report.failures(**LIMITS))
