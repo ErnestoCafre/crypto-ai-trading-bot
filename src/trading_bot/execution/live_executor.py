@@ -137,9 +137,12 @@ class LiveExecutor(BaseExecutor):
         For market orders ``price`` is only the reference used when the
         exchange reports no fill price; it is not sent (ccxt could turn it
         into a limit on some exchanges). When the response lacks ``filled``
-        the order is fetched once; if it is still unknown the requested
-        quantity is assumed and the status is ``"unconfirmed"``.
+        the order is fetched once; if it is still unknown the fill is
+        measured as the change of the base balance and the status is
+        ``"unconfirmed"``. The ledger moves by the base actually received or
+        given (a buy fee charged in the base asset is deducted).
         """
+        before = await self._base_total(pair)
         try:
             order = await self._exchange.create_order(
                 symbol=pair,
@@ -158,17 +161,21 @@ class LiveExecutor(BaseExecutor):
         filled = order.get("filled")
         status = str(order.get("status") or "unknown")
         if filled is None:
+            filled = await self._measured_fill(pair, side, before, quantity)
             logger.warning(
-                "%s %s order %s: fill not reported by the exchange — assuming "
-                "%.8f; the position is re-read from the balance",
+                "%s %s order %s: fill not reported by the exchange — %.8f "
+                "measured from the balance",
                 pair,
                 side,
                 order.get("id"),
-                quantity,
+                filled,
             )
             status = "unconfirmed"
-        filled_qty = float(filled) if filled is not None else quantity
-        self._apply_fill(pair, side, filled_qty)
+            net = float(filled)  # a balance change is already net of fees
+        else:
+            net = self._net_base(order, pair, side, float(filled))
+        filled_qty = float(filled)
+        self._apply_fill(pair, side, net)
         fee = order.get("fee") or {}
         return OrderResult(
             order_id=str(uuid.uuid4()),
@@ -182,6 +189,50 @@ class LiveExecutor(BaseExecutor):
             status=status,
             timestamp=datetime.now(UTC),
         )
+
+    async def _base_total(self, pair: str) -> float | None:
+        """Total base balance of ``pair``; None if it cannot be read."""
+        try:
+            totals = (await self._exchange.fetch_balance()).get("total") or {}
+            return float(totals.get(self._base(pair)) or 0.0)
+        except Exception:
+            logger.warning("Could not read the %s balance", pair, exc_info=True)
+            return None
+
+    async def _measured_fill(
+        self, pair: str, side: str, before: float | None, requested: float
+    ) -> float:
+        """Fill size from the base balance change around the order.
+
+        Falls back to ``requested`` (logged) when a balance cannot be read:
+        the ledger is then clamped to the balance on the next reconcile.
+        """
+        after = await self._base_total(pair)
+        if before is None or after is None:
+            logger.error(
+                "%s: cannot measure an unreported fill — assuming %.8f",
+                pair,
+                requested,
+            )
+            return requested
+        change = after - before if side == "buy" else before - after
+        return max(0.0, change)
+
+    def _net_base(
+        self, order: dict[str, Any], pair: str, side: str, filled: float
+    ) -> float:
+        """Base received on a buy: ``filled`` minus fees charged in the base
+        asset (Binance without BNB). Sells give exactly ``filled``."""
+        if side != "buy":
+            return filled
+        fees = order.get("fees") or ([order["fee"]] if order.get("fee") else [])
+        base = self._base(pair)
+        in_base = sum(
+            float(f.get("cost") or 0.0)
+            for f in fees
+            if isinstance(f, dict) and f.get("currency") == base
+        )
+        return max(0.0, filled - in_base)
 
     async def _refresh_order(self, order: dict[str, Any], pair: str) -> dict[str, Any]:
         """Merge the exchange's current view of ``order`` (one fetch_order)."""

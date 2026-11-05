@@ -297,17 +297,64 @@ class TestLiveExecutor:
     async def test_place_order_handles_none_average(self) -> None:
         mock_exchange = _mock_exchange({})
         mock_exchange.fetch_order = AsyncMock(return_value={"id": "ord-1"})
+        # Balance before / after the order: the fill is measured from it.
+        mock_exchange.fetch_balance = AsyncMock(
+            side_effect=[{"total": {"BTC": 0.0}}, {"total": {"BTC": 0.0099}}]
+        )
         executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
 
         result = await executor.place_order(
             "BTC/USDT", "buy", "market", 0.01, price=50000.0
         )
         assert result.filled_price == 50000.0
-        assert result.filled_quantity == 0.01
+        assert result.filled_quantity == pytest.approx(0.0099)
         assert result.fee == 0.0
         # Fill neither in the response nor in fetch_order: flagged (audit M-2).
         assert result.status == "unconfirmed"
+        assert executor.owned("BTC/USDT") == pytest.approx(0.0099)
         mock_exchange.fetch_order.assert_awaited_with("ord-1", "BTC/USDT")
+
+    @pytest.mark.asyncio()
+    async def test_unmeasurable_fill_assumes_the_requested_amount(self) -> None:
+        mock_exchange = _mock_exchange({})
+        mock_exchange.fetch_order = AsyncMock(return_value={"id": "ord-1"})
+        mock_exchange.fetch_balance = AsyncMock(side_effect=ConnectionError("down"))
+        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        result = await executor.place_order(
+            "BTC/USDT", "buy", "market", 0.01, price=50000.0
+        )
+        assert result.filled_quantity == 0.01
+        assert result.status == "unconfirmed"
+
+    @pytest.mark.asyncio()
+    async def test_buy_fee_in_base_is_not_credited_to_the_ledger(self) -> None:
+        # Binance without BNB charges the buy fee in the bought coin: the
+        # account receives filled - fee, so the ledger must too.
+        mock_exchange = _mock_exchange({})
+        mock_exchange.create_order = AsyncMock(
+            return_value={
+                "id": "1",
+                "status": "closed",
+                "filled": 0.01,
+                "average": 50000.0,
+                "fee": {"cost": 0.00001, "currency": "BTC"},
+            }
+        )
+        executor = LiveExecutor(exchange=mock_exchange, pairs=["BTC/USDT"])
+        result = await executor.place_order("BTC/USDT", "buy", "market", 0.01)
+        assert result.filled_quantity == 0.01  # what the exchange filled
+        assert executor.owned("BTC/USDT") == pytest.approx(0.00999)
+
+        mock_exchange.create_order = AsyncMock(
+            return_value={
+                "id": "2",
+                "status": "closed",
+                "filled": 0.01,
+                "fees": [{"cost": 0.5, "currency": "USDT"}],
+            }
+        )
+        await executor.place_order("BTC/USDT", "buy", "market", 0.01)
+        assert executor.owned("BTC/USDT") == pytest.approx(0.01999)
 
         no_price = await executor.place_order("BTC/USDT", "sell", "market", 0.01)
         assert no_price.filled_price == 0.0
