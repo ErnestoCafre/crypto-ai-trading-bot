@@ -124,6 +124,19 @@ class TestPortfolio:
         assert res.exposure["B/USDT"].loc[: late.index[449]].sum() == 0
         assert len(res.equity_curve) == 900
 
+    def test_missing_bar_does_not_liquidate_the_pair(self) -> None:
+        df = _daily(seed=14, drift=0.003, n=1200)
+        engine = TargetExposureEngine(
+            allocation=0.5, rebalance_threshold=0.0, fee_pct=0.0, slippage_pct=0.0
+        )
+        full = engine.run({"A/USDT": df, "B/USDT": df})
+        held = full.exposure["B/USDT"]
+        day = held[held > 0.2].index[100]
+        gap = day - pd.Timedelta("1D")
+        res = engine.run({"A/USDT": df, "B/USDT": df.drop(index=gap)})
+        # No decision on the missing day: B keeps its position into ``day``.
+        assert res.exposure.loc[day, "B/USDT"] > 0.1
+
     def test_partial_sells_record_realised_trades(self) -> None:
         df = _daily(seed=12, drift=0.002, n=1500)
         res = TargetExposureEngine().run({"X/USDT": df})

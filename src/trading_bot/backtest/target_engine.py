@@ -164,9 +164,12 @@ class TargetExposureEngine:
             )
 
         opens, closes = aligned("open"), aligned("close")
-        targets = pd.DataFrame(
-            {p: self.targets(data[p]) for p in pairs}, index=index
-        ).fillna(0.0)
+        decided = pd.DataFrame({p: self.targets(data[p]) for p in pairs}, index=index)
+        # A day without a bar for a pair decides nothing for it: the live bot
+        # has no new closed candle and leaves the pair alone. Filling it with
+        # 0 would liquidate the pair at the next open.
+        known = decided.notna()
+        targets = decided.fillna(0.0)
         # Last known close values held positions on days a pair has no bar.
         marks = closes.ffill()
 
@@ -178,7 +181,7 @@ class TargetExposureEngine:
         for i, ts in enumerate(index):
             if self._execution == "next_open" and i > 0:
                 prices = opens.iloc[i].where(opens.iloc[i].notna(), marks.iloc[i - 1])
-                tradable = opens.iloc[i].notna()
+                tradable = opens.iloc[i].notna() & known.iloc[i - 1]
                 notional[i] += self._rebalance(
                     book, targets.iloc[i - 1], prices, tradable, ts
                 )
