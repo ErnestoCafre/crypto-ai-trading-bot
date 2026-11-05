@@ -295,6 +295,13 @@ class TradingOrchestrator:
             if price is not None:
                 prices[pair] = price
         self._executor.update_prices(prices)
+        stale = [p for p in self._settings.TRADING_PAIRS if p not in prices]
+        if stale:
+            logger.warning(
+                "No price this cycle for {}: valued at the last known price, "
+                "not traded",
+                ", ".join(stale),
+            )
 
         # Stops run before valuation and signals, and regardless of halts.
         await self._process_stops(market_data)
@@ -1362,8 +1369,10 @@ class TradingOrchestrator:
                     self._cycle_decisions[pair]["unfilled"] = True
                 continue
             self._rebalanced[pair] = candle
-        self._save_risk_state()
+        # Decisions first: a crash before the state save only repeats the
+        # candle (parity keeps the last record), never loses its record.
         self._write_decisions()
+        self._save_risk_state()
 
     def _write_decisions(self) -> None:
         """Append this cycle's decisions; a logging failure never stops trading."""

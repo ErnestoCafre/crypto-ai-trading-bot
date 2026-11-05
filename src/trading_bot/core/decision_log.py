@@ -26,13 +26,32 @@ class DecisionLog:
         return self._path
 
     def append(self, record: Mapping[str, Any]) -> None:
-        """Write one record as a line and fsync it."""
+        """Write one record as a line and fsync it.
+
+        A crash mid-write can leave a last line without its newline; the
+        record is then started on a fresh line so only the torn one is lost
+        (appending to it would corrupt both).
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, sort_keys=True, default=str)
+        prefix = "\n" if _ends_mid_line(self._path) else ""
         with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+            fh.write(prefix + line + "\n")
             fh.flush()
             os.fsync(fh.fileno())
+
+
+def _ends_mid_line(path: Path) -> bool:
+    """True if ``path`` is non-empty and does not end with a newline."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except FileNotFoundError:
+        return False
 
 
 def read_decisions(path: Path | str) -> list[dict[str, Any]]:

@@ -25,6 +25,20 @@ def atomic_write_json(path: Path | str, data: dict[str, Any]) -> None:
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Persist the rename itself: without it a power cut can bring back the
+    old file on some filesystems. No-op where directories cannot be opened
+    (Windows)."""
+    if os.name != "posix":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def read_json_dict(path: Path | str) -> dict[str, Any] | None:
