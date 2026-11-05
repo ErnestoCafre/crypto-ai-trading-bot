@@ -258,7 +258,9 @@ def ai_exposure_multiplier(
         return 1.0, False
     bearish: list[tuple[float, float]] = []
     if ai.sentiment_score is not None:
-        bearish.append((sentiment_weight, max(0.0, -min(1.0, ai.sentiment_score))))
+        # Bearishness = -score clamped to [0, 1]: a score below -1 must not
+        # push the multiplier under the floor (or below 0).
+        bearish.append((sentiment_weight, min(1.0, max(0.0, -ai.sentiment_score))))
     llm_short = False
     if ai.llm_recommendation is not None and ai.llm_confidence is not None:
         llm_short = ai.llm_recommendation.upper() in ("SHORT", "CLOSE")
