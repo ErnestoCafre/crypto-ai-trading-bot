@@ -85,7 +85,11 @@ uv run streamlit run src/trading_bot/dashboard/app.py # dashboard
   con código 1 sin leer ni escribir nada; si no, las dos operarían las mismas
   velas y se pisarían la cuenta paper y los stops. Paper y live usan archivos
   distintos y pueden correr a la vez. El lock se libera solo si el proceso
-  muere, así que un crash no deja un lock colgado.
+  muere, así que un crash no deja un lock colgado. Es un lock *advisory*
+  (`flock`) local: no protege entre máquinas ni en sistemas de archivos que no
+  lo respetan (NFS, algunos bind mounts de Docker Desktop en macOS/Windows), y
+  solo cubre `RISK_STATE_PATH`: dos instancias con distinto `RISK_STATE_PATH`
+  no deben compartir `DONCHIAN_DECISION_LOG_PATH`.
 - En live, **un retiro de fondos cuenta como pérdida** para el drawdown: tras
   retirar, reiniciar una vez con `RISK_RESET=true`.
 - En live el bot lleva un **libro de posición propio** (`live_ledger` en el
@@ -187,7 +191,10 @@ default sigue siendo `regime_selector`.
 - **Estado**: se reconstruye en cada ciclo recorriendo el OHLCV (el bot pide
   al menos 1000 velas diarias, o 360 + 90 + la ventana más larga si se
   configuran ventanas mayores), así que no se persiste y un reinicio da la
-  misma exposición. Con menos de 360 + 90 velas la exposición es 0. En BTC/ETH/SOL
+  misma exposición. Con menos de 360 + 90 velas la exposición es 0 si el par
+  está plano; si hay posición, el bot **no la vende**: la mantiene, avisa (log
+  y Telegram, una vez por vela) y reintenta cada hora, porque una historia
+  corta es un problema de datos y no una señal. En BTC/ETH/SOL
   2017-2026, una ventana de 720 velas ya reproducía el estado de la historia
   completa en todos los días probados (450 no). Si algún canal no tiene en la
   ventana un close debajo de su punto medio, el bot avisa con un warning.
@@ -206,7 +213,9 @@ default sigue siendo `regime_selector`.
   (`TRADING_INTERVAL_MINUTES` no se usa en este modo). El de las 00:02 opera
   el cierre diario cerca del open siguiente, como el backtest; los demás
   valoran la cartera, vigilan el kill-switch y reintentan un rebalanceo
-  fallido.
+  fallido: tanto si la orden dio error como si volvió sin ejecutarse
+  (rechazada o `expired`); en el decision log queda `order_error` o
+  `unfilled`.
 - **Asignación**: en este modo `MAX_POSITION_PCT` es la asignación de cada
   par. Con 25 % y 3 pares, la exposición total máxima es 75 % y la cartera
   rinde ~¾ de la 1/N testeada (mismo Sharpe, menos CAGR y menos drawdown).
@@ -291,7 +300,9 @@ termina con código 1 si algo no coincide:
 - **Ejecución**: slippage adverso de cada fill contra el open de t+1, y fee
   sobre el nocional. El promedio no debe superar `BACKTEST_SLIPPAGE_PCT` ni
   `BACKTEST_FEE_PCT`.
-- **Continuidad**: una decisión por par y día desde la primera.
+- **Continuidad**: una decisión por par y día desde la primera. Un día en que
+  el bot mantuvo una posición sin historia suficiente (`held_not_ready`) se
+  reporta como discrepancia.
 - **Demora**: primera decisión de la vela a más de 60 minutos del cierre
   (`--max-lag-min`). Los reintentos horarios mientras el riesgo bloquea una
   suba no cuentan como demora.
