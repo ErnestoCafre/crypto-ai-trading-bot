@@ -42,7 +42,7 @@ with log.open("w") as fh:
             "pair": pair,
             "candle": candle.isoformat(),
             "decided_at": (
-                candle + pd.Timedelta("1D") + pd.Timedelta("2min")
+                candle + pd.Timedelta(1, unit="D") + pd.Timedelta(2, unit="min")
             ).isoformat(),
             "target": t.exposure,
             "raw": t.raw_exposure,

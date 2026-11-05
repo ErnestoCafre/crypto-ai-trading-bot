@@ -16,8 +16,8 @@ import pandas as pd
 
 out, freq, n, seed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 rng = np.random.default_rng(seed)
-step = pd.Timedelta("1D") if freq.upper() == "1D" else pd.Timedelta("1h")
-per_year = 365 if step == pd.Timedelta("1D") else 365 * 24
+step = pd.Timedelta(1, unit="D") if freq.upper() == "1D" else pd.Timedelta(1, unit="h")
+per_year = 365 if step == pd.Timedelta(1, unit="D") else 365 * 24
 sigma = 0.65 / np.sqrt(per_year)  # ~65 % annualised volatility
 regime = np.repeat(rng.choice([-1.0, 0.0, 1.5], size=n // 60 + 1), 60)[:n]
 r = rng.normal(regime * 0.8 / per_year, sigma)

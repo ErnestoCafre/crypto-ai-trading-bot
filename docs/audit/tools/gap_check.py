@@ -19,7 +19,7 @@ eng = TargetExposureEngine(
 full = eng.run({"A": df, "B": df})
 held = full.exposure["B"]
 day = held[held > 0.2].index[min(300, int((held > 0.2).sum()) - 1)]
-gap = day - pd.Timedelta("1D")
+gap = day - pd.Timedelta(1, unit="D")
 res = eng.run({"A": df, "B": df.drop(index=gap)})
 print(
     "day",

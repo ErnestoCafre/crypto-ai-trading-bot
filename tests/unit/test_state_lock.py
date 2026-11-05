@@ -37,6 +37,7 @@ def other_process(tmp_path):
     yield path, proc
     proc.kill()
     proc.wait()
+    proc.stdout.close()
 
 
 def test_second_instance_is_refused(other_process):

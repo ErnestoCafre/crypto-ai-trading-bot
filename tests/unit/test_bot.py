@@ -998,7 +998,7 @@ class TestStopLoss:
         assert stop.quantity == pytest.approx(0.01)
         assert stop.order_id is None
         # The candle forming at entry (last closed + 1h) is never checked.
-        entry_candle = ohlcv.index[-1] + pd.Timedelta(hours=1)
+        entry_candle = ohlcv.index[-1] + pd.Timedelta(1, unit="h")
         assert stop.last_checked == entry_candle.isoformat()
 
     @pytest.mark.asyncio
@@ -1560,7 +1560,7 @@ class TestMarketData:
 
         kwargs = orch._fetcher.fetch_ohlcv.call_args.kwargs
         # 100 closed bars + the forming one, plus one bar of slack.
-        expected = before - pd.Timedelta(minutes=minutes * 102)
+        expected = before - pd.Timedelta(minutes * 102, unit="min")
         assert abs((kwargs["since"] - expected).total_seconds()) < 5
         assert kwargs["limit"] == 101
         assert kwargs["timeframe"] == tf
@@ -1763,7 +1763,7 @@ class TestSentimentAndCaches:
             fear_greed_score=0.7,
             num_sources_analyzed=3,
             time_window="1h",
-            timestamp=datetime.now(UTC) - pd.Timedelta(minutes=age_min),
+            timestamp=datetime.now(UTC) - pd.Timedelta(age_min, unit="min"),
         )
 
     def test_stale_sentiment_is_ignored(self):
@@ -1793,7 +1793,7 @@ class TestSentimentAndCaches:
                 total_tokens=0,
                 total_cost_usd=0.0,
                 total_latency_ms=0,
-                timestamp=datetime.now(UTC) - pd.Timedelta(minutes=age_min),
+                timestamp=datetime.now(UTC) - pd.Timedelta(age_min, unit="min"),
             )
 
         orch._latest_llm_decision["BTC/USDT"] = decision(age_min=10)

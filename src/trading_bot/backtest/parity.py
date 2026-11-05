@@ -24,7 +24,9 @@ import pandas as pd
 
 from trading_bot.backtest.target_engine import TargetExposureEngine
 
-DAY = pd.Timedelta(days=1)
+# Built from an explicit unit: pd.Timedelta(days=1) trips numpy>=2.5's
+# deprecated "generic" timedelta64 unit inside pandas 2.3.
+DAY = pd.Timedelta(1, unit="D")
 # Float residue allowed over a cost budget (a 0.1 % fee is not "> 0.1 %").
 _COST_EPSILON = 1e-9
 

@@ -132,7 +132,7 @@ class TestPortfolio:
         full = engine.run({"A/USDT": df, "B/USDT": df})
         held = full.exposure["B/USDT"]
         day = held[held > 0.2].index[100]
-        gap = day - pd.Timedelta("1D")
+        gap = day - pd.Timedelta(1, unit="D")
         res = engine.run({"A/USDT": df, "B/USDT": df.drop(index=gap)})
         # No decision on the missing day: B keeps its position into ``day``.
         assert res.exposure.loc[day, "B/USDT"] > 0.1
