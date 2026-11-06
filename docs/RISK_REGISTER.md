@@ -24,8 +24,8 @@ Riesgos técnicos y operacionales identificados para el bot de trading crypto co
 | ID | Riesgo | Prob. | Impacto | Prio. | Mitigación | Owner |
 |----|--------|-------|---------|-------|------------|-------|
 | R05 | **Flash crash / liquidation cascade** mueve precio 10-20% en minutos | 2 | 4 | 8 | Stop-loss server-side en exchange. Kill-switch drawdown >15%. Max apalancamiento 2-3x. Daily loss limit 3-5%. | risk/ |
-| R06 | **Slippage real muy superior al modelado** en altcoins | 3 | 3 | 9 | Solo operar pares de alta liquidez (BTC, ETH, SOL). Modelar slippage dinámico (no fijo). Limitar tamaño de orden vs profundidad del order book. | risk/ + backtest/ |
-| R07 | **Estrategia funciona en backtest pero falla en live** (overfitting) | 3 | 3 | 9 | Walk-forward validation. Monte Carlo 5000 sim. Paper trading mínimo 2-4 semanas antes de live. Out-of-sample testing estricto. | backtest/ |
+| R06 | **Slippage real muy superior al modelado** en altcoins | 3 | 3 | 9 | Solo operar pares de alta liquidez (BTC, ETH, SOL). Modelar slippage dinámico (no fijo). Limitar tamaño de orden vs profundidad del order book. Estrés de slippage ×2/×3 en `run_backtest.py --robustness`. | risk/ + backtest/ |
+| R07 | **Estrategia funciona en backtest pero falla en live** (overfitting) | 3 | 3 | 9 | Walk-forward validation. Monte Carlo 5000 sim. Paper trading mínimo 2-4 semanas antes de live. Out-of-sample testing estricto. Inicios aleatorios (`--robustness`), paridad backtest/ventana en vivo (`scripts/window_parity.py`) y versión del validador en cada reporte (`docs/VALIDATION_CHANGELOG.md`). | backtest/ |
 | R08 | **Exchange delista un par que el bot tiene en posición** | 1 | 3 | 3 | Monitorear anuncios del exchange. Solo operar top 20 por market cap. Alert si par va a ser delistado. | data/ |
 | R09 | **Funding rate acumula costos no previstos** en futuros perpetuos | 2 | 2 | 4 | Monitorear funding rate antes de abrir posición. Limitar holding time. Incluir funding en backtesting siempre. | risk/ |
 

@@ -20,11 +20,23 @@ Usage:
 
 donchian_ensemble simulates the kill-switch like the bot (MAX_DRAWDOWN_PCT,
 MAX_DAILY_LOSS_PCT, DONCHIAN_DAILY_LOSS_ACTION) unless --no-kill-switch.
+
+Robustness (both modes, ``--robustness``): random starts (``--samples``
+windows of ``--window`` bars launched flat on seeded random bars) and
+slippage stress (``--stress``, multiples of the modelled slippage, judged on
+the walk-forward OOS in regime_selector and on the holdout, or the full
+period, in donchian_ensemble). It ends with a pass/fail verdict; exit code
+stays 0 (it is a report). ``--json PATH`` writes every number plus the
+provenance block (validation version, commit, data hashes, settings):
+
+    uv run python scripts/run_backtest.py --pair BTC/USDT --robustness \
+        --json reports/bt_btc_1h.json
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -34,7 +46,18 @@ import pandas as pd
 
 from trading_bot.backtest.metrics import infer_periods_per_year
 from trading_bot.backtest.pipeline import build_live_engine, build_target_engine
+from trading_bot.backtest.provenance import VALIDATION_VERSION, provenance
 from trading_bot.backtest.report import BacktestReporter
+from trading_bot.backtest.robustness import (
+    DEFAULT_STRESS_MULTIPLIERS,
+    RandomStartResult,
+    RobustnessCriteria,
+    RobustnessReport,
+    StressPoint,
+    random_starts,
+    random_starts_target,
+    slippage_stress,
+)
 from trading_bot.backtest.target_engine import (
     DAILY_LOSS_ACTIONS,
     DailyLossAction,
@@ -133,7 +156,31 @@ def main() -> None:
         action="store_true",
         help="donchian_ensemble: portfolio under every daily-loss policy",
     )
+    parser.add_argument(
+        "--robustness",
+        action="store_true",
+        help="random starts + slippage stress, with a pass/fail verdict",
+    )
+    parser.add_argument(
+        "--samples", type=int, default=20, help="robustness: random windows"
+    )
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="robustness: bars per random window (default: 1/4 of the history)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="robustness: RNG seed")
+    parser.add_argument(
+        "--stress",
+        default=",".join(f"{k:g}" for k in DEFAULT_STRESS_MULTIPLIERS),
+        help="robustness: slippage multipliers, comma-separated",
+    )
+    parser.add_argument(
+        "--json", type=Path, default=None, help="write results + provenance here"
+    )
     args = parser.parse_args()
+    print(f"Validation {VALIDATION_VERSION}")
 
     overrides: dict[str, float] = {}
     if args.max_risk_pct is not None:
@@ -194,10 +241,62 @@ def main() -> None:
         f"maxDD {agg.get('max_drawdown_pct', 0):.2f}%"
     )
 
+    robustness = None
+    if args.robustness:
+        starts = random_starts(
+            engine, ohlcv, args.pair, args.samples, args.window, args.seed
+        )
+
+        def oos(slippage: float) -> dict[str, float]:
+            stressed = build_live_engine(
+                args.pair,
+                initial_capital=args.capital,
+                fee_pct=args.fee_pct,
+                slippage_pct=slippage,
+                settings=settings,
+            )
+            return wf.run(stressed, ohlcv, args.pair).aggregate_metrics
+
+        stress = slippage_stress(oos, args.slippage_pct, _multipliers(args.stress))
+        robustness = RobustnessReport(starts, stress, RobustnessCriteria())
+        _print_robustness(robustness, "walk-forward OOS")
+
     if args.html:
         out = f"reports/backtest_{args.pair.replace('/', '')}_{args.timeframe}.html"
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         BacktestReporter.generate_html(full, output_path=out)
+
+    if args.json:
+        _write_json(
+            args.json,
+            {
+                "provenance": provenance(
+                    settings,
+                    {args.pair: ohlcv},
+                    strategy_mode="regime_selector",
+                    timeframe=args.timeframe,
+                    fee_pct=args.fee_pct,
+                    slippage_pct=args.slippage_pct,
+                    walk_forward={
+                        "splits": args.splits,
+                        "train_ratio": args.train_ratio,
+                    },
+                ),
+                "full": full.metrics,
+                "walk_forward": {
+                    "folds": [
+                        {
+                            "start": str(f.start_date),
+                            "end": str(f.end_date),
+                            "metrics": f.metrics,
+                        }
+                        for f in result.fold_results
+                    ],
+                    "aggregate": agg,
+                },
+                "robustness": None if robustness is None else robustness.as_dict(),
+            },
+        )
 
 
 def _run_donchian(args: argparse.Namespace, settings: Settings) -> None:
@@ -244,12 +343,15 @@ def _run_donchian(args: argparse.Namespace, settings: Settings) -> None:
     )
 
     def build(
-        allocation: float, policy: str = action, simulate: bool = kill_switch
+        allocation: float,
+        policy: str = action,
+        simulate: bool = kill_switch,
+        slippage: float = args.slippage_pct,
     ) -> TargetExposureEngine:
         return build_target_engine(
             initial_capital=args.capital,
             fee_pct=args.fee_pct,
-            slippage_pct=args.slippage_pct,
+            slippage_pct=slippage,
             settings=settings,
             allocation=allocation,
             rebalance_threshold=threshold,
@@ -266,9 +368,11 @@ def _run_donchian(args: argparse.Namespace, settings: Settings) -> None:
     else:
         runs = [(pair, build(1.0).run({pair: df})) for pair, df in data.items()]
         runs.append((f"portfolio ({alloc:.0%}/pair)", build(alloc).run(data)))
+    table: dict[str, dict[str, dict[str, float]]] = {}
     for name, result in runs:
         for label, start, end in periods:
             m = result.metrics(start, end)
+            table.setdefault(name, {})[label] = m
             print(
                 f"  {name:24} {label:8} sharpe {m['sharpe_ratio']:5.2f}  "
                 f"CAGR {m['cagr']:6.2f}%  maxDD {m['max_drawdown_pct']:5.2f}%  "
@@ -278,6 +382,86 @@ def _run_donchian(args: argparse.Namespace, settings: Settings) -> None:
                 f"daily-loss {int(m.get('daily_loss_events', 0))}"
                 + ("  HALTED" if m.get("halted") else "")
             )
+
+    robustness = None
+    if args.robustness:
+        # The portfolio the bot runs: MAX_POSITION_PCT per pair.
+        starts = random_starts_target(
+            build(alloc), data, args.samples, args.window, args.seed
+        )
+        label, start, end = periods[-1]  # holdout when given, else full
+
+        def judged(slippage: float) -> dict[str, float]:
+            return build(alloc, slippage=slippage).run(data).metrics(start, end)
+
+        stress = slippage_stress(judged, args.slippage_pct, _multipliers(args.stress))
+        robustness = RobustnessReport(starts, stress, RobustnessCriteria())
+        _print_robustness(robustness, f"portfolio, {label}")
+
+    if args.json:
+        _write_json(
+            args.json,
+            {
+                "provenance": provenance(
+                    settings,
+                    data,
+                    strategy_mode="donchian_ensemble",
+                    timeframe="1d",
+                    fee_pct=args.fee_pct,
+                    slippage_pct=args.slippage_pct,
+                    rebalance_threshold=threshold,
+                    execution=args.execution,
+                    kill_switch=kill_switch,
+                    daily_loss_action=action,
+                    holdout_start=args.holdout_start,
+                ),
+                "runs": table,
+                "robustness": None if robustness is None else robustness.as_dict(),
+            },
+        )
+
+
+def _multipliers(text: str) -> list[float]:
+    values = [float(v) for v in text.split(",") if v.strip()]
+    if not values or any(v <= 0 for v in values):
+        sys.exit("--stress takes positive multipliers, e.g. 1,2,3")
+    return values
+
+
+def _print_robustness(report: RobustnessReport, judged_on: str) -> None:
+    rs: RandomStartResult | None = report.random_starts
+    if rs is not None:
+        s = rs.summary()
+        print(
+            f"\nRandom starts: {int(s['n_samples'])} windows of "
+            f"{int(s['window_bars'])} bars (seed {rs.seed})\n"
+            f"  profitable {s['profitable_share']:.0%}  return p10/median/p90 "
+            f"{s['return_p10_pct']:.2f} / {s['return_median_pct']:.2f} / "
+            f"{s['return_p90_pct']:.2f}%  Sharpe median {s['sharpe_median']:.2f} "
+            f"(min {s['sharpe_min']:.2f})  worst maxDD "
+            f"{s['max_drawdown_worst_pct']:.2f}%  trades median "
+            f"{s['trades_median']:.0f}"
+        )
+    print(f"Slippage stress ({judged_on}):")
+    point: StressPoint
+    for point in report.stress:
+        m = point.metrics
+        print(
+            f"  x{point.multiplier:<4g} slippage {point.slippage_pct:.3f}%  "
+            f"return {m.get('total_return_pct', 0):7.2f}%  "
+            f"sharpe {m.get('sharpe_ratio', 0):6.2f}  "
+            f"maxDD {m.get('max_drawdown_pct', 0):6.2f}%"
+        )
+    passed, reasons = report.verdict()
+    print(f"Robustness verdict: {'PASS' if passed else 'FAIL'}")
+    for reason in reasons:
+        print(f"  - {reason}")
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"\nJSON report: {path}")
 
 
 if __name__ == "__main__":
