@@ -178,6 +178,11 @@ class TargetExposureEngine:
     def strategy_name(self) -> str:
         return STRATEGY_NAME
 
+    @property
+    def min_history(self) -> int:
+        """Daily bars needed before the first non-zero target."""
+        return self._min_history
+
     def targets(self, ohlcv: pd.DataFrame) -> pd.Series:
         """Target exposure decided at each daily close."""
         return exposure_series(
@@ -188,14 +193,26 @@ class TargetExposureEngine:
             self._min_history,
         )["exposure"]
 
-    def run(self, data: Mapping[str, pd.DataFrame]) -> TargetExposureResult:
-        """Backtest ``{pair: daily OHLCV}`` as one portfolio."""
+    def run(
+        self,
+        data: Mapping[str, pd.DataFrame],
+        start: str | pd.Timestamp | None = None,
+    ) -> TargetExposureResult:
+        """Backtest ``{pair: daily OHLCV}`` as one portfolio.
+
+        ``start`` launches the portfolio on that day, as a bot started then:
+        targets use the whole history before it, but the book stays in cash
+        (no fills, no kill-switch) until the first day ``>= start``, whose
+        open trades the previous close's target (``"close"`` execution: that
+        day's close). Equity before it is the initial capital.
+        """
         if not data:
             raise ValueError("no data")
         pairs = list(data)
         index = pd.DatetimeIndex(
             sorted(set().union(*(df.index for df in data.values())))
         )
+        first = 0 if start is None else int(index.searchsorted(_ts(start)))
 
         def aligned(col: str) -> pd.DataFrame:
             return pd.DataFrame(
@@ -219,6 +236,9 @@ class TargetExposureEngine:
         notional = np.zeros(len(index))
 
         for i, ts in enumerate(index):
+            if i < first:  # not launched yet: all cash, nothing traded
+                equity[i] = self._capital
+                continue
             # The day opens at the open (or the last mark without a bar).
             prev_marks = marks.iloc[i - 1] if i > 0 else closes.iloc[i]
             day_open = opens.iloc[i].where(opens.iloc[i].notna(), prev_marks)
@@ -282,6 +302,7 @@ class TargetExposureEngine:
                     None if self._max_daily is None else self._max_daily * 100
                 ),
                 "daily_loss_action": self._daily_action,
+                "start": None if start is None else str(_ts(start)),
             },
         )
 

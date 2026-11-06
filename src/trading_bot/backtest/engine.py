@@ -84,6 +84,15 @@ class BacktestEngine:
     def strategy_name(self) -> str:
         return self._strategy.name
 
+    @property
+    def required_lookback(self) -> int:
+        """Bars the strategy needs before its first signal (warm-up)."""
+        return int(self._strategy.get_required_lookback())
+
+    @property
+    def slippage_pct(self) -> float:
+        return self._slippage_pct
+
     def run(
         self,
         ohlcv: pd.DataFrame,
