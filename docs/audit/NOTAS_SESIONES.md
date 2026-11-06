@@ -210,3 +210,9 @@ operativo: backtests con datos reales en un entorno con red (incluido
 - El Postgres local de §3 no sobrevive a la pausa del contenedor: si
   `pg_ctl` da "Permission denied", repetir `chmod o+x` sobre los directorios
   padre y arrancarlo de nuevo con `-w`.
+- **Versión del validador**: `tests/unit/test_validation_version.py` fija
+  la salida de `BacktestEngine` y `TargetExposureEngine` sobre datos
+  sintéticos. Si un cambio la mueve a propósito, subir `VALIDATION_VERSION`
+  (`backtest/provenance.py`), anotarlo en `docs/VALIDATION_CHANGELOG.md` y
+  agregar los valores nuevos a `GOLDEN`; no reescribir solo los números.
+  Cambiar un default de settings que use la estrategia también lo dispara.

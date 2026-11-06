@@ -438,6 +438,55 @@ Qué garantiza:
 No simula: señales de IA históricas (salvo que se pasen en
 `ai_signals_series`), el kill-switch de drawdown ni el rechazo de órdenes.
 
+### Robustez, versión del validador y paridad de ventana
+
+Tres controles que se suman al walk-forward. Se tomaron de los pipelines de
+validación públicos de estrategias cripto (p. ej. CacheCarti/Crypto-Strategies),
+adaptados a los dos motores de este repo:
+
+```bash
+uv run python scripts/run_backtest.py --pair BTC/USDT --robustness \
+    --json reports/bt_btc_1h.json
+uv run python scripts/run_backtest.py --strategy-mode donchian_ensemble \
+    --pairs BTC/USDT,ETH/USDT,SOL/USDT --holdout-start 2024-01-01 --robustness
+uv run python scripts/window_parity.py --pair BTC/USDT --timeframe 1h --last 4000
+```
+
+- **Inicios aleatorios** (`backtest/robustness.py`): la misma estrategia se
+  arranca sin posición en `--samples` velas elegidas al azar (con semilla
+  `--seed`, reproducible) y opera `--window` velas cada vez. Por defecto la
+  ventana es 1/4 de la historia operable. En `regime_selector` las velas
+  previas a cada inicio son solo calentamiento, igual que en el
+  walk-forward. En `donchian_ensemble`, cada muestra equivale a un bot
+  lanzado ese día (`TargetExposureEngine.run(start=...)`): parte en efectivo
+  y la primera apertura compra el objetivo que da la historia completa.
+- **Estrés de slippage**: la misma evaluación con slippage ×1, ×2 y ×3
+  (`--stress`). En `regime_selector` se juzga el OOS encadenado del
+  walk-forward. En `donchian_ensemble`, el holdout (o el período completo si
+  no hay `--holdout-start`).
+- **Veredicto** (`RobustnessCriteria`): pasa si al menos el 60 % de las
+  ventanas son rentables, el Sharpe mediano es > 0 y el Sharpe con slippage
+  ×2 es > 0. Es un filtro, no una prueba: las ventanas se solapan y no son
+  muestras independientes. El script sale con código 0 aunque el veredicto
+  sea FAIL, porque es un reporte.
+- **Versión del validador** (`backtest/provenance.py`): con `--json`, cada
+  reporte (y los de `scripts/train_models.py`, más la metadata de los modelos
+  publicados) lleva un bloque `provenance` con `validation_version`, commit,
+  hash SHA-256 de las velas usadas y los settings de los que depende el
+  resultado. Los cambios de la simulación se anotan en
+  [docs/VALIDATION_CHANGELOG.md](docs/VALIDATION_CHANGELOG.md).
+  `tests/unit/test_validation_version.py` fija la salida de los dos motores
+  sobre datos sintéticos: si la simulación cambia, falla hasta que se sube la
+  versión y se anota el cambio.
+- **Paridad de ventana** (`backtest/window_parity.py`): el backtest calcula
+  los indicadores sobre toda la historia, pero el bot en vivo solo ve las
+  últimas `OHLCV_LOOKBACK_BARS` velas cerradas. El script repite cada vela
+  de las dos maneras y termina con código 1 si cambia la señal, el régimen,
+  el factor de tamaño, la confianza (> 1e-3) o el ATR-14 (> 0,1 % relativo;
+  fija el stop y el tamaño). Además se niega a correr si la ventana es menor
+  que el lookback que piden las estrategias. Un test lo cubre con datos
+  sintéticos.
+
 ## Desarrollo
 
 ```bash

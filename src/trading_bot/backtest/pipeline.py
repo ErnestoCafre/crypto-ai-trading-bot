@@ -17,7 +17,8 @@ Not simulated: AI signals (sentiment / ML / LLM — pass
 history), the drawdown kill-switch and exchange-side stop orders. Live
 features are computed over a rolling ``OHLCV_LOOKBACK_BARS`` window rather
 than the full history; for the indicators the strategies use (EMA<=50,
-RSI/ADX/ATR 14, BB 20) the difference is negligible after warm-up.
+RSI/ADX/ATR 14, BB 20) the difference is negligible after warm-up, which
+:mod:`trading_bot.backtest.window_parity` checks (``scripts/window_parity.py``).
 """
 
 from __future__ import annotations
