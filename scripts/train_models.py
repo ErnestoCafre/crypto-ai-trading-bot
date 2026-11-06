@@ -55,6 +55,7 @@ from trading_bot.ai.prediction.validation import (
     tune_params,
     walk_forward_splits,
 )
+from trading_bot.backtest.provenance import VALIDATION_VERSION, provenance
 from trading_bot.config import get_settings
 from trading_bot.config.logging import setup_logging
 from trading_bot.data.market.candles import split_closed_candles
@@ -401,6 +402,7 @@ async def run_meta(args: argparse.Namespace) -> MetaRun:
                 cfg.timeframe,
                 {
                     "trained_at": stamp,
+                    "validation_version": VALIDATION_VERSION,
                     "pairs": result.pairs,
                     "weight_mode": cfg.weight_mode,
                     "max_bars": cfg.max_bars,
@@ -430,6 +432,7 @@ async def run_meta(args: argparse.Namespace) -> MetaRun:
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "provenance": provenance(settings, histories, task="meta_label"),
         "task": "meta_label",
         "config": {**asdict(cfg), "embargo": str(cfg.embargo)},
         "history_start": str(since),
@@ -530,6 +533,7 @@ async def run_direction(args: argparse.Namespace) -> list[PairResult]:
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "provenance": provenance(get_settings(), task="direction"),
         "config": {**cfg.__dict__, "embargo": cfg.embargo_bars, "years": args.years},
         "exchange": args.exchange,
         "results": [r.as_dict() for r in results],
